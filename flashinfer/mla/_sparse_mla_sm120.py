@@ -255,6 +255,65 @@ def _decode_dsv4_dispatchable(
     )
 
 
+def _decode_shape_supported(
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    d_qk: int,
+    page_block_size: int,
+    model_type: int,
+    extra_topk: int = 0,
+) -> bool:
+    """True iff a standalone SM120 decode kernel exists for this shape."""
+    if model_type == _MODEL_TYPE_DSV4:
+        return _decode_dsv4_dispatchable(
+            num_tokens, num_heads, topk, d_qk, page_block_size, extra_topk
+        )
+    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+        return _decode_dsv3_2_dispatchable(
+            num_tokens, num_heads, topk, d_qk, page_block_size
+        )
+    return False
+
+
+def _raise_unsupported_decode_shape(
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    d_qk: int,
+    page_block_size: int,
+    model_type: int,
+    extra_topk: int,
+) -> None:
+    """Raise an actionable error naming the supported decode shapes.
+
+    The decode kernels are compiled only for the (num_heads, topk) pairs
+    enumerated in ``_DECODE_DSV4_DISPATCH`` / ``_DECODE_DSV3_2_DISPATCH`` —
+    in particular there is no decode kernel below 8 heads. Naming the support
+    matrix in the error saves users from digging the constraint out of the
+    source.
+    """
+
+    def _fmt(table: frozenset) -> str:
+        heads = sorted({h for h, _ in table})
+        topks = sorted({t for _, t in table})
+        return f"num_heads in {heads} x topk in {topks}"
+
+    raise ValueError(
+        "SM120 sparse-MLA has no decode kernel for this shape: "
+        f"num_tokens={num_tokens}, num_heads={num_heads}, topk={topk}, "
+        f"d_qk={d_qk}, page_block_size={page_block_size}, "
+        f"model_type={model_type}, extra_topk={extra_topk}. "
+        f"Supported decode (num_tokens <= {_DECODE_MAX_TOKENS}) shapes: "
+        f"d_qk=576 (DSv3.2/GLM): {_fmt(_DECODE_DSV3_2_DISPATCH)} with "
+        f"page_block_size={_DECODE_DSV3_2_PAGE_BLOCK_SIZE}; "
+        f"d_qk=512 (DSv4): {_fmt(_DECODE_DSV4_DISPATCH)} with "
+        f"page_block_size={_DECODE_DSV4_PAGE_BLOCK_SIZE}. "
+        "Add the matching (num_heads, topk) instantiation to the dispatch "
+        "tables in _sparse_mla_sm120.py to support other shapes."
+    )
+
+
 def _decode_scratch_views(
     mid_out: Optional[torch.Tensor],
     mid_lse: Optional[torch.Tensor],
@@ -389,13 +448,8 @@ def get_sparse_mla_sm120_module():
         # decode instantiation tables. Raise an actionable error instead of letting
         # the kernel abort the process.
         if num_tokens <= _DECODE_MAX_TOKENS:
-            raise ValueError(
-                "SM120 sparse-MLA has no decode kernel for this shape: "
-                f"num_tokens={num_tokens}, num_heads={num_heads}, topk={topk}, "
-                f"d_qk={d_qk}, page_block_size={kv_pbs}, model_type={model_type}, "
-                f"extra_topk={extra_topk}. Supported decode shapes are enumerated in "
-                "_DECODE_DSV4_DISPATCH / _DECODE_DSV3_2_DISPATCH; add the matching "
-                "(num_heads, topk) instantiation to support it."
+            _raise_unsupported_decode_shape(
+                num_tokens, num_heads, topk, d_qk, kv_pbs, model_type, extra_topk
             )
 
         module.sparse_mla_sm120_paged_attention(
@@ -508,6 +562,23 @@ def _sparse_mla_sm120_paged_attention(
     _require_d_v_512(d_v)
     _check_last_dim_512(output, "output")
     model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
+
+    # Validate decode shapes BEFORE the (potentially multi-minute) JIT build:
+    # an unsupported (num_heads, topk) can never succeed, so fail fast with
+    # the support matrix instead of compiling the module first.
+    if q.ndim == 3 and q.shape[0] <= _DECODE_MAX_TOKENS:
+        num_tokens, num_heads, d_qk = q.shape
+        topk = indices.shape[-1]
+        extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+        kv_pbs = _packed_kv_page_block_size(
+            kv_cache, model_type=model_type, name="kv_cache"
+        )
+        if not _decode_shape_supported(
+            num_tokens, num_heads, topk, d_qk, kv_pbs, model_type, extra_topk
+        ):
+            _raise_unsupported_decode_shape(
+                num_tokens, num_heads, topk, d_qk, kv_pbs, model_type, extra_topk
+            )
 
     impl = get_sparse_mla_sm120_module()
     impl.paged_attention(
