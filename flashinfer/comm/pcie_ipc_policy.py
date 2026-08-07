@@ -81,6 +81,21 @@ def _tp2(batch: int) -> Optional[IpcLaunchConfig]:
     return IpcLaunchConfig(16, 128, False, False)
 
 
+def _tp2_for_shape(hidden: int, batch: int) -> Optional[IpcLaunchConfig]:
+    """Return the measured TP2 policy for the exact payload size.
+
+    The original table was tuned with 2,048 elements per row. DS4 uses a
+    4,096-wide hidden state, for which equal-byte payloads select the same
+    launch geometry on the measured root-complex topology. Keep this extension
+    deliberately narrow; other hidden sizes remain unsupported until measured.
+    """
+    if hidden == 2048:
+        return _tp2(batch)
+    if hidden == 4096:
+        return _tp2(batch * 2)
+    return None
+
+
 def _rootcplx(world_size: int, hidden: int, batch: int) -> Optional[IpcLaunchConfig]:
     if world_size == 4 and hidden == 4096:
         # Staged reduce-scatter/all-gather wins at every batch here, not only
@@ -180,7 +195,7 @@ def get_pcie_ipc_launch_config(
     deadlocks the collective.
     """
     if world_size == 2:
-        config = _tp2(batch) if hidden <= 2048 else None
+        config = _tp2_for_shape(hidden, batch)
     elif profile == PROFILE_ROOTCPLX:
         config = _rootcplx(world_size, hidden, batch)
     elif profile == PROFILE_SWITCHPAIR:

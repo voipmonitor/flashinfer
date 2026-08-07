@@ -37,6 +37,7 @@ from flashinfer.comm.pcie_ipc_topology import PROFILE_ROOTCPLX, PROFILE_SWITCHPA
 
 _SHAPES = [
     (2, 2048),
+    (2, 4096),
     (4, 4096),
     (8, 6144),
     (8, 8192),
@@ -104,10 +105,21 @@ def test_untuned_shapes_report_unsupported() -> None:
         # TP4 is tuned at exactly 4096.
         assert get_pcie_ipc_launch_config(profile, 4, 2048, 8) is None
         assert get_pcie_ipc_launch_config(profile, 4, 8192, 8) is None
-        # TP2 only up to 2048.
-        assert get_pcie_ipc_launch_config(profile, 2, 4096, 8) is None
+        # TP2 is qualified only at the two measured hidden sizes.
+        assert get_pcie_ipc_launch_config(profile, 2, 3072, 8) is None
         # World sizes the kernels do not implement.
         assert get_pcie_ipc_launch_config(profile, 6, 6144, 8) is None
+
+
+@pytest.mark.parametrize("profile", [PROFILE_ROOTCPLX, PROFILE_SWITCHPAIR])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 24, 32, 64, 128])
+def test_tp2_hidden4096_uses_measured_byte_equivalent_policy(
+    profile: str, batch: int
+) -> None:
+    """DS4's 4,096-wide rows reuse the measured equal-byte TP2 geometry."""
+    assert get_pcie_ipc_launch_config(profile, 2, 4096, batch) == (
+        get_pcie_ipc_launch_config(profile, 2, 2048, batch * 2)
+    )
 
 
 def test_unknown_profile_raises() -> None:
@@ -303,7 +315,7 @@ def test_group_correctness_uses_a_min_reduction() -> None:
         calls.append(op)
 
     real_dist = bench.dist
-    real_tensor = bench.torch.tensor
+    real_torch = bench.torch
     try:
         bench.dist = type(
             "D",
@@ -322,9 +334,27 @@ def test_group_correctness_uses_a_min_reduction() -> None:
         assert bench._group_all(False, None, None) is False
     finally:
         bench.dist = real_dist
-        bench.torch.tensor = real_tensor
+        bench.torch = real_torch
 
     assert calls, "the verdict must be reduced across ranks, not decided locally"
     assert all(op is real_dist.ReduceOp.MIN for op in calls), (
         f"correctness must reduce with MIN (logical AND), got {calls}"
     )
+
+
+def test_collective_json_write_propagates_rank0_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    bench = _load_benchmark_module()
+    missing = tmp_path / "missing" / "results.json"
+
+    monkeypatch.setattr(bench.dist, "broadcast", lambda *args, **kwargs: None)
+    with pytest.raises(RuntimeError, match="failed to write"):
+        bench._write_json_collective(str(missing), [], rank=0, device="cpu", group=None)
+
+    def report_root_failure(tensor, *args, **kwargs):
+        tensor.fill_(1)
+
+    monkeypatch.setattr(bench.dist, "broadcast", report_root_failure)
+    with pytest.raises(RuntimeError, match="rank 0 failed to write"):
+        bench._write_json_collective(str(missing), [], rank=1, device="cpu", group=None)

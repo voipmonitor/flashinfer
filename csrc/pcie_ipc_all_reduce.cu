@@ -58,6 +58,8 @@ int64_t pcie_ipc_workspace_size(int64_t world_size, int64_t max_numel, int64_t e
   TVM_FFI_ICHECK_GT(max_numel, 0) << "max_numel must be positive";
   TVM_FFI_ICHECK_EQ(elem_size, 2)
       << "only 2-byte dtypes (bfloat16, float16) are supported, got elem_size " << elem_size;
+  TVM_FFI_ICHECK_EQ(max_numel % (16 / elem_size), 0)
+      << "max_numel must be divisible by the 16-byte pack width";
   TVM_FFI_ICHECK_GT(max_blocks, 0) << "max_blocks must be positive";
   return fi::workspace_size(static_cast<int>(world_size), max_numel, static_cast<int>(elem_size),
                             static_cast<int>(max_blocks));
@@ -79,8 +81,11 @@ fptr_t pcie_ipc_init(Array<fptr_t> ipc_ptrs, int64_t rank, int64_t max_numel, in
   TVM_FFI_ICHECK(world_size == 2 || world_size == 4 || world_size == 8)
       << "pcie ipc all-reduce supports world_size 2, 4 or 8, got " << world_size;
   TVM_FFI_ICHECK(rank >= 0 && rank < world_size) << "rank " << rank << " out of range";
+  TVM_FFI_ICHECK_GT(max_numel, 0) << "max_numel must be positive";
   TVM_FFI_ICHECK_EQ(elem_size, 2)
       << "only 2-byte dtypes (bfloat16, float16) are supported, got elem_size " << elem_size;
+  TVM_FFI_ICHECK_EQ(max_numel % (16 / elem_size), 0)
+      << "max_numel must be divisible by the 16-byte pack width";
   TVM_FFI_ICHECK_GT(max_blocks, 0) << "max_blocks must be positive";
 
   int64_t ptrs[fi::kMaxWorldSize];
@@ -132,14 +137,22 @@ void pcie_ipc_all_reduce(fptr_t handle, TensorView inp, TensorView out, int64_t 
   const int64_t elem_size = get_element_size(inp);
   TVM_FFI_ICHECK_EQ(elem_size, h->elem_size)
       << "dtype element size " << elem_size << " does not match the workspace's " << h->elem_size;
-  TVM_FFI_ICHECK_LE(static_cast<size_t>(numel * elem_size), h->layout.max_payload_bytes)
-      << "payload exceeds the workspace capacity";
+  TVM_FFI_ICHECK_GT(numel, 0) << "numel must be positive";
+  TVM_FFI_ICHECK_LE(numel, h->max_numel)
+      << "payload of " << numel << " elements exceeds the workspace capacity of "
+      << h->max_numel;
 
   const int64_t pack_elems = 16 / elem_size;
   TVM_FFI_ICHECK_EQ(numel % pack_elems, 0)
       << "numel must be divisible by the 16-byte pack width (" << pack_elems << ")";
   TVM_FFI_ICHECK_EQ(h->max_numel % pack_elems, 0)
       << "max_numel must be divisible by the 16-byte pack width";
+  const int64_t num_packs = numel / pack_elems;
+  if ((h->world_size == 4 && stream_mode) || h->world_size == 8) {
+    TVM_FFI_ICHECK_GE(num_packs, 4)
+        << "the selected reduce-scatter kernel requires at least 4 16-byte packs, got "
+        << num_packs;
+  }
   TVM_FFI_ICHECK(blocks > 0 && blocks <= h->max_blocks)
       << "blocks must be in (0, " << h->max_blocks << "], got " << blocks;
   TVM_FFI_ICHECK(threads > 0 && threads <= 1024) << "threads must be in (0, 1024], got " << threads;

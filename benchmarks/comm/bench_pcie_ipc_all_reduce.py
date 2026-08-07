@@ -136,6 +136,26 @@ def _group_all(flag: bool, device, group) -> bool:
     return bool(t.item())
 
 
+def _write_json_collective(path, rows, rank, device, group) -> None:
+    """Atomically persist rank-0 results or fail every rank together."""
+    error = None
+    if rank == 0:
+        try:
+            tmp = path + ".partial"
+            with open(tmp, "w") as f:
+                json.dump(rows, f, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:
+            error = exc
+
+    failed = torch.tensor([int(error is not None)], dtype=torch.int32, device=device)
+    dist.broadcast(failed, src=0, group=group)
+    if failed.item():
+        if error is not None:
+            raise RuntimeError(f"failed to write {path}") from error
+        raise RuntimeError(f"rank 0 failed to write {path}")
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--hidden", type=int, default=None)
@@ -338,6 +358,8 @@ def _run_protocol_ab(args, group, world_size, hidden, batches, dtype, device, ra
         group=group, max_numel=hidden * max(batches), dtype=dtype
     )
     try:
+        profile = probe.profile
+        profile_reason = probe.profile_reason
         shape_config = {}
         for batch in batches:
             cfg = probe.launch_config(
@@ -395,12 +417,9 @@ def _run_protocol_ab(args, group, world_size, hidden, batches, dtype, device, ra
         last for the same reason. rename() makes a reader see either the old
         file or a complete new one.
         """
-        if rank != 0 or not args.json:
+        if not args.json:
             return
-        tmp = args.json + ".partial"
-        with open(tmp, "w") as f:
-            json.dump(rows, f, indent=2)
-        os.replace(tmp, args.json)
+        _write_json_collective(args.json, rows, rank, device, group)
 
     def _emit(switch, leg):
         """Report one finished leg, then persist."""
@@ -421,6 +440,8 @@ def _run_protocol_ab(args, group, world_size, hidden, batches, dtype, device, ra
                 "batch": batch,
                 "hidden": hidden,
                 "world_size": world_size,
+                "profile": profile,
+                "profile_reason": profile_reason,
                 "switch": switch,
                 "unsafe_baseline": switch
                 in ("no-block-epoch", "no-barrier-entry-sync"),
@@ -572,6 +593,8 @@ def main() -> None:
                 "hidden": hidden,
                 "world_size": world_size,
                 "dtype": args.dtype,
+                "profile": workspace.profile,
+                "profile_reason": workspace.profile_reason,
                 "ours_us": ours_us,
                 "nccl_us": nccl_us,
                 "ours_rank0_us": ours_rank_us,
@@ -592,10 +615,10 @@ def main() -> None:
                 f"ring={int(config.ring_push)}"
             )
 
-    if rank == 0 and args.json:
-        with open(args.json, "w") as f:
-            json.dump(rows, f, indent=2)
-        print(f"wrote {args.json}")
+    if args.json:
+        _write_json_collective(args.json, rows, rank, device, group)
+        if rank == 0:
+            print(f"wrote {args.json}")
 
     workspace.destroy()
     dist.destroy_process_group()

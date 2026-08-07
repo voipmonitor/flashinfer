@@ -50,7 +50,7 @@ def get_pcie_ipc_comm_module():
             world_size, max_numel, elem_size, max_blocks
         )
 
-    @register_custom_op("flashinfer::pcie_ipc_init", mutates_args=["ipc_ptrs"])
+    @register_custom_op("flashinfer::pcie_ipc_init", mutates_args=[])
     def init(
         ipc_ptrs: List[int],
         rank: int,
@@ -60,7 +60,7 @@ def get_pcie_ipc_comm_module():
     ) -> int:
         return module.pcie_ipc_init(ipc_ptrs, rank, max_numel, elem_size, max_blocks)
 
-    @register_custom_op("flashinfer::pcie_ipc_dispose", mutates_args=["handle"])
+    @register_custom_op("flashinfer::pcie_ipc_dispose", mutates_args=[])
     def dispose(handle: int) -> None:
         module.pcie_ipc_dispose(handle)
 

@@ -908,6 +908,9 @@ __global__ __launch_bounds__(1024, 1) void ipc_tp2_remote_push_kernel(
 
 template <int WorldSize>
 __device__ __forceinline__ int rsag_owner_for_pack(int idx, int part) {
+  // Host dispatch validates part > 0 before selecting a kernel that uses this
+  // owner map. Keep the guard as a defensive clamp, not as protocol support
+  // for an empty owner partition.
   int owner = part > 0 ? idx / part : 0;
   return owner < WorldSize ? owner : WorldSize - 1;
 }
@@ -2128,11 +2131,11 @@ inline cudaError_t launch(Kernel kernel, dim3 grid, dim3 block, cudaStream_t str
 //     8      true   true  ipc_topo_rsag8_ring_push_param_kernel (block scratch)
 //
 // Preconditions the caller must have validated: world_size in {2,4,8};
-// 0 < blocks <= max_blocks; 0 < threads <= 1024; numel and max_numel both
-// divisible by the 16-byte pack width; numel * elem_size <= max_payload_bytes;
-// and blocks % 4 == 0 whenever the block-partitioned TP8 kernel is selected
-// (world_size 8 and not ring_push), since it derives its chunk from
-// blockIdx.x & 3.
+// 0 < numel <= max_numel; 0 < blocks <= max_blocks; 0 < threads <= 1024;
+// numel and max_numel both divisible by the 16-byte pack width; at least four
+// packs for world-4 staged kernels and every world-8 kernel; and blocks % 4 ==
+// 0 whenever the block-partitioned TP8 kernel is selected (world_size 8 and
+// not ring_push), since it derives its chunk from blockIdx.x & 3.
 template <typename T>
 cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews& views, int rank,
                        int world_size, int max_blocks, int64_t max_numel, int blocks, int threads,

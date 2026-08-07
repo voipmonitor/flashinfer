@@ -187,10 +187,9 @@ def _unsupported_shape_worker(world_size: int, rank: int, port: int) -> None:
             group=group, max_numel=8192, dtype=torch.bfloat16
         )
 
-        # A shape the table does not cover (hidden 2048 needs 2 ranks, and
-        # this group has 2, so use an uncovered hidden instead).
+        # A hidden width the TP2 table does not cover.
         assert not ws.supports(
-            torch.empty(4, 4096, dtype=torch.bfloat16, device=device)
+            torch.empty(1, 3072, dtype=torch.bfloat16, device=device)
         )
         # Larger than the workspace.
         assert not ws.supports(torch.empty(16384, dtype=torch.bfloat16, device=device))
@@ -210,6 +209,42 @@ def _unsupported_shape_worker(world_size: int, rank: int, port: int) -> None:
         for wrong in (torch.device("cpu"), peer):
             with pytest.raises(ValueError, match="workspace was built on"):
                 ws.supports(torch.empty(1024, dtype=torch.bfloat16, device=wrong))
+    finally:
+        if ws is not None:
+            ws.destroy()
+        if group is not None:
+            dist.destroy_process_group(group)
+
+
+def _binding_validation_worker(world_size: int, rank: int, port: int) -> None:
+    ws = None
+    group = None
+    try:
+        _init_process_group(world_size, rank, port)
+        group = dist.group.WORLD
+        device = torch.device(f"cuda:{rank}")
+        module = comm.get_pcie_ipc_comm_module()
+
+        with pytest.raises(RuntimeError, match="16-byte pack width"):
+            module.workspace_size(world_size, 1, 2, 128)
+        with pytest.raises(RuntimeError, match="max_numel must be positive"):
+            module.init([1] * world_size, rank, 0, 2, 128)
+
+        ws = comm.PcieIpcAllReduceWorkspace(
+            group=group, max_numel=32, dtype=torch.bfloat16
+        )
+
+        with pytest.raises(RuntimeError, match="workspace capacity"):
+            ws.all_reduce(
+                torch.empty(40, dtype=torch.bfloat16, device=device),
+                config=IpcLaunchConfig(1, 128, False, False),
+            )
+
+        with pytest.raises(RuntimeError, match="at least 4 16-byte packs"):
+            ws.all_reduce(
+                torch.empty(16, dtype=torch.bfloat16, device=device),
+                config=IpcLaunchConfig(1, 128, True, False),
+            )
     finally:
         if ws is not None:
             ws.destroy()
@@ -314,9 +349,11 @@ def _shape_change_worker(world_size: int, rank: int, port: int) -> None:
         dist.barrier(group=group)
 
         outs = []
-        for i in range(40):
+        call = 0
+        for _ in range(40):
             for b in batches:
-                v = i % variants
+                v = call % variants
+                call += 1
                 outs.append((b, v, ws.all_reduce(inputs[b][v])))
         torch.cuda.synchronize()
         for b, v, o in outs:
@@ -569,7 +606,9 @@ def _second_stream_worker(world_size: int, rank: int, port: int) -> None:
         ws = comm.PcieIpcAllReduceWorkspace(
             group=group, max_numel=hidden * 8, dtype=torch.bfloat16
         )
-        inp = torch.randn(8, hidden, dtype=torch.bfloat16, device=device)
+        inp = torch.randint(0, 16, (8, hidden), dtype=torch.int32, device=device).to(
+            torch.bfloat16
+        )
 
         ws.all_reduce(inp)  # binds to the current stream
         ws.all_reduce(inp)  # same stream, still fine
@@ -613,3 +652,10 @@ def test_pcie_ipc_unsupported_shapes(world_size: int) -> None:
     if world_size > torch.cuda.device_count():
         pytest.skip("not enough GPUs")
     multi_process_parallel(world_size, _unsupported_shape_worker)
+
+
+@pytest.mark.parametrize("world_size", [4])
+def test_pcie_ipc_binding_rejects_unsafe_explicit_configs(world_size: int) -> None:
+    if world_size > torch.cuda.device_count():
+        pytest.skip("not enough GPUs")
+    multi_process_parallel(world_size, _binding_validation_worker)
