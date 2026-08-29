@@ -57,7 +57,7 @@
 //   CM:              ComputeMode (FP8 / BF16) for the QK MMA; XV is always FP8
 //   NUM_HEADS:       8, 16, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
 //   TOPK:            128, 512, 1024, 2048
-//   PAGE_BLOCK_SIZE: 64 (DSV3_2 and DSV4 both use the 64-token page layout)
+//   PAGE_BLOCK_SIZE: physical tokens per cache page (currently 64 or 256)
 // ============================================================================
 
 struct PrefillColdParams {
@@ -642,13 +642,9 @@ __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
   using KV = KVCacheTraits<MT>;
   using IO = KVIOTraits<MT>;
   idx = (idx >= 0) ? idx : 0;
-  if constexpr (KV::V_HAS_ROPE) {
-    const int bi = idx / PAGE_BLOCK_SIZE;
-    const int li = idx % PAGE_BLOCK_SIZE;
-    return kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
-  } else {
-    return kv_global + (size_t)idx * IO::IO_STRIDE;
-  }
+  const int bi = idx / PAGE_BLOCK_SIZE;
+  const int li = idx % PAGE_BLOCK_SIZE;
+  return kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;
 }
 
 // Shared MG implementation for single-cache and dual-cache prefill.

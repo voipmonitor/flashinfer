@@ -888,6 +888,110 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize(
+    ("page_block_size", "num_heads", "num_blocks", "tail_bytes"),
+    [
+        pytest.param(256, 32, 16, 4096, id="page256"),
+        pytest.param(256, 16, 16, 4096, id="page256-tp4-heads"),
+        # vLLM's GLM5Next hybrid manager appends a 37-byte/token C4 tail after
+        # every 2304-token MLA page. This is the production TP4 geometry.
+        pytest.param(2304, 16, 2, 2304 * 37, id="page2304-glm-c4-tail"),
+        pytest.param(2304, 32, 2, 2304 * 37, id="page2304-32-heads"),
+    ],
+)
+def test_sparse_mla_sm120_prefill_glm_nsa_padded_page(
+    page_block_size: int,
+    num_heads: int,
+    num_blocks: int,
+    tail_bytes: int,
+) -> None:
+    """GLM prefill honors the runtime page size and padded parent stride."""
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    d_qk, d_v = 576, 512
+    num_tokens, topk = 65, 2048
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks,
+            page_block_size,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_compact = quantize_kv_glm_nsa(kv_bf16)
+    _assert_has_non_pow2_inline_scales(kv_compact)
+    kv_dequant = dequantize_kv_dsv3_2(kv_compact)
+
+    # Model a padded/shared parent cache. The page2304 case exactly models
+    # vLLM's GLM C4 tail; poison it so flat ``idx * 656`` addressing fails.
+    block_bytes = page_block_size * 656
+    padded_block_stride = block_bytes + tail_bytes
+    backing = torch.full(
+        (num_blocks, padded_block_stride),
+        0xFF,
+        dtype=torch.uint8,
+        device=device,
+    )
+    kv_padded = torch.as_strided(
+        backing,
+        size=(num_blocks, page_block_size, 1, 656),
+        stride=(padded_block_stride, 656, 656, 1),
+    )
+    kv_padded.copy_(kv_compact)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    boundary_lengths = torch.tensor(
+        [639, 640, 641, 1023, 1024, 1025, 2047, 2048],
+        dtype=torch.int32,
+        device=device,
+    )
+    topk_length = boundary_lengths.repeat((num_tokens + 7) // 8)[:num_tokens]
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(
+        q,
+        kv_dequant,
+        indices,
+        sm_scale,
+        d_v,
+        topk_length=topk_length,
+    )
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_padded,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_scale_format="arbitrary_fp32",
+        topk_length=topk_length,
+    )
+
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(out_lse).all()
+    # A random sample over two page2304 blocks necessarily contains indices
+    # beyond the first page, exercising the padded parent stride.
+    assert bool((indices >= page_block_size).any())
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
 _DSV4_PREFILL_CONFIGS = [
     (16, 128),
     (32, 512),

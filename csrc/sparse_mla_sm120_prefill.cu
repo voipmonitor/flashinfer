@@ -211,50 +211,85 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-template <ModelType MT>
-inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
-                         const int32_t* indices, const float* attn_sink, bf16* output,
-                         float* out_lse, float sm_scale, int num_tokens, size_t stride_kv_block,
-                         const int* topk_length_ptr, cudaStream_t stream) {
+template <ModelType MT, int PAGE_BLOCK_SIZE>
+inline bool dispatch_v32_page(int num_heads, const bf16* Q, const uint8_t* KV,
+                              const int32_t* indices, const float* attn_sink, bf16* output,
+                              float* out_lse, float sm_scale, int num_tokens,
+                              size_t stride_kv_block, const int* topk_length_ptr,
+                              cudaStream_t stream) {
   static_assert(KVCacheTraits<MT>::D_QK == 576);
-  if (topk != 2048) return false;
 
-  // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`). NH=8 covers
-  // small-TP shards; the SG kernel zero-pads invalid head slots up to HPB=16
-  // internally and gates write-back by VALID_HPB.
-  if (num_heads <= HPB) {
-    if (num_heads == 8) {
-      launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, 64>(
-          Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
-          topk_length_ptr, stream);
-      return true;
-    }
-    if (num_heads != 16) return false;
-    launch_prefill_sg<MT, ComputeMode::FP8, 16, 2048, 64>(Q, KV, indices, attn_sink, output,
-                                                          out_lse, sm_scale, num_tokens,
-                                                          stride_kv_block, topk_length_ptr, stream);
+  // NH=8 covers small-TP shards; the SG kernel zero-pads invalid head slots
+  // up to HPB=16 internally and gates write-back by VALID_HPB. Route NH=16
+  // through the one-group MG kernel: SG produces the correct attention output
+  // for this shape but leaves every LSE row at its -1e30 initialization value.
+  if (num_heads == 8) {
+    launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, PAGE_BLOCK_SIZE>(
+        Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
+        topk_length_ptr, stream);
+    return true;
+  }
+  if (num_heads == 16) {
+    launch_prefill_mg<MT, ComputeMode::FP8, 16, 2048, PAGE_BLOCK_SIZE, 1>(
+        Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
+        topk_length_ptr, stream);
     return true;
   }
 
-#define DISPATCH_DSV3_2_MG(NH)                                                             \
-  launch_prefill_mg<MT, ComputeMode::FP8, NH, 2048, 64>(Q, KV, indices, attn_sink, output, \
-                                                        out_lse, sm_scale, num_tokens,     \
-                                                        stride_kv_block, topk_length_ptr, stream)
+#define DISPATCH_V32_MG(NH)                                                       \
+  launch_prefill_mg<MT, ComputeMode::FP8, NH, 2048, PAGE_BLOCK_SIZE>(             \
+      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens,           \
+      stride_kv_block, topk_length_ptr, stream)
 
   switch (num_heads) {
     case 32:
-      DISPATCH_DSV3_2_MG(32);
+      DISPATCH_V32_MG(32);
       return true;
     case 64:
-      DISPATCH_DSV3_2_MG(64);
+      DISPATCH_V32_MG(64);
       return true;
     case 128:
-      DISPATCH_DSV3_2_MG(128);
+      DISPATCH_V32_MG(128);
       return true;
     default:
       return false;
   }
-#undef DISPATCH_DSV3_2_MG
+#undef DISPATCH_V32_MG
+}
+
+template <ModelType MT>
+inline bool dispatch_v32(int num_heads, int topk, int page_block_size, const bf16* Q,
+                         const uint8_t* KV, const int32_t* indices, const float* attn_sink,
+                         bf16* output, float* out_lse, float sm_scale, int num_tokens,
+                         size_t stride_kv_block, const int* topk_length_ptr,
+                         cudaStream_t stream) {
+  if (topk != 2048) return false;
+
+  // The decode kernel uses 64-token pages. Prefill also supports 256-token
+  // sparse pages and GLM's 2304-token hybrid-manager pages. GLM keeps its C4
+  // selector tail after each manager page, so that page cannot be exposed as
+  // smaller uniformly strided kernel pages.
+  //
+  // PAGE_BLOCK_SIZE participates in physical-slot decomposition and therefore
+  // must match the runtime tensor layout; stride_kv_block alone is insufficient.
+  if (page_block_size == 64) {
+    return dispatch_v32_page<MT, 64>(num_heads, Q, KV, indices, attn_sink, output, out_lse,
+                                     sm_scale, num_tokens, stride_kv_block, topk_length_ptr,
+                                     stream);
+  }
+  if (page_block_size == 256) {
+    return dispatch_v32_page<MT, 256>(num_heads, Q, KV, indices, attn_sink, output, out_lse,
+                                      sm_scale, num_tokens, stride_kv_block, topk_length_ptr,
+                                      stream);
+  }
+  if constexpr (MT == ModelType::GLM_NSA) {
+    if (page_block_size == 2304) {
+      return dispatch_v32_page<MT, 2304>(num_heads, Q, KV, indices, attn_sink, output,
+                                         out_lse, sm_scale, num_tokens, stride_kv_block,
+                                         topk_length_ptr, stream);
+    }
+  }
+  return false;
 }
 
 inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
@@ -412,13 +447,13 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
 
   switch (mt) {
     case ModelType::DSV3_2:
-      return dispatch_v32<ModelType::DSV3_2>(num_heads, topk, Q, KV_cache, indices, attn_sink,
-                                             output, out_lse, sm_scale, num_tokens, stride_kv_block,
-                                             topk_length, stream);
+      return dispatch_v32<ModelType::DSV3_2>(
+          num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output, out_lse,
+          sm_scale, num_tokens, stride_kv_block, topk_length, stream);
     case ModelType::GLM_NSA:
-      return dispatch_v32<ModelType::GLM_NSA>(num_heads, topk, Q, KV_cache, indices, attn_sink,
-                                              output, out_lse, sm_scale, num_tokens,
-                                              stride_kv_block, topk_length, stream);
+      return dispatch_v32<ModelType::GLM_NSA>(
+          num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output, out_lse,
+          sm_scale, num_tokens, stride_kv_block, topk_length, stream);
     case ModelType::DSV4:
       return dispatch_dsv4_single(num_heads, topk, Q, KV_cache, indices, attn_sink, output, out_lse,
                                   sm_scale, num_tokens, stride_kv_block, topk_length, stream);

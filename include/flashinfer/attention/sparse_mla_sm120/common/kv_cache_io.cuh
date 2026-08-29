@@ -40,9 +40,10 @@
 //   DSV4: 576 (nope+rope only, footer scales excluded)
 //           576 % 16 = 0 ✓ for cp.async.bulk
 //
-// DSV3_2 uses flat addressing: kv_ptr + global_idx * 656.
-// DSV4 uses block-structured addressing (footer layout):
-//   data:  kv_ptr + block_idx * stride_kv_block + local_idx * 576
+// Both inline and footer layouts use page-aware addressing so padded parent
+// block strides are honored:
+//   data:  kv_ptr + block_idx * stride_kv_block + local_idx * IO_STRIDE
+// DSV4 additionally stores scales in a footer:
 //   scale: kv_ptr + block_idx * stride_kv_block + page_block_size * 576 + local_idx * 8
 //
 // Reference: FlashMLA SM90 splitkv_mla.cuh / SM100 kernel.cuh.
@@ -58,7 +59,8 @@ struct KVIOTraits {
 };
 
 // Bulk gather token nope data (and inline scales for DSV3_2) from global to smem.
-// DSV3_2: flat addressing (idx * 656). DSV4: block-structured (footer layout).
+// Page decomposition is required for either layout when stride_kv_block has
+// padding between physical pages. A tightly packed cache remains equivalent.
 template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false>
 __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t* indices,
                                                     const uint8_t* __restrict__ kv_ptr,
@@ -77,15 +79,11 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
     int idx = indices[bi];
     idx = (idx >= 0) ? idx : 0;
 
-    const uint8_t* src;
-    if constexpr (KV::SCALE_IN_KV_SMEM) {
-      src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
-    } else {
-      constexpr int pbs = PAGE_BLOCK_SIZE;
-      int block_idx = idx / pbs;
-      int local_idx = idx % pbs;
-      src = kv_ptr + (size_t)block_idx * stride_kv_block + (size_t)local_idx * IO::IO_STRIDE;
-    }
+    constexpr int pbs = PAGE_BLOCK_SIZE;
+    int block_idx = idx / pbs;
+    int local_idx = idx % pbs;
+    const uint8_t* src = kv_ptr + (size_t)block_idx * stride_kv_block +
+                         (size_t)local_idx * IO::IO_STRIDE;
     if constexpr (USE_L2_HINT)
       cp_async_bulk_g2s_l2hint(dst + bi * SMEM_STRIDE, src, COPY_BYTES, mbar, cache_policy);
     else
