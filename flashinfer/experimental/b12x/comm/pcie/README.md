@@ -130,7 +130,20 @@ compares explicit transports and the static dispatch policy with CUDA graphs.
 Explicit joint-only plans for staged BF16 reductions with payload-ready peer
 storage race two joint entrypoints. `joint_latency` supports `full`, `payload_rsag`, and
 `pull`; `joint_bandwidth` supports `payload_rsag`, `bulk_push`, `bulk_pull`, and
-`pull`. Ordinary plans retain standalone transport competition. Each entrypoint
+`pull`. Rank groups larger than two also admit `full_phased` and
+`payload_rsag_phased` in `joint_latency`, and `payload_rsag_phased` and
+`bulk_push_phased` in `joint_bandwidth`. These profiles send to one peer at a
+time in rank-staggered order. They require `active_blocks=1`; each writing
+thread performs a system fence and the CTA synchronizes before the next peer.
+Inactive grid blocks do not participate in the phase ordering, so it does not
+require simultaneous grid residency. Base profiles remain available for tuning;
+the single active CTA can limit phased throughput. For example,
+`CollectiveConfig(implementation="joint_bandwidth", threads=512, blocks=64,
+submode="bulk_push_phased", active_blocks=1)` selects phased bulk writes.
+`b12x.comm.pcie.joint_profiles` provides CPU-only typed mode metadata, admission,
+and labels for consumers that store selectors or validate profile catalogs.
+
+Ordinary plans retain standalone transport competition. Each entrypoint
 uses one compiled program per thread count and maximum grid; its submode and
 active CTA count are device data and do not specialize compilation. The maximum
 grid is capped by the device SM count and 64 CTAs. The tuning

@@ -96,22 +96,91 @@ def _assert_epoch_wrapped(state):
     assert tuple(words) == (0, 0), tuple(words)
 
 
-def _exercise(rank, world, family, alias):
+def _phase_completions(state, value=None):
+    import torch
+    from b12x.comm.pcie._joint_profile import JOINT_PHASE_COMPLETIONS_OFFSET
+
+    word = ctypes.c_uint32(0 if value is None else value)
+    address = state.workspace.shared.local_ptr + JOINT_PHASE_COMPLETIONS_OFFSET
+    source, destination = (
+        (address, ctypes.addressof(word))
+        if value is None
+        else (ctypes.addressof(word), address)
+    )
+    stream = torch.cuda.current_stream()
+    state.runtime._ipc.cudaMemcpyAsync(destination, source, 4, stream.cuda_stream)
+    stream.synchronize()
+    return word.value
+
+
+def _oversubscribed_graph(state, source, out):
+    """Launch more physical blocks than can be resident, with only CTA zero active."""
+    import torch
+    import cutlass
+    import cutlass.cute as cute
+    from b12x._lib.utils.device import current_cuda_stream
+    from b12x._lib.utils.pointers import make_ptr
+    from b12x.comm.pcie._joint_cute import _JointLaunch
+    from b12x.comm.pcie._oneshot_cute import _dummy
+
+    call = state.query.call
+    launch = _JointLaunch(
+        call["transport"].removeprefix("joint_"),
+        state.query.world_size,
+        state.query.rank,
+        call["threads"],
+        65536,
+    )
+    raw = cute.compile(
+        launch,
+        _dummy(cutlass.Uint64, 8),
+        _dummy(cutlass.Uint64, 8),
+        _dummy(cutlass.Uint32, 4),
+        _dummy(cutlass.Uint32, 4),
+        _dummy(cutlass.Uint32, 16),
+        _dummy(cutlass.Uint32, 16),
+        1,
+        1,
+        current_cuda_stream(),
+    )
+    work = state.workspace
+    addresses = (
+        (cutlass.Uint64, work.peer_table.data_ptr(), 8),
+        (cutlass.Uint64, work.signal_table.data_ptr(), 8),
+        (cutlass.Uint32, work.shared.local_ptr, 4),
+        (cutlass.Uint32, state.selector.data_ptr(), 4),
+        (cutlass.Uint32, source.data_ptr(), 16),
+        (cutlass.Uint32, out.data_ptr(), 16),
+    )
+    pointers = tuple(
+        make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=alignment)
+        for dtype, address, alignment in addresses
+    )
+    state.select_profile("payload_rsag_phased", 1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        raw(*pointers, call["size_packs"], work.capacity_packs, current_cuda_stream())
+    return graph, raw
+
+
+def _exercise(rank, world, family, alias, pack_counts=None, threads=256):
     import torch
     import torch.distributed as dist
 
     from b12x.comm.pcie import CollectiveConfig
+    from b12x.comm.pcie.joint_profiles import (
+        JOINT_MODE_SPECS,
+        joint_modes,
+        joint_mode_spec,
+    )
     from b12x.comm.pcie._oneshot_preparation import _prepare_plain_call
     from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
     from b12x.preparation import CollectiveRequirement, PreparationSession
 
     device = torch.device("cuda", rank)
-    pack_counts = tuple(sorted({1, world - 1, world + 1, 257, 4099}))
-    modes = (
-        ("full", "payload_rsag", "pull")
-        if family == "joint_latency"
-        else ("payload_rsag", "bulk_push", "bulk_pull", "pull")
-    )
+    if pack_counts is None:
+        pack_counts = tuple(sorted({1, world - 1, world + 1, 257, 4099}))
+    modes = joint_modes(family, world)
     manager = PCIeAllReduce.from_exchange_group(
         joint=True,
         exchange_group=dist.group.WORLD,
@@ -135,7 +204,7 @@ def _exercise(rank, world, family, alias):
                 out=out,
                 override=CollectiveConfig(
                     implementation=family,
-                    threads=256,
+                    threads=threads,
                     blocks=64,
                     submode=modes[0],
                     active_blocks=16,
@@ -147,20 +216,26 @@ def _exercise(rank, world, family, alias):
                     plan.request(
                         name=name,
                         collective=CollectiveRequirement(name, tuple(range(world))),
-                        prepare_call=lambda state,
-                        source=source,
-                        out=out: _prepare_plain_call(state, inp=source, out=out),
+                        prepare_call=lambda state, source=source, out=out: (
+                            _prepare_plain_call(state, inp=source, out=out)
+                        ),
                     ),
                 ),
-                coordinator=lambda progress: progress.ready_collectives[0].key
-                if progress.ready_collectives
-                else None,
+                coordinator=lambda progress: (
+                    progress.ready_collectives[0].key
+                    if progress.ready_collectives
+                    else None
+                ),
             )
             graph = torch.cuda.CUDAGraph()
             dist.barrier()
             with session.capture(), manager.capture(), torch.cuda.graph(graph):
                 manager.all_reduce(source, out=out, plan=plan)
             graphs.append((graph, source, out, plan.prepared.state))
+        oversized = None
+        if world > 2:
+            _, source, out, state = graphs[-1]
+            oversized = _oversubscribed_graph(state, source, out)
         session.freeze()
         for graph, source, out, state in graphs:
             profiles = state.profiles
@@ -169,10 +244,37 @@ def _exercise(rank, world, family, alias):
             for step, active in enumerate((1, 4, 2, 8, 1, 64)):
                 sequence = modes if step % 2 == 0 else tuple(reversed(modes))
                 for mode in sequence:
-                    state.select_profile(mode, active)
-                    _poison_scratch(state, rollover=step == 2)
+                    mode_spec = joint_mode_spec(mode)
+                    selected_active = 1 if mode_spec.phased else active
                     values = _operands(world, source.numel(), step)
-                    expected = _reference(values, rank, mode)
+                    base_mode = next(
+                        spec.name
+                        for spec in JOINT_MODE_SPECS
+                        if spec.mode == mode_spec.base
+                    )
+                    expected = _reference(values, rank, base_mode)
+                    base_bits = None
+                    if mode_spec.phased:
+                        state.select_profile(base_mode, 1)
+                        source.copy_(values[rank])
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        base_bits = out.cpu().view(torch.int16)
+                    state.select_profile(mode, selected_active)
+                    _poison_scratch(state, rollover=step == 2)
+                    if step == 2:
+                        _phase_completions(state, 0xFFFFFFFD)
+                    phases_before = _phase_completions(state)
+                    phases_per_replay = (
+                        (world - 1) * (1 if base_mode == "full" else 2)
+                        if mode_spec.phased
+                        else 0
+                    )
+                    replay_graph = (
+                        oversized[0]
+                        if mode_spec.phased and step == 5 and state is graphs[-1][3]
+                        else graph
+                    )
                     for replay in range(3):
                         source.copy_(values[rank])
                         if not alias:
@@ -180,7 +282,7 @@ def _exercise(rank, world, family, alias):
                         torch.cuda.synchronize()
                         dist.barrier()
                         before = torch.cuda.memory_stats()
-                        graph.replay()
+                        replay_graph.replay()
                         torch.cuda.synchronize()
                         after = torch.cuda.memory_stats()
                         for counter in (
@@ -198,6 +300,15 @@ def _exercise(rank, world, family, alias):
                         torch.testing.assert_close(
                             out.cpu(), expected, rtol=0, atol=0, equal_nan=True
                         )
+                        if base_bits is not None:
+                            assert torch.equal(
+                                out.cpu().view(torch.int16), base_bits
+                            ), mode
+                        assert (
+                            _phase_completions(state)
+                            == (phases_before + phases_per_replay * (replay + 1))
+                            & 0xFFFFFFFF
+                        )
                         if not alias:
                             torch.testing.assert_close(
                                 source.cpu(),
@@ -211,13 +322,15 @@ def _exercise(rank, world, family, alias):
                     assert selector_address == state.selector.data_ptr()
                     assert state.profiles == profiles
     finally:
+        if "oversized" in locals() and oversized is not None:
+            oversized[0].reset()
         for graph, *_ in graphs:
             graph.reset()
         session.close()
         manager.close()
 
 
-def _worker(rank, world, directory, family, alias):
+def _worker(rank, world, directory, family, alias, large=False, threads=256):
     import torch
     import torch.distributed as dist
 
@@ -234,7 +347,15 @@ def _worker(rank, world, directory, family, alias):
         if family == "provisioning":
             _exercise_provisioning(rank)
         else:
-            _exercise(rank, world, family, alias)
+            pack_counts = (
+                tuple(
+                    size // 16
+                    for size in (81920, 327680, 655360, 1310720, 2621440, 8388608)
+                )
+                if large
+                else None
+            )
+            _exercise(rank, world, family, alias, pack_counts, threads)
     finally:
         gc.collect()
         dist.destroy_process_group()
@@ -256,6 +377,28 @@ def test_joint_profile_graph_transitions(world, family, alias, tmp_path):
         pytest.skip("insufficient assigned GPUs")
     mp.spawn(
         _worker, args=(world, str(tmp_path), family, alias), nprocs=world, join=True
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("B12X_RUN_JOINT_PCIE_TEST") != "1",
+    reason="requires an assigned peer-accessible GPU group",
+)
+@pytest.mark.parametrize("family", ("joint_latency", "joint_bandwidth"))
+@pytest.mark.parametrize("alias", (False, True))
+@pytest.mark.parametrize("threads", (256, 512))
+def test_joint_phased_large_payloads(family, alias, threads, tmp_path):
+    """Check phased/base bit parity and phase execution from 80 KiB through 8 MiB."""
+    import torch
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 4:
+        pytest.skip("requires four assigned GPUs")
+    mp.spawn(
+        _worker,
+        args=(4, str(tmp_path), family, alias, True, threads),
+        nprocs=4,
+        join=True,
     )
 
 
@@ -308,9 +451,11 @@ def _exercise_provisioning(rank):
                         ),
                     ),
                 ),
-                coordinator=lambda progress: progress.ready_collectives[0].key
-                if progress.ready_collectives
-                else None,
+                coordinator=lambda progress: (
+                    progress.ready_collectives[0].key
+                    if progress.ready_collectives
+                    else None
+                ),
             )
             state = plan.prepared.state
             state.run_plain(source, out)

@@ -8,6 +8,9 @@ from b12x.comm.pcie._collective_tuning import CollectiveConfig, CollectiveQuery,
 from b12x.comm.pcie._joint_profile import (
     JOINT_FAMILIES,
     JOINT_MODES,
+    JOINT_MODE_SPECS,
+    joint_mode_spec,
+    joint_modes,
     joint_slot_packs,
     profile_index,
     profile_records,
@@ -19,9 +22,11 @@ from b12x.preparation import FrozenMapping, autotune_effort
 @pytest.mark.parametrize("family", JOINT_FAMILIES)
 def test_profile_table_selects_every_admitted_mode_and_grid(family):
     records = profile_records(family, 64)
-    assert len(records) == 64 * len(JOINT_FAMILIES[family])
+    assert len(records) == sum(
+        1 if joint_mode_spec(mode).phased else 64 for mode in JOINT_FAMILIES[family]
+    )
     for mode in JOINT_FAMILIES[family]:
-        for blocks in range(1, 65):
+        for blocks in range(1, (1 if joint_mode_spec(mode).phased else 64) + 1):
             selected = selected_profile(family, 64, mode, blocks)
             assert selected >> 16 == JOINT_MODES[mode]
             assert selected & 0xFFFF == blocks
@@ -96,7 +101,7 @@ def test_joint_tuning_keeps_modes_at_large_tp2_payloads(family):
         candidates = tuple(
             config for _, config in TUNING.iterate(TUNING.configure(query, device=None))
         )
-    assert {c.submode for c in candidates} == set(JOINT_FAMILIES[family])
+    assert {c.submode for c in candidates} == set(joint_modes(family, 2))
     assert {c.threads for c in candidates} == {32, 64, 128, 256, 512}
     assert {c.blocks for c in candidates} == {64}
     assert {c.active_blocks for c in candidates} == {1, 2, 4, 8, 16, 32, 36, 64}
@@ -334,3 +339,91 @@ def test_external_channel_does_not_advertise_unprovisioned_joint_candidates(
     candidates = oneshot_alternatives(provisioned, runtime)
     assert set(JOINT_FAMILIES).issubset(candidates)
     assert all(candidates[family][0].call["blocks"] == 48 for family in JOINT_FAMILIES)
+
+
+@pytest.mark.parametrize("world", (2, 3, 4, 6, 8, 10))
+@pytest.mark.parametrize("family", JOINT_FAMILIES)
+def test_phased_profiles_require_one_active_cta_and_more_than_two_ranks(world, family):
+    query = _query(family, 4099)
+    alternatives = query.alternatives.to_dict()
+    alternatives[family]["world_size"] = world
+    query = replace(query, world_size=world, alternatives=FrozenMapping(alternatives))
+    with autotune_effort("default"):
+        candidates = tuple(
+            c for _, c in TUNING.iterate(TUNING.configure(query, device=None))
+        )
+    modes = joint_modes(family, world)
+    assert {c.submode for c in candidates} == set(modes)
+    for spec in JOINT_MODE_SPECS:
+        if not spec.phased or family not in spec.families:
+            continue
+        phased = [c for c in candidates if c.submode == spec.name]
+        assert bool(phased) == (world != 2)
+        assert all(c.active_blocks == 1 for c in phased)
+        for active in (2, 4, 64):
+            with pytest.raises(ValueError):
+                selected_profile(family, 64, spec.name, active, world=world)
+        if world == 2:
+            with pytest.raises(ValueError):
+                selected_profile(family, 64, spec.name, 1, world=world)
+
+
+def test_public_joint_metadata_does_not_import_cuda_modules():
+    import subprocess
+    import sys
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from b12x.comm.pcie.joint_profiles import joint_modes; "
+            "import sys; assert 'torch' not in sys.modules; "
+            "assert 'cuda.bindings.driver' not in sys.modules; "
+            "assert 'full_phased' in joint_modes('joint_latency', 4)",
+        ],
+        check=True,
+    )
+
+
+@pytest.mark.parametrize("world,active", ((2, 1), (4, 2), (4, 64)))
+def test_joint_plan_rejects_unsafe_phased_profiles_before_preparation(world, active):
+    from types import SimpleNamespace
+    from b12x.comm.pcie._joint_preparation import plan
+
+    query = SimpleNamespace(
+        world_size=world,
+        call=dict(
+            transport="joint_bandwidth",
+            blocks=64,
+            submode="bulk_push_phased",
+            active_blocks=active,
+        ),
+    )
+    with pytest.raises(ValueError):
+        plan(query, runtime=None)
+
+
+@pytest.mark.parametrize("world,active", ((2, 1), (4, 2), (4, 64)))
+def test_runtime_selection_rejects_unsafe_phased_profiles_before_cuda(
+    monkeypatch, world, active
+):
+    from types import SimpleNamespace
+    from b12x.comm.pcie import _joint_preparation
+
+    state = _joint_preparation._JointExecutionState.__new__(
+        _joint_preparation._JointExecutionState
+    )
+    state.query = SimpleNamespace(
+        world_size=world, call=dict(transport="joint_bandwidth", blocks=64)
+    )
+    state.runtime = SimpleNamespace(_closed=False, device=None, exchange_group=None)
+    monkeypatch.setattr(
+        _joint_preparation, "_is_current_stream_capturing", lambda device: False
+    )
+    monkeypatch.setattr(
+        _joint_preparation,
+        "_run_collective_preallocation_setup",
+        lambda **kwargs: kwargs["setup"](),
+    )
+    with pytest.raises(ValueError):
+        state.select_profile("bulk_push_phased", active)

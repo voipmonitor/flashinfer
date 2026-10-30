@@ -3,6 +3,7 @@
 import math
 from pathlib import Path
 
+from b12x.comm.pcie.joint_profiles import JOINT_MODE_SPECS
 from b12x.tools._collective_ladder_search import read_report
 
 
@@ -75,6 +76,7 @@ def _heading(path, metadata, summary, rows):
 
 
 def _choice_figure(sizes, rows, heading, details):
+    from matplotlib import colormaps
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.colors import ListedColormap
     from matplotlib.figure import Figure
@@ -96,11 +98,11 @@ def _choice_figure(sizes, rows, heading, details):
     handles = []
     palettes = (
         ("#3366ad", "#e28c27"),
-        ("#4169a1", "#9561b1", "#49954a", "#169a9d", "#cc6a38"),
+        tuple(colormaps["tab10"](index) for index in range(len(JOINT_MODE_SPECS))),
     )
     orders = (
         ("joint_latency", "joint_bandwidth"),
-        ("full", "payload_rsag", "bulk_push", "bulk_pull", "pull"),
+        tuple(spec.name for spec in JOINT_MODE_SPECS),
     )
     for axis, field, title, palette, order in zip(
         axes,

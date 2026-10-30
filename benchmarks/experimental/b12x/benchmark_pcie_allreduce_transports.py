@@ -31,6 +31,11 @@ from b12x.comm.pcie.pcie_allreduce import PCIeAllReduce
 from b12x.comm.pcie import CollectiveConfig
 from b12x.comm.pcie._collective_tuning import plan as collective_plan
 from b12x.comm.pcie._tuning import PcieQuery
+from b12x.comm.pcie.joint_profiles import (
+    JOINT_MODE_SPECS,
+    JointMode,
+    joint_mode_spec,
+)
 from b12x.preparation import CollectiveRequirement, FrozenMapping, PreparationSession
 
 
@@ -262,21 +267,21 @@ def prepare(
 def reference(operands, rank, transport, submode=None):
     world, elements = operands.shape
     if transport in ("joint_latency", "joint_bandwidth"):
-        transport = {
-            "full": "remote_push_full",
-            "payload_rsag": "remote_push_rsag",
-            "bulk_push": "bulk_push",
-            "bulk_pull": "bulk_pull",
-            "pull": "pull",
-        }[submode]
-    bulk = transport in ("bulk_push", "bulk_pull")
-    if transport not in ("remote_push_rsag", "twoshot", "bulk_push", "bulk_pull"):
+        base = joint_mode_spec(submode).base
+        bulk = base in (JointMode.BULK_PUSH, JointMode.BULK_PULL)
+        partitioned = bulk or base == JointMode.PAYLOAD_RSAG
+        round_up = bulk
+    else:
+        bulk = transport in ("bulk_push", "bulk_pull")
+        partitioned = bulk or transport in ("remote_push_rsag", "twoshot")
+        round_up = bulk or transport == "twoshot"
+    if not partitioned:
         total = operands[rank].float()
         for peer in range(1, world):
             total += operands[(rank + peer) % world].float()
         return total.to(operands.dtype)
     packs = elements // 8
-    part = -(-packs // world) if transport == "twoshot" or bulk else packs // world
+    part = -(-packs // world) if round_up else packs // world
     result = torch.empty(elements, dtype=operands.dtype)
     for owner in range(world):
         begin = min(elements, owner * part * 8)
@@ -308,7 +313,7 @@ def main():
     parser.add_argument("--blocks", type=int, default=16)
     parser.add_argument(
         "--joint-submode",
-        choices=("full", "payload_rsag", "bulk_push", "bulk_pull", "pull"),
+        choices=tuple(spec.name for spec in JOINT_MODE_SPECS),
     )
     parser.add_argument("--joint-active-blocks", type=int, default=16)
     parser.add_argument("--joint-max-blocks", type=int, default=64)

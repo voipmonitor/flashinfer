@@ -347,7 +347,7 @@ class JointCollector:
     def measure(self, size, configs, rounds=3):
         """Return six per-invocation rank maxima per round from three fixtures."""
         import torch
-        from b12x.comm.pcie._joint_profile import selected_profile
+        from b12x.comm.pcie.joint_profiles import selected_profile
         from b12x.comm.pcie.pcie_oneshot import _require_collective_contract
 
         if type(rounds) is not int or not 1 <= rounds <= self._MAX_ROUNDS:
@@ -385,6 +385,7 @@ class JointCollector:
                         config["blocks"],
                         config["submode"],
                         config["active_blocks"],
+                        world=self.world,
                     )
                 )
                 return state

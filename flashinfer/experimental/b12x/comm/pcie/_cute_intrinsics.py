@@ -677,6 +677,22 @@ def plain_graph_epoch_arrive(
 
 
 @dsl_user_op
+def threadfence_sys(*, loc=None, ip=None) -> None:
+    """Order this thread's peer writes before the next destination phase."""
+    llvm.inline_asm(
+        None,
+        [],
+        "fence.sc.sys;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def threadfence_gpu(*, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,

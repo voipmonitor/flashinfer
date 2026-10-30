@@ -139,3 +139,37 @@ def test_single_bucket_render(report):
     writer.append_summary(summary)
     writer.close()
     assert all(path.is_file() for path in plot_report(path.with_name("single.jsonl")))
+
+
+def test_every_typed_mode_has_a_distinct_legend_color():
+    pytest.importorskip("matplotlib")
+    from b12x.comm.pcie.joint_profiles import JOINT_MODE_SPECS
+
+    rows = [
+        dict(
+            confirmed=True,
+            config=dict(
+                implementation=spec.families[0],
+                submode=spec.name,
+                threads=64,
+                blocks=64,
+                active_blocks=1,
+            ),
+        )
+        for spec in JOINT_MODE_SPECS
+    ]
+    sizes = [1024 * (index + 1) for index in range(len(rows))]
+    figure = _choice_figure(sizes, rows, "Typed modes", "Measured configurations")
+    try:
+        legend = figure.legends[0]
+        labels = [text.get_text() for text in legend.get_texts()]
+        colors = {
+            label: tuple(handle.get_facecolor())
+            for label, handle in zip(labels, legend.get_patches())
+        }
+        assert all(spec.name in colors for spec in JOINT_MODE_SPECS)
+        assert len({colors[spec.name] for spec in JOINT_MODE_SPECS}) == len(
+            JOINT_MODE_SPECS
+        )
+    finally:
+        figure.clear()

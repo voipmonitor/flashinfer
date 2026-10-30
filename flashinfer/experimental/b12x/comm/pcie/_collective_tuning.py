@@ -14,7 +14,7 @@ from b12x.preparation import (
 from b12x.preparation._efficiency import capture_autotune_effort
 
 from ._tuning import PcieQuery, TUNING as NATIVE
-from ._joint_profile import JOINT_FAMILIES
+from ._joint_profile import JOINT_FAMILIES, JointMode, joint_modes, joint_mode_spec
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -43,13 +43,14 @@ def _configs(query):
         threads = int(call["threads"])
         if name in JOINT_FAMILIES:
             for count_threads in (32, 64, 128, 256, 512):
-                for mode in JOINT_FAMILIES[name]:
+                for mode in joint_modes(name, query.world_size):
+                    mode_spec = joint_mode_spec(mode)
                     units = int(call["size_packs"])
-                    if mode in ("bulk_push", "bulk_pull"):
+                    if mode_spec.base in (JointMode.BULK_PUSH, JointMode.BULK_PULL):
                         units = -(-units // query.world_size)
                     covering = max(1, -(-units // count_threads))
                     for active in dict.fromkeys(
-                        min(count, blocks)
+                        1 if mode_spec.phased else min(count, blocks)
                         for count in (1, 2, 4, 8, 16, 32, 36, blocks, covering)
                     ):
                         yield CollectiveConfig(
@@ -220,8 +221,9 @@ def _parameters(query, device):
                 or query.default.implementation == "pull"
                 or query.operation == "all_reduce"
             ),
-            lambda value: effort is AutotuneEffort.OFF
-            or _efficient_plain_grid(query, value),
+            lambda value: (
+                effort is AutotuneEffort.OFF or _efficient_plain_grid(query, value)
+            ),
         ),
         autotune_effort=effort,
     )
@@ -344,7 +346,7 @@ def _family_bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=7,
-    candidate_contract_version=3,
+    candidate_contract_version=4,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")

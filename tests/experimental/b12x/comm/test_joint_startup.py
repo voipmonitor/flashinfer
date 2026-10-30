@@ -8,7 +8,7 @@ def test_joint_finalist_policy_preserves_mode_and_compiled_geometry():
     policy = joint_finalist_policy()
     assert policy.family_fields == ("implementation", "threads", "blocks", "submode")
     assert policy.per_family == 1
-    assert policy.max_total == 35
+    assert policy.max_total == 55
 
 
 def test_unprepared_joint_startup_rejected():
@@ -72,6 +72,8 @@ def test_explicit_runtime_profiles_need_no_measured_finalists(prepared_joint):
         (("bulk_push", 65),),
         (("bulk_push", True),),
         (("full", 1),),
+        (("bulk_push_phased", 2),),
+        (("payload_rsag_phased", 64),),
         (("bulk_pull", 8), ("bulk_pull", 8)),
         ("bulk_pull",),
         (("bulk_pull",),),
@@ -80,3 +82,19 @@ def test_explicit_runtime_profiles_need_no_measured_finalists(prepared_joint):
 def test_invalid_explicit_runtime_profiles(prepared_joint, profiles):
     with pytest.raises(ValueError):
         joint_startup_spec(prepared_joint, profiles=profiles)
+
+
+def test_startup_choice_labels_are_defined_by_protocol_metadata(prepared_joint):
+    spec = joint_startup_spec(
+        prepared_joint, profiles=(("bulk_push_phased", 1), ("bulk_pull", 8))
+    )
+    assert spec.choice_labels() == (
+        ((7 << 16) | 1, "Phased bulk push (1 CTA)"),
+        ((3 << 16) | 8, "Bulk pull (8 CTAs)"),
+    )
+
+
+def test_startup_profiles_reject_phased_tp2(prepared_joint):
+    prepared_joint.prepared.state.query.world_size = 2
+    with pytest.raises(ValueError, match="rank group"):
+        joint_startup_spec(prepared_joint, profiles=(("bulk_push_phased", 1),))
