@@ -159,6 +159,57 @@ work before entering this method with identical arguments. A profile change
 cannot occur during capture or overlap graph replay. No topology is inferred
 from the profile; callers choose the prepared profile explicitly.
 
+### Cluster-scoped phased profiles
+
+Experimental cluster profiles opt in through
+`AllReduce.plan(..., joint_only=True, joint_cluster_size=8)`. The default is
+`joint_cluster_size=1`, which preserves ordinary queries and launch policy.
+Cluster plans require SM120/SM121, at least 64 SMs, 512 threads per CTA, and a
+fixed 64-CTA grid. Preparation checks that the compiled kernel can keep this
+grid resident with eight CTAs per cluster; unsupported geometry is rejected.
+
+`joint_latency` additionally admits `full_phased` and `payload_rsag_phased`;
+`joint_bandwidth` additionally admits `payload_rsag_phased`. These modes require
+exactly eight active CTAs: one complete cluster. All other clusters return
+before accessing IPC state. Each writer issues a system fence before the
+active cluster synchronizes and advances to its next peer destination.
+Ordinary modes retain active counts 1–64 and execute without cluster barriers.
+Both paths use the same workspace layout, BF16 arithmetic, and aliasing contract.
+
+For an established joint channel, declare the geometry with the existing
+configuration type and submit the plan through the normal preparation batch:
+
+```python
+plan = runtime.plan(
+    inp,
+    out=out,
+    joint_only=True,
+    joint_cluster_size=8,
+    override=CollectiveConfig(
+        implementation="joint_bandwidth",
+        threads=512,
+        blocks=64,
+        submode="payload_rsag_phased",
+        active_blocks=8,
+    ),
+)
+```
+
+After preparation, a startup specification can retain ordinary alternatives
+alongside the phased profile:
+
+```python
+spec = joint_startup_spec(
+    plan,
+    profiles=(("payload_rsag_phased", 8), ("bulk_pull", 11), ("payload_rsag", 42)),
+)
+```
+
+The cluster dimension is immutable plan metadata, while the selected mode and
+active count remain device data. Startup selection and serving use the same
+compiled launcher. Cluster launches use ordinary CUDA graph kernel attributes,
+without cooperative launch or additional protocol counters.
+
 ### Captured startup mode selection
 
 `AllReduce.plan(...)` excludes joint kernels by default and retains static transport
