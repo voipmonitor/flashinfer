@@ -14,7 +14,7 @@ from ._collective_ladder_sampling import (
 )
 
 
-COMPILED_FIELDS = ("implementation", "threads", "blocks")
+COMPILED_FIELDS = ("implementation", "threads", "blocks", "cooperative")
 
 
 def ladder_sizes():
@@ -31,7 +31,7 @@ def _copy(value):
 
 
 def _compiled(config):
-    return {field: config[field] for field in COMPILED_FIELDS}
+    return {field: config[field] for field in COMPILED_FIELDS if field in config}
 
 
 def _record(record):
@@ -434,7 +434,10 @@ class Search:
         config = self.configs[size, key]
 
         def distance(other):
-            compiled = sum(config[field] != other[field] for field in COMPILED_FIELDS)
+            compiled = sum(
+                config.get(field, False) != other.get(field, False)
+                for field in COMPILED_FIELDS
+            )
             categorical, numeric = 0, 0.0
             for field, value in config.items():
                 previous = other.get(field)

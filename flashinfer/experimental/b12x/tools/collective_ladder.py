@@ -68,6 +68,11 @@ def parser():
     result.add_argument("--points-per-doubling", type=int, default=16)
     result.add_argument("--cache-policy", choices=("cold", "warm"), default="cold")
     result.add_argument(
+        "--cooperative-phased",
+        action="store_true",
+        help="include resident cooperative grids for phased protocols",
+    )
+    result.add_argument(
         "--alias",
         action="store_true",
         help="use exact input/output aliases instead of disjoint buffers",
