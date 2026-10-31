@@ -54,6 +54,7 @@ class JointCollector:
             args.cache_policy,
         )
         self.compilation_seconds = 0.0
+        self.cooperative_phased = getattr(args, "cooperative_phased", False)
         self._closed = False
         self._catalogs = {}
         self._states = {}
@@ -185,10 +186,26 @@ class JointCollector:
 
     @staticmethod
     def _geometry(config):
-        return config["implementation"], config["threads"], config["blocks"]
+        return (
+            config["implementation"],
+            config["threads"],
+            config["blocks"],
+            config.get("cooperative", False),
+        )
 
     def _query(self, source, output):
-        return self.manager.plan(source, out=output, joint_only=True).query
+        from dataclasses import replace
+        from b12x.preparation import FrozenMapping
+
+        query = self.manager.plan(source, out=output, joint_only=True).query
+        if self.cooperative_phased:
+            alternatives = {}
+            for name, payload in query.alternatives.items():
+                native = payload.to_dict()
+                native["call"]["cooperative"] = True
+                alternatives[name] = native
+            query = replace(query, alternatives=FrozenMapping(alternatives))
+        return query
 
     def _eligible(self, query):
         from b12x.comm.pcie._collective_tuning import TUNING
@@ -386,6 +403,7 @@ class JointCollector:
                         config["submode"],
                         config["active_blocks"],
                         world=self.world,
+                        cooperative=config.get("cooperative", False),
                     )
                 )
                 return state

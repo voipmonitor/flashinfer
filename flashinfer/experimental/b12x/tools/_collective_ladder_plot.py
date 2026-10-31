@@ -258,7 +258,8 @@ def _bucket_figure(sizes, rows, heading, details):
             face = "#e1ebf8" if family == "L" else "#faecd9"
             suffix = "" if row.get("confirmed", False) else " ?"
             hatch = None if not suffix else "///"
-            text = f"#{index:03d}  {size:,} B\n{family}/{config['submode']}\nT{config['threads']} G{config['blocks']} A{config['active_blocks']}{suffix}"
+            launch = "cooperative" if config.get("cooperative", False) else "ordinary"
+            text = f"#{index:03d}  {size:,} B\n{family}/{config['submode']}\nT{config['threads']} G{config['blocks']} A{config['active_blocks']} {launch}{suffix}"
         axis.add_patch(
             Rectangle(
                 (x, y),
