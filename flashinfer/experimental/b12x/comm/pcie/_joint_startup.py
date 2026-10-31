@@ -5,7 +5,14 @@ from dataclasses import dataclass, field
 import torch
 
 from b12x.preparation import FinalistPolicy
-from ._joint_profile import JOINT_FAMILIES, JOINT_MODES, selected_profile
+from ._joint_profile import (
+    JOINT_FAMILIES,
+    JOINT_MODES,
+    JointLaunchVariant,
+    joint_modes,
+    joint_profile_label,
+    selected_profile,
+)
 
 
 def joint_finalist_policy():
@@ -13,7 +20,7 @@ def joint_finalist_policy():
     return FinalistPolicy(
         family_fields=("implementation", "threads", "blocks", "submode"),
         per_family=1,
-        max_total=35,
+        max_total=5 * sum(len(modes) for modes in JOINT_FAMILIES.values()),
     )
 
 
@@ -25,6 +32,73 @@ class JointStartupSpec:
     state: object = field(compare=False, repr=False)
     inplace: bool
     rank: int
+    variants: tuple[JointLaunchVariant, ...] = ()
+
+    @property
+    def selector_values(self):
+        if self.variants:
+            return tuple(
+                value
+                for index, variant in enumerate(self.variants)
+                for value in variant.encoded_values(index)
+            )
+        return tuple((mode << 16) | active for mode, active in self.profiles)
+
+    def choice_labels(self):
+        """Pair each admitted selector value with its protocol and CTA label."""
+        if self.variants:
+            return tuple(
+                (value, variant.choice_label(mode, active))
+                for index, variant in enumerate(self.variants)
+                for value, (mode, active) in zip(
+                    variant.encoded_values(index), variant.profiles
+                )
+            )
+        return tuple(
+            ((mode << 16) | active, joint_profile_label((mode << 16) | active))
+            for mode, active in self.profiles
+        )
+
+    def candidate_launcher(self, candidate):
+        """Resolve a candidate before capture; the GPU race calls only its kernel."""
+        if self.variants:
+            variant_id = self.selector_values[candidate] >> 24
+            return self.state.variant_launchers[variant_id]
+        return self.state.launcher
+
+    def launch_predicates(self):
+        """Describe captured kernel nodes enabled by each startup selector value."""
+        if not self.variants:
+            return ()
+        from ._joint_functions import joint_function
+
+        allowed = tuple(value.to_bytes(4, "little") for value in self.selector_values)
+        return tuple(
+            JointLaunchPredicate(
+                joint_function(launcher),
+                3,
+                0,
+                self.selector,
+                tuple(
+                    value.to_bytes(4, "little")
+                    for value in variant.encoded_values(index)
+                ),
+                allowed,
+            )
+            for index, (variant, launcher) in enumerate(
+                zip(self.variants, self.state.variant_launchers, strict=True)
+            )
+        )
+
+
+@dataclass(frozen=True)
+class JointLaunchPredicate:
+    function: int
+    selector_argument_index: int
+    selector_argument_byte_offset: int
+    selector: torch.Tensor = field(compare=False, repr=False)
+    enabled_values: tuple[bytes, ...]
+    allowed_values: tuple[bytes, ...]
 
 
 def joint_startup_spec(plan, *, profiles=None):
@@ -38,7 +112,18 @@ def joint_startup_spec(plan, *, profiles=None):
     call = state.query.call
     family = call["transport"]
     geometry = (family, call["threads"], call["blocks"])
-    if profiles is not None:
+    variants = getattr(state, "variants", ())
+    if variants:
+        if profiles is not None:
+            raise ValueError(
+                "compiled joint variants already declare their runtime profiles"
+            )
+        profiles = tuple(
+            (JOINT_MODES[mode], active)
+            for variant in variants
+            for mode, active in variant.profiles
+        )
+    elif profiles is not None:
         profiles = tuple(profiles)
         if not profiles or any(
             not isinstance(profile, (tuple, list)) or len(profile) != 2
@@ -49,7 +134,14 @@ def joint_startup_spec(plan, *, profiles=None):
             )
         encoded = []
         for mode, active in profiles:
-            selected_profile(family, call["blocks"], mode, active)
+            selected_profile(
+                family,
+                call["blocks"],
+                mode,
+                active,
+                world=state.query.world_size,
+                cooperative=call.get("cooperative", False),
+            )
             encoded.append((JOINT_MODES[mode], active))
         if len(set(encoded)) != len(encoded):
             raise ValueError("runtime profiles must be distinct")
@@ -66,9 +158,11 @@ def joint_startup_spec(plan, *, profiles=None):
             ):
                 mode = assignment["submode"]
                 active = assignment["active_blocks"]
-                selected_profile(family, call["blocks"], mode, active)
+                selected_profile(
+                    family, call["blocks"], mode, active, world=state.query.world_size
+                )
                 measured[mode] = (JOINT_MODES[mode], active)
-        modes = JOINT_FAMILIES[family]
+        modes = joint_modes(family, state.query.world_size)
         if set(measured) != set(modes):
             raise ValueError(
                 "startup tuning requires measured finalists for every mode of the selected geometry"
@@ -78,21 +172,26 @@ def joint_startup_spec(plan, *, profiles=None):
     import torch.distributed as dist
 
     members = tuple(dist.get_process_group_ranks(state.runtime.exchange_group))
+    # Variant records already include launch policy; single-launch specs need it too.
+    launch_geometry = (
+        geometry if variants else (*geometry, call.get("cooperative", False))
+    )
     key = (
         "joint_startup",
-        1,
+        2,
         state.query.world_size,
         members,
-        *geometry,
+        *launch_geometry,
         tuple(state.query.setup["shape"]),
         call["dtype"],
         call["size_packs"],
         state.workspace.capacity_packs,
         inplace,
         profiles,
+        variants,
     )
     return JointStartupSpec(
-        key, profiles, state.selector, state, inplace, state.query.rank
+        key, profiles, state.selector, state, inplace, state.query.rank, variants
     )
 
 
@@ -147,7 +246,7 @@ class JointStartupTuner:
                     (len(first.profiles), 21), dtype=torch.int64, device=runtime.device
                 )
                 self.profiles = torch.tensor(
-                    [(mode << 16) | active for mode, active in first.profiles],
+                    first.selector_values,
                     dtype=torch.uint32,
                     device=runtime.device,
                 )
@@ -272,9 +371,9 @@ class JointStartupTuner:
             sample,
         )
 
-    def _collective(self):
+    def _collective(self, candidate):
         work = self.state.workspace
-        self.state.launcher(
+        self.specs[0].candidate_launcher(candidate)(
             work.peer_table.data_ptr(),
             work.signal_table.data_ptr(),
             work.shared.local_ptr,
@@ -289,11 +388,12 @@ class JointStartupTuner:
         """Enqueue the race without allocation, compilation, or host decisions."""
         with torch.cuda.device(self.runtime.device):
             self._timing("reset", 0, self.state.selector)
-            for mode, active in self.specs[0].profiles:
-                self.state.selector.fill_((mode << 16) | active)
+            values = self.specs[0].selector_values
+            for candidate, value in enumerate(values):
+                self.state.selector.fill_(value)
                 for producer in range(3):
                     self.inputs.produce(producer)
-                    self._collective()
+                    self._collective(candidate)
                     torch.ne(
                         self.inputs.out,
                         self.inputs.reference.expected[producer],
@@ -312,15 +412,14 @@ class JointStartupTuner:
                         mode_index = (offset + round_index) % len(
                             self.specs[0].profiles
                         )
-                        mode, active = self.specs[0].profiles[mode_index]
-                        self.state.selector.fill_((mode << 16) | active)
+                        self.state.selector.fill_(values[mode_index])
                         if self.eviction is not None:
                             torch.sum(self.eviction, dim=0, out=self.eviction_sum)
                         self.inputs.produce(producer)
                         sample = mode_index * 21 + round_index * 3 + producer
                         self._timing("begin", sample, self.state.selector)
                         for _ in range(self.inputs.repetitions):
-                            self._collective()
+                            self._collective(mode_index)
                         self._timing("end", sample, self.state.selector)
             for spec in self.specs:
                 self._timing("publish", 0, spec.selector)
@@ -334,14 +433,6 @@ def prepare_joint_startup_tuner(specs, *, cache_policy="cold"):
     if producer.status.item() != 0:
         raise RuntimeError("joint startup fixture validation failed during preparation")
     for spec in producer.specs:
-        call = spec.state.query.call
-        spec.selector.fill_(
-            selected_profile(
-                call["transport"],
-                call["blocks"],
-                call["submode"],
-                call["active_blocks"],
-            )
-        )
+        spec.selector.fill_(spec.state.initial_selector)
     producer.status.fill_(-1)
     return producer

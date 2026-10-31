@@ -257,6 +257,8 @@ def _owned_resident_layout(runtime, native) -> tuple[int, int, int]:
 
 
 def _joint_max_blocks(runtime):
+    # Bound launch geometry, not simultaneous residency. Phased profiles admit
+    # one active CTA independently of this physical grid limit.
     if getattr(runtime, "_joint_workspace", None) is None:
         return 0
     return min(

@@ -1,7 +1,7 @@
 """Fixed-grid BF16 PCIe collectives with device-resident protocol profiles.
 
-The selected uint32 profile contains protocol in its upper 16 bits and the
-participating CTA count in its lower 16 bits. Ranks must select the same profile,
+The selected uint32 profile contains variant in bits 24–31, protocol in bits
+16–23, and participating CTA count in bits 0–15. Ranks select the same profile,
 and profile changes require all ranks' previous replay to have drained.
 """
 
@@ -31,6 +31,8 @@ from ._cute_intrinsics import (
     st_relaxed_sys_global_v4_u32,
     pack_f32x2_to_bf16x2,
     pcie_arrive_and_wait,
+    threadfence_sys,
+    atomic_add_global_u32,
 )
 from ._twoshot_cute import _ld_generic_v4_u32, _st_generic_v4_u32
 
@@ -39,13 +41,17 @@ from ._joint_profile import (
     JOINT_MAX_RANKS,
     JOINT_SIGNAL_BYTES,
     JOINT_MODES,
+    JointMode,
+    JOINT_EPOCH_OFFSET,
+    JOINT_PHASE_COMPLETIONS_OFFSET,
     joint_slot_packs,
 )
 
 _SELF_BYTES = JOINT_MAX_BLOCKS * JOINT_MAX_RANKS * 4
 _FLAG_SLOT_BYTES = JOINT_MAX_BLOCKS * JOINT_MAX_RANKS * 32 * 4
-_EPOCH_OFFSET = JOINT_SIGNAL_BYTES - 8
+_EPOCH_OFFSET = JOINT_EPOCH_OFFSET
 _PREPARED = set()
+_PHASE_PACKS_PER_THREAD = 4
 
 __all__ = [
     "JOINT_MAX_BLOCKS",
@@ -59,13 +65,14 @@ __all__ = [
 
 
 class _JointLaunch(_PackedMath):
-    def __init__(self, family, world_size, rank, threads, max_blocks):
+    def __init__(self, family, world_size, rank, threads, max_blocks, variant_id=None):
         super().__init__("bfloat16")
         self._family = family
         self._world_size = world_size
         self._rank = rank
         self._threads = threads
         self._max_blocks = max_blocks
+        self._variant_id = variant_id
 
     @cute.jit
     def __call__(
@@ -112,6 +119,31 @@ class _JointLaunch(_PackedMath):
         cute.arch.sync_threads()
 
     @cute.jit
+    def _finish_write_phase(self, local_signal: Int64):
+        # Only CTA zero is admitted for phased profiles. Every writer fences
+        # before the CTA releases its next destination; no local CTA is awaited.
+        threadfence_sys()
+        cute.arch.sync_threads()
+        tid, _, _ = cute.arch.thread_idx()
+        if tid == Int32(0):
+            atomic_add_global_u32(
+                local_signal + Int64(JOINT_PHASE_COMPLETIONS_OFFSET), Uint32(1)
+            )
+
+    @cute.jit
+    def _input_words(
+        self, payload: Int64, index: Int64, aliases: cutlass.Constexpr[bool]
+    ):
+        # Exact aliases need coherent loads. Select the cache policy outside
+        # transfer loops so disjoint inputs retain the read-only load sequence.
+        words = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+        if cutlass.const_expr(aliases):
+            words = ld_global_v4_u32(payload + index * Int64(16))
+        else:
+            words = ld_global_nc_v4_u32(payload + index * Int64(16))
+        return words
+
+    @cute.jit
     def _owner(self, index: Int64, size: Int64) -> Int32:
         part = size // Int64(self._world_size)
         if cutlass.const_expr(
@@ -139,28 +171,48 @@ class _JointLaunch(_PackedMath):
         flat: Int64,
         stride: Int64,
         mode: Uint32,
+        local_signal: Int64,
+        phased: cutlass.Constexpr[bool],
     ):
         local = Int64(peers[self._rank]) + capacity * Int64(16)
-        index = flat
-        while index < size:
-            words = ld_global_v4_u32(payload + index * Int64(16))
-            if mode == Uint32(0):
-                for target in cutlass.range_constexpr(self._world_size):
-                    dest = Int64(peers[target]) + (
+        if cutlass.const_expr(phased):
+            for scatter_phase in cutlass.range_constexpr(self._world_size):
+                scatter_target = (self._rank + scatter_phase) % self._world_size
+                index = flat
+                while index < size:
+                    owner = self._owner(index, size)
+                    if (mode == Uint32(JointMode.FULL)) | (
+                        owner == Int32(scatter_target)
+                    ):
+                        words = ld_global_v4_u32(payload + index * Int64(16))
+                        dest = Int64(peers[scatter_target]) + (
+                            capacity + Int64(self._rank) * capacity + index
+                        ) * Int64(16)
+                        self._publish_bf16_words(dest, words)
+                    index += stride
+                if cutlass.const_expr(scatter_phase != 0):
+                    self._finish_write_phase(local_signal)
+        else:
+            index = flat
+            while index < size:
+                words = ld_global_v4_u32(payload + index * Int64(16))
+                if mode == Uint32(JointMode.FULL):
+                    for target in cutlass.range_constexpr(self._world_size):
+                        dest = Int64(peers[target]) + (
+                            capacity + Int64(self._rank) * capacity + index
+                        ) * Int64(16)
+                        self._publish_bf16_words(dest, words)
+                else:
+                    owner = self._owner(index, size)
+                    dest = Int64(peers[owner]) + (
                         capacity + Int64(self._rank) * capacity + index
                     ) * Int64(16)
                     self._publish_bf16_words(dest, words)
-            else:
-                owner = self._owner(index, size)
-                dest = Int64(peers[owner]) + (
-                    capacity + Int64(self._rank) * capacity + index
-                ) * Int64(16)
-                self._publish_bf16_words(dest, words)
-            index += stride
+                index += stride
         index = flat
         while index < size:
             owner = Int32(self._rank)
-            if mode == Uint32(1):
+            if mode == Uint32(JointMode.PAYLOAD_RSAG):
                 owner = self._owner(index, size)
             if owner == Int32(self._rank):
                 acc = cute.make_rmem_tensor((8,), Float32)
@@ -177,15 +229,30 @@ class _JointLaunch(_PackedMath):
                     result[2],
                     result[3],
                 )
-                if mode == Uint32(1):
-                    for target in cutlass.range_constexpr(self._world_size):
-                        if cutlass.const_expr(target != self._rank):
-                            dest = Int64(peers[target]) + (
+                if cutlass.const_expr(not phased):
+                    if mode == Uint32(JointMode.PAYLOAD_RSAG):
+                        for target in cutlass.range_constexpr(self._world_size):
+                            if cutlass.const_expr(target != self._rank):
+                                dest = Int64(peers[target]) + (
+                                    capacity + Int64(self._rank) * capacity + index
+                                ) * Int64(16)
+                                self._publish_bf16_words(dest, result)
+            index += stride
+        if mode == Uint32(JointMode.PAYLOAD_RSAG):
+            if cutlass.const_expr(phased):
+                for gather_phase in cutlass.range_constexpr(1, self._world_size):
+                    gather_target = (self._rank + gather_phase) % self._world_size
+                    index = flat
+                    while index < size:
+                        owner = self._owner(index, size)
+                        if owner == Int32(self._rank):
+                            reduced_words = ld_global_v4_u32(output + index * Int64(16))
+                            dest = Int64(peers[gather_target]) + (
                                 capacity + Int64(self._rank) * capacity + index
                             ) * Int64(16)
-                            self._publish_bf16_words(dest, result)
-            index += stride
-        if mode == Uint32(1):
+                            self._publish_bf16_words(dest, reduced_words)
+                        index += stride
+                    self._finish_write_phase(local_signal)
             index = flat
             while index < size:
                 owner = self._owner(index, size)
@@ -257,6 +324,9 @@ class _JointLaunch(_PackedMath):
         flat: Int64,
         stride: Int64,
         push: cutlass.Constexpr[bool],
+        local_signal: Int64,
+        phased: cutlass.Constexpr[bool],
+        aliases: cutlass.Constexpr[bool],
     ):
         shard = (size + Int64(self._world_size - 1)) // Int64(self._world_size)
         cap_shard = (capacity + Int64(self._world_size - 1)) // Int64(self._world_size)
@@ -264,27 +334,71 @@ class _JointLaunch(_PackedMath):
         reduced_offset = slab_offset + Int64(self._world_size) * cap_shard
         local = Int64(peers[self._rank])
         # Every stage, reduction and gather uses the same shard-relative CTA.
-        index = flat
-        while index < shard:
-            for peer_index in cutlass.range_constexpr(1, self._world_size):
-                target = (self._rank + peer_index) % self._world_size
-                pack = Int64(target) * shard + index
-                if pack < size:
-                    words = ld_global_nc_v4_u32(payload + pack * Int64(16))
-                    if cutlass.const_expr(push):
-                        dest = Int64(peers[target]) + (
-                            slab_offset + Int64(self._rank) * cap_shard + index
-                        ) * Int64(16)
-                        _st_generic_v4_u32(dest, words[0], words[1], words[2], words[3])
-                    else:
-                        st_global_v4_u32(
-                            local + pack * Int64(16),
-                            words[0],
-                            words[1],
-                            words[2],
-                            words[3],
-                        )
-            index += stride
+        if cutlass.const_expr(phased):
+            for scatter_phase in cutlass.range_constexpr(1, self._world_size):
+                scatter_target = (self._rank + scatter_phase) % self._world_size
+                index = flat
+                while index < shard:
+                    scatter_words = cute.make_rmem_tensor(
+                        (_PHASE_PACKS_PER_THREAD, 4), Uint32
+                    )
+                    for scatter_lane in cutlass.range_constexpr(
+                        _PHASE_PACKS_PER_THREAD
+                    ):
+                        scatter_index = index + Int64(scatter_lane) * stride
+                        scatter_pack = Int64(scatter_target) * shard + scatter_index
+                        if (scatter_index < shard) & (scatter_pack < size):
+                            scatter_loaded = self._input_words(
+                                payload, scatter_pack, aliases
+                            )
+                            for scatter_word in cutlass.range_constexpr(4):
+                                scatter_words[scatter_lane, scatter_word] = (
+                                    scatter_loaded[scatter_word]
+                                )
+                    for scatter_lane in cutlass.range_constexpr(
+                        _PHASE_PACKS_PER_THREAD
+                    ):
+                        scatter_index = index + Int64(scatter_lane) * stride
+                        scatter_pack = Int64(scatter_target) * shard + scatter_index
+                        if (scatter_index < shard) & (scatter_pack < size):
+                            scatter_dest = Int64(peers[scatter_target]) + (
+                                slab_offset
+                                + Int64(self._rank) * cap_shard
+                                + scatter_index
+                            ) * Int64(16)
+                            _st_generic_v4_u32(
+                                scatter_dest,
+                                scatter_words[scatter_lane, 0],
+                                scatter_words[scatter_lane, 1],
+                                scatter_words[scatter_lane, 2],
+                                scatter_words[scatter_lane, 3],
+                            )
+                    index += stride * Int64(_PHASE_PACKS_PER_THREAD)
+                self._finish_write_phase(local_signal)
+        else:
+            index = flat
+            while index < shard:
+                for peer_index in cutlass.range_constexpr(1, self._world_size):
+                    target = (self._rank + peer_index) % self._world_size
+                    pack = Int64(target) * shard + index
+                    if pack < size:
+                        words = self._input_words(payload, pack, aliases)
+                        if cutlass.const_expr(push):
+                            dest = Int64(peers[target]) + (
+                                slab_offset + Int64(self._rank) * cap_shard + index
+                            ) * Int64(16)
+                            _st_generic_v4_u32(
+                                dest, words[0], words[1], words[2], words[3]
+                            )
+                        else:
+                            st_global_v4_u32(
+                                local + pack * Int64(16),
+                                words[0],
+                                words[1],
+                                words[2],
+                                words[3],
+                            )
+                index += stride
         self._barrier(signals)
         index = flat
         while index < shard:
@@ -293,7 +407,7 @@ class _JointLaunch(_PackedMath):
                 acc = cute.make_rmem_tensor((8,), Float32)
                 for lane in cutlass.range_constexpr(8):
                     acc[lane] = Float32(0.0)
-                words = ld_global_nc_v4_u32(payload + pack * Int64(16))
+                words = self._input_words(payload, pack, aliases)
                 self._accumulate_words(
                     acc, words[0], words[1], words[2], words[3], False
                 )
@@ -322,7 +436,7 @@ class _JointLaunch(_PackedMath):
                     result[2],
                     result[3],
                 )
-                if cutlass.const_expr(push):
+                if cutlass.const_expr(push and not phased):
                     for peer_index in cutlass.range_constexpr(1, self._world_size):
                         peer = (self._rank + peer_index) % self._world_size
                         address = Int64(peers[peer]) + (
@@ -331,7 +445,7 @@ class _JointLaunch(_PackedMath):
                         _st_generic_v4_u32(
                             address, result[0], result[1], result[2], result[3]
                         )
-                else:
+                elif cutlass.const_expr(not push):
                     st_global_v4_u32(
                         local + (reduced_offset + index) * Int64(16),
                         result[0],
@@ -340,6 +454,43 @@ class _JointLaunch(_PackedMath):
                         result[3],
                     )
             index += stride
+        if cutlass.const_expr(phased):
+            for gather_phase in cutlass.range_constexpr(1, self._world_size):
+                gather_target = (self._rank + gather_phase) % self._world_size
+                index = flat
+                while index < shard:
+                    gather_words = cute.make_rmem_tensor(
+                        (_PHASE_PACKS_PER_THREAD, 4), Uint32
+                    )
+                    for gather_lane in cutlass.range_constexpr(_PHASE_PACKS_PER_THREAD):
+                        gather_index = index + Int64(gather_lane) * stride
+                        gather_pack = Int64(self._rank) * shard + gather_index
+                        if (gather_index < shard) & (gather_pack < size):
+                            gather_loaded = ld_global_v4_u32(
+                                output + gather_pack * Int64(16)
+                            )
+                            for gather_word in cutlass.range_constexpr(4):
+                                gather_words[gather_lane, gather_word] = gather_loaded[
+                                    gather_word
+                                ]
+                    for gather_lane in cutlass.range_constexpr(_PHASE_PACKS_PER_THREAD):
+                        gather_index = index + Int64(gather_lane) * stride
+                        gather_pack = Int64(self._rank) * shard + gather_index
+                        if (gather_index < shard) & (gather_pack < size):
+                            gather_dest = Int64(peers[gather_target]) + (
+                                reduced_offset
+                                + Int64(self._rank) * cap_shard
+                                + gather_index
+                            ) * Int64(16)
+                            _st_generic_v4_u32(
+                                gather_dest,
+                                gather_words[gather_lane, 0],
+                                gather_words[gather_lane, 1],
+                                gather_words[gather_lane, 2],
+                                gather_words[gather_lane, 3],
+                            )
+                    index += stride * Int64(_PHASE_PACKS_PER_THREAD)
+                self._finish_write_phase(local_signal)
         self._barrier(signals)
         for peer_index in cutlass.range_constexpr(1, self._world_size):
             peer = (self._rank + peer_index) % self._world_size
@@ -366,6 +517,52 @@ class _JointLaunch(_PackedMath):
                     )
                 index += stride
 
+    @cute.jit
+    def _bulk_for_output(
+        self,
+        peers: cute.Pointer,
+        signals: cute.Pointer,
+        payload: Int64,
+        output: Int64,
+        size: Int64,
+        capacity: Int64,
+        flat: Int64,
+        stride: Int64,
+        push: cutlass.Constexpr[bool],
+        local_signal: Int64,
+        phased: cutlass.Constexpr[bool],
+    ):
+        if payload == output:
+            self._bulk(
+                peers,
+                signals,
+                payload,
+                output,
+                size,
+                capacity,
+                flat,
+                stride,
+                push,
+                local_signal,
+                phased,
+                True,
+            )
+        else:
+            self._bulk(
+                peers,
+                signals,
+                payload,
+                output,
+                size,
+                capacity,
+                flat,
+                stride,
+                push,
+                local_signal,
+                phased,
+                False,
+            )
+
     @cute.kernel
     def kernel(
         self,
@@ -385,6 +582,11 @@ class _JointLaunch(_PackedMath):
         profile = selector[0]
         mode = profile >> Uint32(16)
         active = profile & Uint32(0xFFFF)
+        if cutlass.const_expr(self._variant_id is not None):
+            # A losing captured variant must not advance epochs or touch IPC state.
+            mode = mode & Uint32(0xFF)
+            if (profile >> Uint32(24)) != Uint32(self._variant_id):
+                active = Uint32(0)
         if Uint32(bid) < active:
             slot_peers = peers + Int64(generation % Uint32(2)) * Int64(16)
             cute.arch.sync_threads()
@@ -398,18 +600,65 @@ class _JointLaunch(_PackedMath):
             stride = Int64(active) * Int64(self._threads)
             src = Int64(payload.toint())
             dst = Int64(output.toint())
-            if mode == Uint32(4):
+            if mode == Uint32(JointMode.PULL):
                 self._pull(slot_peers, signals, src, dst, size, flat, stride)
-            elif mode == Uint32(1):
-                self._ready(slot_peers, src, dst, size, capacity, flat, stride, mode)
+            elif mode == Uint32(JointMode.PAYLOAD_RSAG):
+                self._ready(
+                    slot_peers,
+                    src,
+                    dst,
+                    size,
+                    capacity,
+                    flat,
+                    stride,
+                    Uint32(JointMode.PAYLOAD_RSAG),
+                    self_signal,
+                    False,
+                )
+            elif mode == Uint32(JointMode.PAYLOAD_RSAG_PHASED):
+                self._ready(
+                    slot_peers,
+                    src,
+                    dst,
+                    size,
+                    capacity,
+                    flat,
+                    stride,
+                    Uint32(JointMode.PAYLOAD_RSAG),
+                    self_signal,
+                    True,
+                )
             else:
                 if cutlass.const_expr(self._family == "latency"):
-                    self._ready(
-                        slot_peers, src, dst, size, capacity, flat, stride, mode
-                    )
+                    if mode == Uint32(JointMode.FULL_PHASED):
+                        self._ready(
+                            slot_peers,
+                            src,
+                            dst,
+                            size,
+                            capacity,
+                            flat,
+                            stride,
+                            Uint32(JointMode.FULL),
+                            self_signal,
+                            True,
+                        )
+                    else:
+                        self._ready(
+                            slot_peers,
+                            src,
+                            dst,
+                            size,
+                            capacity,
+                            flat,
+                            stride,
+                            Uint32(JointMode.FULL),
+                            self_signal,
+                            False,
+                        )
                 else:
-                    if mode == Uint32(2):
-                        self._bulk(
+                    if mode == Uint32(JointMode.BULK_PUSH_PHASED):
+                        self._bulk_for_output(
                             slot_peers,
                             signals,
                             src,
@@ -419,9 +668,11 @@ class _JointLaunch(_PackedMath):
                             flat,
                             stride,
                             True,
+                            self_signal,
+                            True,
                         )
-                    else:
-                        self._bulk(
+                    elif mode == Uint32(JointMode.BULK_PUSH):
+                        self._bulk_for_output(
                             slot_peers,
                             signals,
                             src,
@@ -430,6 +681,22 @@ class _JointLaunch(_PackedMath):
                             capacity,
                             flat,
                             stride,
+                            True,
+                            self_signal,
+                            False,
+                        )
+                    else:
+                        self._bulk_for_output(
+                            slot_peers,
+                            signals,
+                            src,
+                            dst,
+                            size,
+                            capacity,
+                            flat,
+                            stride,
+                            False,
+                            self_signal,
                             False,
                         )
 
@@ -441,7 +708,16 @@ def is_joint_launcher_prepared(
 
 
 @program_cache
-def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_index):
+def get_joint_launcher(
+    family,
+    world_size,
+    rank,
+    threads,
+    max_blocks,
+    device_index,
+    cooperative=False,
+    variant_id=None,
+):
     if family not in ("latency", "bandwidth"):
         raise ValueError("joint family must be latency or bandwidth")
     if world_size not in (2, 3, 4, 6, 8, 10) or not 0 <= rank < world_size:
@@ -454,8 +730,20 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
         512,
     ):
         raise ValueError("invalid joint launch geometry")
+    if type(cooperative) is not bool or (
+        variant_id is not None
+        and (type(variant_id) is not int or not 0 <= variant_id <= 255)
+    ):
+        raise ValueError("invalid joint launch variant")
     key = (family, world_size, rank, threads, max_blocks, device_index)
-    launch = _JointLaunch(family, world_size, rank, threads, max_blocks)
+    if cooperative or variant_id is not None:
+        key = (*key, cooperative, variant_id)
+    launch_type = _JointLaunch
+    if cooperative:
+        from ._joint_cooperative_cute import _CooperativeJointLaunch
+
+        launch_type = _CooperativeJointLaunch
+    launch = launch_type(family, world_size, rank, threads, max_blocks, variant_id)
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     raw = b12x_compile(
         launch,
@@ -468,7 +756,11 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint", 5, key[:-1]),
+        compile_spec=KernelCompileSpec.from_key(
+            "comm.pcie.joint",
+            219,
+            (family, world_size, rank, threads, max_blocks, cooperative, variant_id),
+        ),
     )
 
     def run(

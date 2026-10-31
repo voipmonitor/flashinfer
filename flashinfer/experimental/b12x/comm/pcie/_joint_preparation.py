@@ -9,7 +9,12 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import MemoryRequirements, PersistentMemory, Plan
 
-from ._joint_profile import profile_index, profile_records, selected_profile
+from ._joint_profile import (
+    JointLaunchVariant,
+    profile_records,
+    selected_profile,
+    validate_joint_variants,
+)
 from ._oneshot_preparation import _OneshotExecutionState
 from ._tuning import TUNING
 from .pcie_oneshot import (
@@ -108,23 +113,47 @@ def _workspace(runtime):
 
 
 @program_cache(scope="preparation")
-def compile_joint(family, world, rank, threads, max_blocks, ordinal):
+def compile_joint(
+    family,
+    world,
+    rank,
+    threads,
+    max_blocks,
+    ordinal,
+    cooperative=False,
+    variant_id=None,
+):
     from ._joint_cute import get_joint_launcher
 
-    return get_joint_launcher(family, world, rank, threads, max_blocks, ordinal)
+    return get_joint_launcher(
+        family, world, rank, threads, max_blocks, ordinal, cooperative, variant_id
+    )
 
 
 class _JointExecutionState(_OneshotExecutionState):
-    def __init__(self, query, runtime, launcher, workspace):
+    def __init__(self, query, runtime, launcher, workspace, *, variant_launchers=()):
         self.query, self.runtime, self.launcher = query, runtime, launcher
         self.launchers = {tuple(slot): launcher for slot in query.setup["variants"]}
         self._bound_input = None
         self.workspace = workspace
+        self.variant_launchers = tuple(variant_launchers)
         call = query.call
-        self.profiles = profile_records(call["transport"], call["blocks"])
-        selected = selected_profile(
-            call["transport"], call["blocks"], call["submode"], call["active_blocks"]
+        self.variants = tuple(
+            JointLaunchVariant(**v) for v in call.get("joint_variants", ())
         )
+        self.profiles = profile_records(
+            call["transport"], call["blocks"], world=query.world_size
+        )
+        selected = selected_profile(
+            call["transport"],
+            call["blocks"],
+            call["submode"],
+            call["active_blocks"],
+            world=query.world_size,
+            cooperative=call.get("cooperative", False),
+            variant_id=0 if self.variants else None,
+        )
+        self.initial_selector = selected
         self.selector = torch.tensor(
             [selected], dtype=torch.uint32, device=runtime.device
         )
@@ -136,7 +165,7 @@ class _JointExecutionState(_OneshotExecutionState):
         self._check_input(inp)
         self._bound = True
 
-    def select_profile(self, submode, active_blocks):
+    def select_profile(self, submode, active_blocks, *, variant_id=None):
         """Collectively drain the channel and select a prepared mode and CTA count.
 
         All ranks must call with identical arguments after stopping submissions.
@@ -147,11 +176,35 @@ class _JointExecutionState(_OneshotExecutionState):
         if _is_current_stream_capturing(self.runtime.device):
             raise RuntimeError("joint profiles cannot change during graph capture")
         call = self.query.call
+        if self.variants:
+            if type(variant_id) is not int or not 0 <= variant_id < len(self.variants):
+                raise ValueError("select_profile requires a prepared variant identity")
+            variant = self.variants[variant_id]
+            if (submode, active_blocks) not in variant.profiles:
+                raise ValueError("profile is outside the prepared variant catalog")
+            family, blocks, cooperative = (
+                variant.family,
+                variant.blocks,
+                variant.cooperative,
+            )
+        else:
+            if variant_id is not None:
+                raise ValueError(
+                    "standalone joint profiles do not accept a variant identity"
+                )
+            family, blocks = call["transport"], call["blocks"]
+            cooperative = call.get("cooperative", False)
         selected = _run_collective_preallocation_setup(
             owner="joint PCIe profile validation",
             exchange_group=self.runtime.exchange_group,
             setup=lambda: selected_profile(
-                call["transport"], call["blocks"], submode, active_blocks
+                family,
+                blocks,
+                submode,
+                active_blocks,
+                world=self.query.world_size,
+                cooperative=cooperative,
+                variant_id=variant_id,
             ),
         )
         torch.cuda.synchronize(self.runtime.device)
@@ -164,6 +217,8 @@ class _JointExecutionState(_OneshotExecutionState):
                 call["blocks"],
                 submode,
                 active_blocks,
+                cooperative,
+                variant_id,
             ),
         )
         self.selector.fill_(selected)
@@ -179,29 +234,56 @@ class _JointExecutionState(_OneshotExecutionState):
         _validate_plain_io(inp, out)
         work = self.workspace
         with torch.cuda.device(self.runtime.device):
-            self.launcher(
-                work.peer_table.data_ptr(),
-                work.signal_table.data_ptr(),
-                work.shared.local_ptr,
-                self.selector.data_ptr(),
-                inp.data_ptr(),
-                out.data_ptr(),
-                self.query.call["size_packs"],
-                work.capacity_packs,
-            )
+            for launcher in self.variant_launchers or (self.launcher,):
+                launcher(
+                    work.peer_table.data_ptr(),
+                    work.signal_table.data_ptr(),
+                    work.shared.local_ptr,
+                    self.selector.data_ptr(),
+                    inp.data_ptr(),
+                    out.data_ptr(),
+                    self.query.call["size_packs"],
+                    work.capacity_packs,
+                )
 
 
 def plan(query, *, runtime, override=None):
     call = query.call
-    profile_index(
-        call["transport"], call["blocks"], call["submode"], call["active_blocks"]
+    selected_profile(
+        call["transport"],
+        call["blocks"],
+        call["submode"],
+        call["active_blocks"],
+        world=query.world_size,
+        cooperative=call.get("cooperative", False),
     )
     if call["dtype"] != "bfloat16" or not call["stage_input"]:
         raise ValueError("joint PCIe all-reduce requires staged BF16 input")
     if not 1 <= call["blocks"] <= query.setup.get("joint_max_blocks", 0):
-        raise ValueError("joint PCIe all-reduce grid exceeds resident CTA capacity")
+        raise ValueError(
+            "joint PCIe all-reduce grid exceeds the prepared maximum CTA count"
+        )
     family = call["transport"].removeprefix("joint_")
     args = (family, query.world_size, query.rank, call["threads"], call["blocks"])
+    variants = tuple(JointLaunchVariant(**v) for v in call.get("joint_variants", ()))
+    if variants:
+        validate_joint_variants(variants, world=query.world_size)
+        if any(v.blocks > query.setup["joint_max_blocks"] for v in variants):
+            raise ValueError("joint variant exceeds the prepared maximum CTA count")
+    launch_args = tuple(
+        (
+            (
+                v.family.removeprefix("joint_"),
+                query.world_size,
+                query.rank,
+                v.threads,
+                v.blocks,
+            ),
+            v.cooperative,
+            index,
+        )
+        for index, v in enumerate(variants)
+    ) or ((args, call.get("cooperative", False), None),)
     resident = (
         int(query.setup["rank_data_nbytes"])
         + int(query.setup["owned_slab_nbytes"]) * int(query.setup["owned_slab_count"])
@@ -210,19 +292,40 @@ def plan(query, *, runtime, override=None):
     profiles_bytes = 4
 
     def materialize(selection, device):
-        launcher = load_programs(compile_joint(*args, device.ordinal))
-        return _JointExecutionState(query, runtime, launcher, _workspace(runtime))
+        launchers = tuple(
+            load_programs(
+                compile_joint(*geometry, device.ordinal, cooperative, variant_id)
+            )
+            for geometry, cooperative, variant_id in launch_args
+        )
+        for launcher, (geometry, cooperative, _) in zip(launchers, launch_args):
+            if cooperative:
+                from ._joint_functions import require_resident_grid
+
+                require_resident_grid(
+                    launcher, device.ordinal, geometry[3], geometry[4]
+                )
+        return _JointExecutionState(
+            query,
+            runtime,
+            launchers[0],
+            _workspace(runtime),
+            variant_launchers=launchers if variants else (),
+        )
 
     return Plan(
         contract=TUNING,
         query=query,
         override=override,
-        _compile_jobs=lambda config, device: (
+        _compile_jobs=lambda config, device: tuple(
             CompileJob.create(
                 "b12x.comm.pcie._joint_preparation:compile_joint",
-                *args,
+                *geometry,
                 CompileJob.DEVICE_ORDINAL,
-            ),
+                cooperative,
+                variant_id,
+            )
+            for geometry, cooperative, variant_id in launch_args
         ),
         _memory_requirements=lambda config, device: MemoryRequirements(
             persistent=(
