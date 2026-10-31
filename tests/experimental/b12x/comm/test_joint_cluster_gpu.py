@@ -15,7 +15,20 @@ from .test_pcie_joint_gpu import (
     _assert_epoch_wrapped,
 )
 
-SIZES = (16, 48, 4112, 162784, 163840, 169984, 325568, 327680, 339952)
+SIZES = (
+    16,
+    48,
+    4112,
+    162784,
+    163840,
+    169984,
+    325568,
+    327680,
+    337920,
+    339952,
+    1310720,
+    2293760,
+)
 CAPACITY_BYTES = 2293760
 PROFILES = {
     "joint_latency": (

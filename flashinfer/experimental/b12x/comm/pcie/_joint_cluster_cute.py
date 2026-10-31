@@ -86,83 +86,93 @@ class _JointClusterLaunch(_JointLaunch):
         mode: Uint32,
     ):
         local = Int64(peers[self._rank]) + capacity * Int64(16)
+        # The final peer owns the remainder, including every pack when part is zero.
+        part = size // Int64(self._world_size)
         for scatter_phase in cutlass.range_constexpr(self._world_size):
             target = (self._rank + scatter_phase) % self._world_size
-            index = flat
-            while index < size:
-                owner = self._owner(index, size)
-                if (mode == Uint32(0)) | (owner == Int32(target)):
-                    words = ld_global_v4_u32(payload + index * Int64(16))
-                    dest = Int64(peers[target]) + (
-                        capacity + Int64(self._rank) * capacity + index
-                    ) * Int64(16)
-                    self._publish_bf16_words(dest, words)
+            begin, end = Int64(0), size
+            if mode == Uint32(1):
+                begin = Int64(target) * part
+                end = begin + part
+                if cutlass.const_expr(target == self._world_size - 1):
+                    end = size
+            index = begin + flat
+            while index < end:
+                words = ld_global_v4_u32(payload + index * Int64(16))
+                dest = Int64(peers[target]) + (
+                    capacity + Int64(self._rank) * capacity + index
+                ) * Int64(16)
+                self._publish_bf16_words(dest, words)
                 index += stride
             if cutlass.const_expr(scatter_phase != 0):
                 self._finish_write_phase()
-        index = flat
-        while index < size:
-            owner = Int32(self._rank)
-            if mode == Uint32(1):
-                owner = self._owner(index, size)
-            if owner == Int32(self._rank):
-                acc = cute.make_rmem_tensor((8,), Float32)
-                self._receive_bf16_sum(local, capacity, index, acc)
-                result = cute.make_rmem_tensor((4,), Uint32)
-                for word in cutlass.range_constexpr(4):
-                    result[word] = pack_f32x2_to_bf16x2(
-                        acc[word * 2], acc[word * 2 + 1]
-                    )
-                st_global_v4_u32(
-                    output + index * Int64(16),
-                    result[0],
-                    result[1],
-                    result[2],
-                    result[3],
-                )
+        begin, end = Int64(0), size
+        if mode == Uint32(1):
+            begin = Int64(self._rank) * part
+            end = begin + part
+            if cutlass.const_expr(self._rank == self._world_size - 1):
+                end = size
+        index = begin + flat
+        while index < end:
+            acc = cute.make_rmem_tensor((8,), Float32)
+            self._receive_bf16_sum(local, capacity, index, acc)
+            result = cute.make_rmem_tensor((4,), Uint32)
+            for word in cutlass.range_constexpr(4):
+                result[word] = pack_f32x2_to_bf16x2(acc[word * 2], acc[word * 2 + 1])
+            st_global_v4_u32(
+                output + index * Int64(16),
+                result[0],
+                result[1],
+                result[2],
+                result[3],
+            )
             index += stride
         if mode == Uint32(1):
             for gather_phase in cutlass.range_constexpr(1, self._world_size):
                 target = (self._rank + gather_phase) % self._world_size
-                index = flat
-                while index < size:
-                    owner = self._owner(index, size)
-                    if owner == Int32(self._rank):
-                        words = ld_global_v4_u32(output + index * Int64(16))
-                        dest = Int64(peers[target]) + (
-                            capacity + Int64(self._rank) * capacity + index
-                        ) * Int64(16)
-                        self._publish_bf16_words(dest, words)
+                # Match the reduction's thread map so each thread reads its own
+                # output packs. Empty intervals still enter every phase barrier.
+                index = begin + flat
+                while index < end:
+                    words = ld_global_v4_u32(output + index * Int64(16))
+                    dest = Int64(peers[target]) + (
+                        capacity + Int64(self._rank) * capacity + index
+                    ) * Int64(16)
+                    self._publish_bf16_words(dest, words)
                     index += stride
                 self._finish_write_phase()
-            index = flat
-            while index < size:
-                owner = self._owner(index, size)
-                if owner != Int32(self._rank):
-                    address = local + (Int64(owner) * capacity + index) * Int64(16)
-                    gathered = cute.make_rmem_tensor((4,), Uint32)
-                    waiting = cutlass.Boolean(True)
-                    while waiting:
-                        words = ld_relaxed_sys_global_v4_u32(address)
-                        waiting = cutlass.Boolean(False)
-                        for word in cutlass.range_constexpr(4):
-                            gathered[word] = words[word]
-                            waiting = (
-                                waiting
-                                | ((words[word] & Uint32(0xFFFF)) == Uint32(0))
-                                | ((words[word] & Uint32(0xFFFF0000)) == Uint32(0))
-                            )
-                    st_global_v4_u32(
-                        output + index * Int64(16),
-                        gathered[0],
-                        gathered[1],
-                        gathered[2],
-                        gathered[3],
-                    )
-                    st_relaxed_sys_global_v4_u32(
-                        address, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
-                    )
-                index += stride
+            for owner in cutlass.range_constexpr(self._world_size):
+                if cutlass.const_expr(owner != self._rank):
+                    remote_begin = Int64(owner) * part
+                    remote_end = remote_begin + part
+                    if cutlass.const_expr(owner == self._world_size - 1):
+                        remote_end = size
+                    index = remote_begin + flat
+                    while index < remote_end:
+                        address = local + (Int64(owner) * capacity + index) * Int64(16)
+                        gathered = cute.make_rmem_tensor((4,), Uint32)
+                        waiting = cutlass.Boolean(True)
+                        while waiting:
+                            words = ld_relaxed_sys_global_v4_u32(address)
+                            waiting = cutlass.Boolean(False)
+                            for word in cutlass.range_constexpr(4):
+                                gathered[word] = words[word]
+                                waiting = (
+                                    waiting
+                                    | ((words[word] & Uint32(0xFFFF)) == Uint32(0))
+                                    | ((words[word] & Uint32(0xFFFF0000)) == Uint32(0))
+                                )
+                        st_global_v4_u32(
+                            output + index * Int64(16),
+                            gathered[0],
+                            gathered[1],
+                            gathered[2],
+                            gathered[3],
+                        )
+                        st_relaxed_sys_global_v4_u32(
+                            address, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        )
+                        index += stride
 
     @cute.kernel
     def kernel(
@@ -288,7 +298,7 @@ def get_joint_cluster_launcher(
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint_cluster", 1, key[:-1]),
+        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint_cluster", 2, key[:-1]),
     )
 
     def run(
