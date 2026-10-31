@@ -42,6 +42,7 @@ from .pcie_vocab_argmax import (
 from ._preparation import plan, query_from_runtime
 from ._tuning import PcieConfig, PcieQuery
 from ._collective_tuning import CollectiveConfig, CollectiveQuery
+from ._joint_profile import JointLaunchVariant
 from b12x.preparation import Plan
 
 
@@ -57,6 +58,7 @@ def is_supported(device=None) -> bool:
 
 
 __all__ = [
+    "JointLaunchVariant",
     "joint_finalist_policy",
     "joint_startup_spec",
     "prepare_joint_startup_tuner",

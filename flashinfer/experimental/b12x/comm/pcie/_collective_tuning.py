@@ -24,6 +24,7 @@ class CollectiveConfig:
     blocks: int
     submode: str = ""
     active_blocks: int = 0
+    cooperative: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -42,6 +43,16 @@ def _configs(query):
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
         if name in JOINT_FAMILIES:
+            if call.get("joint_variants"):
+                yield CollectiveConfig(
+                    implementation=name,
+                    threads=threads,
+                    blocks=blocks,
+                    submode=call["submode"],
+                    active_blocks=call["active_blocks"],
+                    cooperative=call.get("cooperative", False),
+                )
+                continue
             for count_threads in (32, 64, 128, 256, 512):
                 for mode in joint_modes(name, query.world_size):
                     mode_spec = joint_mode_spec(mode)
@@ -60,6 +71,17 @@ def _configs(query):
                             submode=mode,
                             active_blocks=active,
                         )
+                    if mode_spec.phased and call.get("cooperative", False):
+                        for active in (1, 2, 4, 8, 16, 32, 64):
+                            if active <= blocks:
+                                yield CollectiveConfig(
+                                    implementation=name,
+                                    threads=count_threads,
+                                    blocks=active,
+                                    submode=mode,
+                                    active_blocks=active,
+                                    cooperative=True,
+                                )
             continue
         yield CollectiveConfig(implementation=name, threads=threads, blocks=blocks)
         if (
@@ -194,6 +216,7 @@ def _parameters(query, device):
                     threads=int(payload["call"]["threads"]),
                     submode=payload["call"].get("submode", ""),
                     active_blocks=int(payload["call"].get("active_blocks", 0)),
+                    cooperative=payload["call"].get("cooperative", False),
                     blocks=int(
                         payload["call"].get(
                             "blocks", payload["call"].get("block_limit", 16)
@@ -212,6 +235,7 @@ def _parameters(query, device):
             "blocks": tuple(dict.fromkeys(c.blocks for c in configs)),
             "submode": tuple(dict.fromkeys(c.submode for c in configs)),
             "active_blocks": tuple(dict.fromkeys(c.active_blocks for c in configs)),
+            "cooperative": tuple(dict.fromkeys(c.cooperative for c in configs)),
         },
         predicates=(lambda value: CollectiveConfig(**value) in legal_configs,),
         # Plain reductions measure pull alongside the payload-ready transports.
@@ -345,14 +369,21 @@ def _family_bucket(query):
 
 TUNING = TuningContract(
     component_id="comm.pcie",
-    query_schema_version=7,
-    candidate_contract_version=4,
-    config_schema_version=2,
+    query_schema_version=8,
+    candidate_contract_version=5,
+    config_schema_version=3,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
     ),
     config_fields=frozenset(
-        ("implementation", "threads", "blocks", "submode", "active_blocks")
+        (
+            "implementation",
+            "threads",
+            "blocks",
+            "submode",
+            "active_blocks",
+            "cooperative",
+        )
     ),
     encode_query=lambda q: dict(
         operation=q.operation,
@@ -373,6 +404,7 @@ TUNING = TuningContract(
         Knob(name="blocks", values=None, binding=ParameterBinding.RUNTIME),
         Knob(name="submode", values=None, binding=ParameterBinding.RUNTIME),
         Knob(name="active_blocks", values=None, binding=ParameterBinding.RUNTIME),
+        Knob(name="cooperative", values=None),
     ),
     parameters=_parameters,
     collective_signature=_collective_signature,
@@ -382,11 +414,42 @@ TUNING = TuningContract(
 
 
 def plan(
-    alternatives, *, default, inplace=False, invocation=FrozenMapping(), override=None
+    alternatives,
+    *,
+    default,
+    inplace=False,
+    invocation=FrozenMapping(),
+    override=None,
+    joint_variants=None,
 ):
     from ._preparation import _provider
     from ._benchmark import benchmark_call
 
+    if override is not None and override.cooperative:
+        q, runtime = alternatives[override.implementation]
+        alternatives = dict(alternatives)
+        alternatives[override.implementation] = (
+            replace(q, call=FrozenMapping({**q.call, "cooperative": True})),
+            runtime,
+        )
+    if joint_variants is not None:
+        from ._joint_profile import validate_joint_variants
+
+        first_query = next(iter(alternatives.values()))[0]
+        variants = validate_joint_variants(joint_variants, world=first_query.world_size)
+        initial = variants[0]
+        q, runtime = alternatives[initial.family]
+        call = dict(q.call)
+        call.update(
+            threads=initial.threads,
+            blocks=initial.blocks,
+            submode=initial.profiles[0][0],
+            active_blocks=initial.profiles[0][1],
+            cooperative=initial.cooperative,
+            joint_variants=tuple(asdict(v) for v in variants),
+        )
+        alternatives = {initial.family: (replace(q, call=FrozenMapping(call)), runtime)}
+        default = initial.family
     first = next(iter(alternatives.values()))[0]
     default_call = alternatives[default][0].call
     query = CollectiveQuery(
@@ -403,6 +466,7 @@ def plan(
             implementation=default,
             submode=default_call.get("submode", ""),
             active_blocks=int(default_call.get("active_blocks", 0)),
+            cooperative=default_call.get("cooperative", False),
             threads=int(default_call["threads"]),
             blocks=int(default_call.get("blocks", default_call.get("block_limit", 16))),
         ),
@@ -418,7 +482,11 @@ def plan(
             call["threads"] = config.threads
             call["blocks" if "blocks" in call else "block_limit"] = config.blocks
             if config.implementation in JOINT_FAMILIES:
-                call.update(submode=config.submode, active_blocks=config.active_blocks)
+                call.update(
+                    submode=config.submode,
+                    active_blocks=config.active_blocks,
+                    cooperative=config.cooperative,
+                )
             q = replace(q, call=FrozenMapping(call))
             native_plans[config] = _provider(q.surface).plan(q, runtime=runtime)
         return native_plans[config]

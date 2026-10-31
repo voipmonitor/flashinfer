@@ -4,18 +4,22 @@ from ._joint_profile import (
     JOINT_MODE_SPECS,
     JointMode,
     JointModeSpec,
+    JointLaunchVariant,
     joint_mode_spec,
     joint_modes,
     joint_profile_label,
     selected_profile,
+    validate_joint_variants,
 )
 
 __all__ = [
     "JOINT_MODE_SPECS",
     "JointMode",
     "JointModeSpec",
+    "JointLaunchVariant",
     "joint_mode_spec",
     "joint_modes",
     "joint_profile_label",
     "selected_profile",
+    "validate_joint_variants",
 ]

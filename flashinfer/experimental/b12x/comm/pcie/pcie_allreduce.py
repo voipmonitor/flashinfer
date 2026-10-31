@@ -487,6 +487,7 @@ class PCIeAllReduce:
         invocation: FrozenMapping = FrozenMapping(),
         override: PcieConfig | CollectiveConfig | None = None,
         joint_only: bool = False,
+        joint_variants=None,
         **call,
     ) -> Plan:
         """Select an existing native channel once, then declare its plan.
@@ -497,6 +498,8 @@ class PCIeAllReduce:
         """
         from ._preparation import plan, query_from_runtime
 
+        if joint_variants is not None and not joint_only:
+            raise ValueError("joint_variants requires joint_only=True")
         if operation not in (
             "all_reduce",
             "all_reduce_fused_add_rms_norm",
@@ -562,6 +565,7 @@ class PCIeAllReduce:
                     inplace=inplace,
                     invocation=invocation,
                     override=override,
+                    joint_variants=joint_variants,
                 )
         if joint_only:
             raise ValueError(

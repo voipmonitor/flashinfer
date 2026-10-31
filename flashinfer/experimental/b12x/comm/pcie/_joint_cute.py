@@ -1,7 +1,7 @@
 """Fixed-grid BF16 PCIe collectives with device-resident protocol profiles.
 
-The selected uint32 profile contains protocol in its upper 16 bits and the
-participating CTA count in its lower 16 bits. Ranks must select the same profile,
+The selected uint32 profile contains variant in bits 24–31, protocol in bits
+16–23, and participating CTA count in bits 0–15. Ranks select the same profile,
 and profile changes require all ranks' previous replay to have drained.
 """
 
@@ -65,13 +65,14 @@ __all__ = [
 
 
 class _JointLaunch(_PackedMath):
-    def __init__(self, family, world_size, rank, threads, max_blocks):
+    def __init__(self, family, world_size, rank, threads, max_blocks, variant_id=None):
         super().__init__("bfloat16")
         self._family = family
         self._world_size = world_size
         self._rank = rank
         self._threads = threads
         self._max_blocks = max_blocks
+        self._variant_id = variant_id
 
     @cute.jit
     def __call__(
@@ -581,6 +582,11 @@ class _JointLaunch(_PackedMath):
         profile = selector[0]
         mode = profile >> Uint32(16)
         active = profile & Uint32(0xFFFF)
+        if cutlass.const_expr(self._variant_id is not None):
+            # A losing captured variant must not advance epochs or touch IPC state.
+            mode = mode & Uint32(0xFF)
+            if (profile >> Uint32(24)) != Uint32(self._variant_id):
+                active = Uint32(0)
         if Uint32(bid) < active:
             slot_peers = peers + Int64(generation % Uint32(2)) * Int64(16)
             cute.arch.sync_threads()
@@ -702,7 +708,16 @@ def is_joint_launcher_prepared(
 
 
 @program_cache
-def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_index):
+def get_joint_launcher(
+    family,
+    world_size,
+    rank,
+    threads,
+    max_blocks,
+    device_index,
+    cooperative=False,
+    variant_id=None,
+):
     if family not in ("latency", "bandwidth"):
         raise ValueError("joint family must be latency or bandwidth")
     if world_size not in (2, 3, 4, 6, 8, 10) or not 0 <= rank < world_size:
@@ -715,8 +730,20 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
         512,
     ):
         raise ValueError("invalid joint launch geometry")
+    if type(cooperative) is not bool or (
+        variant_id is not None
+        and (type(variant_id) is not int or not 0 <= variant_id <= 255)
+    ):
+        raise ValueError("invalid joint launch variant")
     key = (family, world_size, rank, threads, max_blocks, device_index)
-    launch = _JointLaunch(family, world_size, rank, threads, max_blocks)
+    if cooperative or variant_id is not None:
+        key = (*key, cooperative, variant_id)
+    launch_type = _JointLaunch
+    if cooperative:
+        from ._joint_cooperative_cute import _CooperativeJointLaunch
+
+        launch_type = _CooperativeJointLaunch
+    launch = launch_type(family, world_size, rank, threads, max_blocks, variant_id)
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     raw = b12x_compile(
         launch,
@@ -729,7 +756,11 @@ def get_joint_launcher(family, world_size, rank, threads, max_blocks, device_ind
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("comm.pcie.joint", 218, key[:-1]),
+        compile_spec=KernelCompileSpec.from_key(
+            "comm.pcie.joint",
+            219,
+            (family, world_size, rank, threads, max_blocks, cooperative, variant_id),
+        ),
     )
 
     def run(

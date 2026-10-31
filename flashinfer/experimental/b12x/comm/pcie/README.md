@@ -133,8 +133,8 @@ storage race two joint entrypoints. `joint_latency` supports `full`, `payload_rs
 `pull`. Rank groups larger than two also admit `full_phased` and
 `payload_rsag_phased` in `joint_latency`, and `payload_rsag_phased` and
 `bulk_push_phased` in `joint_bandwidth`. These profiles send to one peer at a
-time in rank-staggered order. They require `active_blocks=1`; each writing
-thread performs a system fence and the CTA synchronizes before the next peer.
+time in rank-staggered order. Ordinary launches require `active_blocks=1`; each
+writing thread performs a system fence and the CTA synchronizes before the next peer.
 Inactive grid blocks do not participate in the phase ordering, so it does not
 require simultaneous grid residency. Base profiles remain available for tuning;
 the single active CTA can limit phased throughput. For example,
@@ -142,6 +142,16 @@ the single active CTA can limit phased throughput. For example,
 submode="bulk_push_phased", active_blocks=1)` selects phased bulk writes.
 `b12x.comm.pcie.joint_profiles` provides CPU-only typed mode metadata, admission,
 and labels for consumers that store selectors or validate profile catalogs.
+
+Phased protocols also accept `CollectiveConfig(..., cooperative=True)` with
+`blocks == active_blocks`. Cooperative launches admit 1–64 CTAs and require the
+entire physical grid to fit the compiled kernel's resident capacity. Every
+writer performs a system fence before a GPU-scope arrival/generation barrier
+releases the grid to its next destination. Preparation rejects insufficient
+residency without changing the grid. Cooperative admission is explicit; omitted
+`cooperative` defaults to `False`, and ordinary joint tuning keeps its existing
+candidate catalog. Shared-channel submissions remain serialized across ranks;
+independently ordered concurrent collective channels are outside this contract.
 
 Ordinary plans retain standalone transport competition. Each entrypoint
 uses one compiled program per thread count and maximum grid; its submode and
@@ -189,18 +199,57 @@ This path needs no measured finalists or preparation-time geometry race. Modes
 must belong to the prepared family and active CTA counts must fit its physical
 grid. Multiple counts per mode are allowed; duplicate pairs are rejected.
 
+To retain several compiled geometries, pass typed launch variants instead of a
+single configuration override:
+
+```python
+from b12x.comm.pcie import JointLaunchVariant, joint_startup_spec
+
+variants = (
+    JointLaunchVariant(
+        family="joint_bandwidth", threads=512, blocks=64,
+        profiles=(("bulk_push", 16), ("bulk_pull", 32)),
+    ),
+    JointLaunchVariant(
+        family="joint_bandwidth", threads=512, blocks=8, cooperative=True,
+        profiles=(("bulk_push_phased", 8),),
+    ),
+)
+plan = runtime.plan(source, out=output, joint_only=True, joint_variants=variants)
+# Submit plan.request(...) to the ordinary PreparationSession batch before this call.
+spec = joint_startup_spec(plan)
+```
+
+Each variant declares its family, threads, physical grid, cooperative launch
+property, and allowed protocol/active-grid pairs. The tuple order assigns an
+eight-bit variant identity. The selector stores variant in bits 24–31, protocol
+in bits 16–23, and active CTAs in bits 0–15. Preparation compiles every variant
+through the ordinary batch and initializes the selector to the first profile.
+Serving capture records every guarded variant; a nonmatching variant changes
+neither collective epochs nor IPC state. For direct profile changes, call
+`state.select_profile(mode, active_blocks, variant_id=index)` collectively after
+draining submissions.
+
+`spec.launch_predicates()` identifies each retained CUDA function and its exact
+selector argument, with enabled values and the complete allowed domain. A native
+graph loader can use these records after successful startup to disable losing
+kernel nodes once, preserving the winner's captured launch geometry. The
+records address functions directly and do not match kernel names. Choice labels
+include the family, protocol, thread count, physical and active grids, and
+cooperative property.
+
 Collectively call `prepare_joint_startup_tuner(specs, cache_policy="cold")` before
 freezing kernel resolution. All specs in a producer must have the same semantic
 key, rank, and device. Each spec exposes its actual serving `selector` tensor.
 The producer retains its specs, private fixtures, timing storage, and compiled
 programs. Its IPC storage remains owned by the collective runtime.
 
-Capture `producer.run()` into a separate startup graph. It times the same
-compiled collective launcher used by serving, with the measured CTA count for
-each mode. Seven interleaved rounds use the ordinary reduction benchmark's
+Capture `producer.run()` into a separate startup graph. Each candidate invokes
+exactly its compiled collective launcher, with its complete encoded selector.
+Seven interleaved rounds use the ordinary reduction benchmark's
 three fixtures and `ceil(100 / rows)` invocation chain. A device rank gate
 precedes each timer; each sample is the maximum rank elapsed time. The smallest
-median of 21 samples wins, with family mode order breaking ties. The producer
+median of 21 samples wins, with declared candidate order breaking ties. The producer
 publishes the packed profile to every spec's selector. No host selection or
 recapture is needed after startup replay.
 
@@ -223,6 +272,10 @@ shared storage keys suitable for deduplication.
 from 1 KiB through 8 MiB at 16 points per doubling. Each size recommends one
 confirmed full configuration, including compiled geometry and runtime profile.
 This tool does not change serving dispatch or preparation defaults.
+Pass `--cooperative-phased` to include cooperative phased grids alongside the
+ordinary catalog; it is disabled by default. Reports and search coverage treat
+the cooperative launch property as part of compiled geometry, so ordinary and
+cooperative results cannot be merged into one candidate.
 
 Search covers every compiled geometry and submode at every size, then refines
 runtime profiles using neighboring measurements. Screening rounds scale inversely

@@ -105,8 +105,10 @@ def test_joint_tuning_keeps_modes_at_large_tp2_payloads(family):
     assert {c.threads for c in candidates} == {32, 64, 128, 256, 512}
     assert {c.blocks for c in candidates} == {64}
     assert {c.active_blocks for c in candidates} == {1, 2, 4, 8, 16, 32, 36, 64}
-    assert TUNING.knobs[-2].binding.value == "runtime"
-    assert TUNING.knobs[-1].binding.value == "runtime"
+    bindings = {knob.name: knob.binding.value for knob in TUNING.knobs}
+    assert bindings["submode"] == "runtime"
+    assert bindings["active_blocks"] == "runtime"
+    assert bindings["cooperative"] == "compile"
     with autotune_effort("off"):
         assert tuple(
             c for _, c in TUNING.iterate(TUNING.configure(query, device=None))
@@ -417,6 +419,7 @@ def test_runtime_selection_rejects_unsafe_phased_profiles_before_cuda(
         world_size=world, call=dict(transport="joint_bandwidth", blocks=64)
     )
     state.runtime = SimpleNamespace(_closed=False, device=None, exchange_group=None)
+    state.variants = ()
     monkeypatch.setattr(
         _joint_preparation, "_is_current_stream_capturing", lambda device: False
     )
