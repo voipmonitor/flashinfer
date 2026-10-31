@@ -72,6 +72,31 @@ def _validate_query(query: PcieQuery, device) -> None:
         raise ValueError(f"{query.surface} supports world sizes {worlds}")
     if not 0 <= query.rank < query.world_size:
         raise ValueError("rank must belong to the caller's process group")
+    if "joint_cluster_size" in query.call:
+        from ._joint_profile import profile_index, validate_cluster_geometry
+
+        call = query.call
+        if (
+            not query.surface.endswith(".all_reduce")
+            or call.get("transport") not in ("joint_latency", "joint_bandwidth")
+            or call.get("dtype") != "bfloat16"
+            or not call.get("stage_input")
+        ):
+            raise ValueError(
+                "joint cluster geometry requires a staged joint BF16 all-reduce"
+            )
+        validate_cluster_geometry(
+            call["blocks"], call["threads"], call["joint_cluster_size"], device
+        )
+        if call["blocks"] > query.setup.get("joint_max_blocks", 0):
+            raise ValueError("joint cluster grid exceeds the prepared channel capacity")
+        profile_index(
+            call["transport"],
+            call["blocks"],
+            call["submode"],
+            call["active_blocks"],
+            cluster_size=call["joint_cluster_size"],
+        )
     if query.surface.endswith(".all_gather_heads"):
         transport = query.call.get("gather_transport", "barrier")
         if transport not in ("barrier", "word_exchange"):

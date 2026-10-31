@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 import torch
 
 from b12x.preparation import FinalistPolicy
-from ._joint_profile import JOINT_FAMILIES, JOINT_MODES, selected_profile
+from ._joint_profile import (
+    JOINT_MODES,
+    joint_modes,
+    selected_profile,
+    validate_cluster_geometry,
+)
 
 
 def joint_finalist_policy():
@@ -38,6 +43,8 @@ def joint_startup_spec(plan, *, profiles=None):
     call = state.query.call
     family = call["transport"]
     geometry = (family, call["threads"], call["blocks"])
+    cluster_size = call.get("joint_cluster_size", 1)
+    validate_cluster_geometry(call["blocks"], call["threads"], cluster_size)
     if profiles is not None:
         profiles = tuple(profiles)
         if not profiles or any(
@@ -49,7 +56,9 @@ def joint_startup_spec(plan, *, profiles=None):
             )
         encoded = []
         for mode, active in profiles:
-            selected_profile(family, call["blocks"], mode, active)
+            selected_profile(
+                family, call["blocks"], mode, active, cluster_size=cluster_size
+            )
             encoded.append((JOINT_MODES[mode], active))
         if len(set(encoded)) != len(encoded):
             raise ValueError("runtime profiles must be distinct")
@@ -66,9 +75,11 @@ def joint_startup_spec(plan, *, profiles=None):
             ):
                 mode = assignment["submode"]
                 active = assignment["active_blocks"]
-                selected_profile(family, call["blocks"], mode, active)
+                selected_profile(
+                    family, call["blocks"], mode, active, cluster_size=cluster_size
+                )
                 measured[mode] = (JOINT_MODES[mode], active)
-        modes = JOINT_FAMILIES[family]
+        modes = joint_modes(family, cluster_size=cluster_size)
         if set(measured) != set(modes):
             raise ValueError(
                 "startup tuning requires measured finalists for every mode of the selected geometry"
@@ -91,6 +102,8 @@ def joint_startup_spec(plan, *, profiles=None):
         inplace,
         profiles,
     )
+    if cluster_size != 1:
+        key += (("cluster_size", cluster_size),)
     return JointStartupSpec(
         key, profiles, state.selector, state, inplace, state.query.rank
     )
@@ -341,6 +354,7 @@ def prepare_joint_startup_tuner(specs, *, cache_policy="cold"):
                 call["blocks"],
                 call["submode"],
                 call["active_blocks"],
+                cluster_size=call.get("joint_cluster_size", 1),
             )
         )
     producer.status.fill_(-1)
