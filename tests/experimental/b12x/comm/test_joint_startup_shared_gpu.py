@@ -1,4 +1,4 @@
-"""Startup races of one runtime share eviction and timing storage across replays."""
+"""Startup races of one runtime share eviction, timing and fixture storage across replays."""
 
 from datetime import timedelta
 import gc
@@ -19,6 +19,7 @@ def _exercise(rank):
         CollectiveConfig,
         joint_startup_spec,
         prepare_joint_startup_tuner,
+        use_startup_eviction,
     )
     from b12x.comm.pcie._joint_profile import JOINT_MODES
     from b12x.comm.pcie._oneshot_preparation import _prepare_plain_call
@@ -85,6 +86,13 @@ def _exercise(rank):
         assert {p.eviction.data_ptr() for p in producers} == {first.eviction.data_ptr()}
         assert {p.shared.local_ptr for p in producers} == {first.shared.local_ptr}
         assert int(torch.count_nonzero(first.eviction)) == 0
+        # Cold races can read resident storage instead of their eviction buffer.
+        resident = torch.ones(2 * first.eviction.numel(), dtype=torch.float32, device=device)
+        use_startup_eviction(resident)
+        assert {p.eviction.data_ptr() for p in producers} == {resident.data_ptr()}
+        # One scratch arena and one prefix-shared reference bank serve every race.
+        assert len({p.inputs.source.untyped_storage().data_ptr() for p in producers}) == 1
+        assert len({p.inputs.reference.expected[0].untyped_storage().data_ptr() for p in producers}) == 1
         for producer in producers:
             graph = torch.cuda.CUDAGraph()
             dist.barrier()
@@ -92,6 +100,8 @@ def _exercise(rank):
                 producer.run()
             graphs.append(graph)
         session.freeze()
+        with pytest.raises(RuntimeError, match="after capture"):
+            use_startup_eviction(resident)
 
         def replay(producer, graph):
             producer.status.fill_(-1)
@@ -151,7 +161,7 @@ def _worker(rank, directory):
     os.environ.get("B12X_RUN_JOINT_CLUSTER_TEST") != "1",
     reason="requires an assigned TP4 SM120/SM121 group",
 )
-def test_startup_races_share_eviction_and_timing_storage(tmp_path):
+def test_startup_races_share_eviction_timing_and_fixture_storage(tmp_path):
     import torch
     import torch.multiprocessing as mp
 
