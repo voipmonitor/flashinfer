@@ -1,6 +1,7 @@
 """Prepare captured selection among supplied or measured joint collective profiles."""
 
 from dataclasses import dataclass, field
+import weakref
 
 import torch
 
@@ -20,6 +21,59 @@ def joint_finalist_policy():
         per_family=1,
         max_total=35,
     )
+
+
+_EVICTIONS = {}
+_EXTERNAL_EVICTION = set()
+_CAPTURED = set()
+_COLD_RACES = weakref.WeakSet()
+
+
+def _eviction_bytes(device):
+    l2 = torch.cuda.get_device_properties(device).L2_cache_size
+    return max(2 * l2, 64 * 1024 * 1024)
+
+
+def _startup_eviction(device):
+    """One L2 eviction input per device for every cold startup race.
+
+    Races replay one at a time and only read it, so its contents do not
+    matter; zeros keep it out of the exported initial state.
+    """
+    eviction = _EVICTIONS.get(device.index)
+    if eviction is None:
+        eviction = (
+            torch.zeros(_eviction_bytes(device) // 4, dtype=torch.float32, device=device),
+            torch.empty((), dtype=torch.float32, device=device),
+        )
+        _EVICTIONS[device.index] = eviction
+    return eviction
+
+
+def use_startup_eviction(source):
+    """Displace L2 in every cold startup race on ``source``'s device by reading it.
+
+    Any resident device storage of twice the L2 size serves, such as model
+    weights: the races only read it, so no eviction buffer stays allocated.
+    Call before a race on the device is captured.
+    """
+    device = source.device
+    if device.index in _CAPTURED:
+        raise RuntimeError("the startup eviction source cannot change after capture")
+    flat = source.reshape(-1).view(torch.uint8)
+    nbytes = _eviction_bytes(device)
+    if flat.numel() < nbytes:
+        raise ValueError("startup eviction source is smaller than twice the L2 cache")
+    previous = _startup_eviction(device)
+    eviction = (flat[:nbytes].view(torch.float32), previous[1])
+    _EVICTIONS[device.index] = eviction
+    _EXTERNAL_EVICTION.add(device.index)
+    for race in list(_COLD_RACES):
+        if race.runtime.device == device:
+            race.eviction, race.eviction_sum = eviction
+            race.owners = tuple(
+                eviction[0] if item is previous[0] else item for item in race.owners
+            )
 
 
 @dataclass(frozen=True)
@@ -116,8 +170,13 @@ class JointStartupTuner:
     """Captureable bounded race; retained owners must outlive its CUDA graph."""
 
     def __init__(self, specs, cache_policy):
-        from ._benchmark import _ReductionInputs
-        from ._gather_preparation import GatherInputs, SelectedGatherState
+        from ._benchmark import _DTYPES, _ReductionInputs, _reduction_repetitions
+        from ._gather_preparation import SelectedGatherState
+        from ._joint_startup_fixtures import (
+            StartupGatherInputs,
+            StartupReductionInputs,
+            startup_fixtures,
+        )
         from ._joint_startup_cute import SCRATCH_BYTES, SIGNAL_BYTES, timing_launcher
         from .pcie_oneshot import (
             PCIeOneshotAllReduce,
@@ -169,35 +228,34 @@ class JointStartupTuner:
                     dtype=torch.uint32,
                     device=runtime.device,
                 )
-                self.inputs = (
-                    GatherInputs(state)
-                    if self.gather
-                    else _ReductionInputs(state, inplace=first.inplace)
-                )
-                self.checked_output = (
-                    self.inputs.out.view(torch.uint8).reshape(-1)
-                    if self.gather
-                    else self.inputs.out
-                )
-                self.mismatch = torch.empty_like(self.checked_output, dtype=torch.bool)
-                self.invalid = torch.zeros((), dtype=torch.int32, device=runtime.device)
+                query = state.query
+                self.fixtures = startup_fixtures(runtime.device)
+                if self.gather:
+                    self.inputs = StartupGatherInputs(self.fixtures, state)
+                elif query.surface.endswith(".all_reduce") and not query.surface.startswith(
+                    "PCIeTwoShotBF16."
+                ):
+                    self.inputs = StartupReductionInputs(
+                        self.fixtures,
+                        state,
+                        inplace=first.inplace,
+                        dtype=_DTYPES[query.call["dtype"]],
+                        repetitions=_reduction_repetitions(tuple(query.setup["shape"])),
+                    )
+                else:
+                    self.fixtures = None
+                    self.inputs = _ReductionInputs(state, inplace=first.inplace)
+                    self.inputs.checked = self.inputs.out
+                    self.inputs.mismatch = torch.empty_like(
+                        self.inputs.out, dtype=torch.bool
+                    )
+                self.invalid = torch.zeros((1,), dtype=torch.int32, device=runtime.device)
+                # The validator reads the int32 word; only its first byte is ever written.
+                self.invalid_any = self.invalid.view(torch.bool)[0]
                 self.eviction = self.eviction_sum = None
                 if cache_policy == "cold":
-                    eviction = getattr(runtime, "_joint_startup_eviction", None)
-                    if eviction is None:
-                        l2 = torch.cuda.get_device_properties(
-                            runtime.device
-                        ).L2_cache_size
-                        eviction = (
-                            torch.ones(
-                                max(2 * l2, 64 * 1024 * 1024) // 4,
-                                dtype=torch.float32,
-                                device=runtime.device,
-                            ),
-                            torch.empty((), dtype=torch.float32, device=runtime.device),
-                        )
-                        runtime._joint_startup_eviction = eviction
-                    self.eviction, self.eviction_sum = eviction
+                    self.eviction, self.eviction_sum = _startup_eviction(runtime.device)
+                    _COLD_RACES.add(self)
                 self.launchers = {
                     action: timing_launcher(
                         runtime.world_size,
@@ -216,27 +274,41 @@ class JointStartupTuner:
             setup=prepare_local,
         )
         with torch.cuda.device(runtime.device):
-            shared = PCIeOneshotAllReduce._allocate_shared_buffer(
-                runtime.exchange_group, SCRATCH_BYTES, zero_fill=True, ipc=runtime._ipc
-            )
-            local_error = None
-            try:
+            # Races of one runtime replay one at a time on every rank, so they share
+            # its timing exchange: its barrier counters only ever advance.
+            shared = getattr(runtime, "_joint_startup_shared", None)
+            if shared is None:
+                shared = PCIeOneshotAllReduce._allocate_shared_buffer(
+                    runtime.exchange_group,
+                    SCRATCH_BYTES,
+                    zero_fill=True,
+                    ipc=runtime._ipc,
+                )
+                local_error = None
+                try:
+                    self.peers.copy_(
+                        torch.tensor(
+                            shared.peer_ptrs, dtype=torch.uint64, device=runtime.device
+                        )
+                    )
+                except Exception as error:
+                    local_error = error
+                _finish_collective_runtime_setup(
+                    owner="joint startup tuner",
+                    exchange_group=runtime.exchange_group,
+                    ipc=runtime._ipc,
+                    shared=shared,
+                    local_error=local_error,
+                    detach_shared_ownership=lambda: None,
+                )
+                runtime._owned_buffers.append(shared)
+                runtime._joint_startup_shared = shared
+            else:
                 self.peers.copy_(
                     torch.tensor(
                         shared.peer_ptrs, dtype=torch.uint64, device=runtime.device
                     )
                 )
-            except Exception as error:
-                local_error = error
-            _finish_collective_runtime_setup(
-                owner="joint startup tuner",
-                exchange_group=runtime.exchange_group,
-                ipc=runtime._ipc,
-                shared=shared,
-                local_error=local_error,
-                detach_shared_ownership=lambda: None,
-            )
-            runtime._owned_buffers.append(shared)
             self.shared = shared
         self.local_address = shared.local_ptr + SIGNAL_BYTES
         self.owners = (
@@ -244,16 +316,24 @@ class JointStartupTuner:
             runtime,
             shared,
             self.inputs,
+            self.fixtures,
             self.peers,
             self.status,
             self.samples,
             self.profiles,
-            self.mismatch,
             self.invalid,
             self.eviction,
             self.eviction_sum,
             self.launchers,
         )
+
+    @property
+    def checked_output(self):
+        return self.inputs.checked
+
+    @property
+    def mismatch(self):
+        return self.inputs.mismatch
 
     def memory_requirements(self):
         """Resident startup storage, with shared fixtures and eviction deduplicated."""
@@ -270,7 +350,7 @@ class JointStartupTuner:
             self.profiles,
             self.mismatch,
             self.invalid,
-            self.eviction,
+            None if self.runtime.device.index in _EXTERNAL_EVICTION else self.eviction,
             self.eviction_sum,
         )
         entries = {}
@@ -317,6 +397,11 @@ class JointStartupTuner:
 
     def run(self):
         """Enqueue the race without allocation, compilation, or host decisions."""
+        if torch.cuda.is_current_stream_capturing():
+            # A captured race reads its fixtures and eviction source by address from now on.
+            _CAPTURED.add(self.runtime.device.index)
+            if self.fixtures is not None:
+                self.fixtures.frozen = True
         with torch.cuda.device(self.runtime.device):
             self._timing("reset", 0, self.state.selector)
             for mode, active in self.specs[0].profiles:
@@ -329,12 +414,9 @@ class JointStartupTuner:
                         self.inputs.reference.expected[producer],
                         out=self.mismatch,
                     )
-                    torch.sum(
-                        self.mismatch,
-                        dim=tuple(range(self.mismatch.ndim)),
-                        dtype=torch.int32,
-                        out=self.invalid,
-                    )
+                    # A bool reduction needs no int32 copy of the mask, which a
+                    # captured race would otherwise keep in the graph pool.
+                    torch.any(self.mismatch, out=self.invalid_any)
                     self._timing("validate", 0, self.state.selector)
             for round_index in range(7):
                 for producer in range(3):

@@ -80,3 +80,23 @@ def test_explicit_runtime_profiles_need_no_measured_finalists(prepared_joint):
 def test_invalid_explicit_runtime_profiles(prepared_joint, profiles):
     with pytest.raises(ValueError):
         joint_startup_spec(prepared_joint, profiles=profiles)
+
+
+@pytest.mark.parametrize("kind", ("reduction", "gather"))
+def test_startup_references_of_fewer_rows_are_leading_rows(kind):
+    import torch
+    from b12x.comm.pcie._joint_startup_fixtures import _gather_bank, _reduction_bank
+
+    device = torch.device("cpu")
+    if kind == "reduction":
+        small, large = (
+            _reduction_bank(4, 1, rows, (16,), torch.bfloat16, device) for rows in (3, 8)
+        )
+        leading = lambda tensor, rows: tensor[:rows]
+    else:
+        small, large = (_gather_bank(4, 2, rows, 24, device) for rows in (3, 8))
+        leading = lambda tensor, rows: tensor[: rows * tensor.numel() // 8]
+    for case in range(3):
+        assert torch.equal(small.seeds[case], leading(large.seeds[case], 3))
+        assert torch.equal(small.expected[case], leading(large.expected[case], 3))
+    assert large.seeds[0].abs().sum() > 0
