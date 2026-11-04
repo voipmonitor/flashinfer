@@ -22,6 +22,28 @@ def joint_finalist_policy():
     )
 
 
+_EVICTIONS = {}
+
+
+def _startup_eviction(device):
+    """One L2 eviction input per device for every cold startup race.
+
+    Races replay one at a time and only read it, so its contents do not
+    matter; zeros keep it out of the exported initial state.
+    """
+    eviction = _EVICTIONS.get(device.index)
+    if eviction is None:
+        l2 = torch.cuda.get_device_properties(device).L2_cache_size
+        eviction = (
+            torch.zeros(
+                max(2 * l2, 64 * 1024 * 1024) // 4, dtype=torch.float32, device=device
+            ),
+            torch.empty((), dtype=torch.float32, device=device),
+        )
+        _EVICTIONS[device.index] = eviction
+    return eviction
+
+
 @dataclass(frozen=True)
 class JointStartupSpec:
     key: tuple
@@ -180,24 +202,12 @@ class JointStartupTuner:
                     else self.inputs.out
                 )
                 self.mismatch = torch.empty_like(self.checked_output, dtype=torch.bool)
-                self.invalid = torch.zeros((), dtype=torch.int32, device=runtime.device)
+                self.invalid = torch.zeros((1,), dtype=torch.int32, device=runtime.device)
+                # The validator reads the int32 word; only its first byte is ever written.
+                self.invalid_any = self.invalid.view(torch.bool)[0]
                 self.eviction = self.eviction_sum = None
                 if cache_policy == "cold":
-                    eviction = getattr(runtime, "_joint_startup_eviction", None)
-                    if eviction is None:
-                        l2 = torch.cuda.get_device_properties(
-                            runtime.device
-                        ).L2_cache_size
-                        eviction = (
-                            torch.ones(
-                                max(2 * l2, 64 * 1024 * 1024) // 4,
-                                dtype=torch.float32,
-                                device=runtime.device,
-                            ),
-                            torch.empty((), dtype=torch.float32, device=runtime.device),
-                        )
-                        runtime._joint_startup_eviction = eviction
-                    self.eviction, self.eviction_sum = eviction
+                    self.eviction, self.eviction_sum = _startup_eviction(runtime.device)
                 self.launchers = {
                     action: timing_launcher(
                         runtime.world_size,
@@ -216,27 +226,41 @@ class JointStartupTuner:
             setup=prepare_local,
         )
         with torch.cuda.device(runtime.device):
-            shared = PCIeOneshotAllReduce._allocate_shared_buffer(
-                runtime.exchange_group, SCRATCH_BYTES, zero_fill=True, ipc=runtime._ipc
-            )
-            local_error = None
-            try:
+            # Races of one runtime replay one at a time on every rank, so they share
+            # its timing exchange: its barrier counters only ever advance.
+            shared = getattr(runtime, "_joint_startup_shared", None)
+            if shared is None:
+                shared = PCIeOneshotAllReduce._allocate_shared_buffer(
+                    runtime.exchange_group,
+                    SCRATCH_BYTES,
+                    zero_fill=True,
+                    ipc=runtime._ipc,
+                )
+                local_error = None
+                try:
+                    self.peers.copy_(
+                        torch.tensor(
+                            shared.peer_ptrs, dtype=torch.uint64, device=runtime.device
+                        )
+                    )
+                except Exception as error:
+                    local_error = error
+                _finish_collective_runtime_setup(
+                    owner="joint startup tuner",
+                    exchange_group=runtime.exchange_group,
+                    ipc=runtime._ipc,
+                    shared=shared,
+                    local_error=local_error,
+                    detach_shared_ownership=lambda: None,
+                )
+                runtime._owned_buffers.append(shared)
+                runtime._joint_startup_shared = shared
+            else:
                 self.peers.copy_(
                     torch.tensor(
                         shared.peer_ptrs, dtype=torch.uint64, device=runtime.device
                     )
                 )
-            except Exception as error:
-                local_error = error
-            _finish_collective_runtime_setup(
-                owner="joint startup tuner",
-                exchange_group=runtime.exchange_group,
-                ipc=runtime._ipc,
-                shared=shared,
-                local_error=local_error,
-                detach_shared_ownership=lambda: None,
-            )
-            runtime._owned_buffers.append(shared)
             self.shared = shared
         self.local_address = shared.local_ptr + SIGNAL_BYTES
         self.owners = (
@@ -329,12 +353,9 @@ class JointStartupTuner:
                         self.inputs.reference.expected[producer],
                         out=self.mismatch,
                     )
-                    torch.sum(
-                        self.mismatch,
-                        dim=tuple(range(self.mismatch.ndim)),
-                        dtype=torch.int32,
-                        out=self.invalid,
-                    )
+                    # A bool reduction needs no int32 copy of the mask, which a
+                    # captured race would otherwise keep in the graph pool.
+                    torch.any(self.mismatch, out=self.invalid_any)
                     self._timing("validate", 0, self.state.selector)
             for round_index in range(7):
                 for producer in range(3):
