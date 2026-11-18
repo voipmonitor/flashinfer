@@ -161,6 +161,9 @@ class W4A16FusedMoeKernel:
             )
         fc1_cols = int(intermediate_size) * (2 if is_gated else 1)
         routed_rows = int(size_m) * int(top_k)
+        self.fixed_work_grid = None
+        self.signal_activation_writers = False
+        self.expert_stage = None
         self.size_m = int(size_m)
         self.hidden_size = int(hidden_size)
         self.intermediate_size = int(intermediate_size)
@@ -847,6 +850,8 @@ class W4A16FusedMoeKernel:
                 (Int64(_LUT_E4M3_VALUE_TABLE_ENTRIES),), stride=(1,)
             ),
         )
+        if cutlass.const_expr(self.fixed_work_grid is not None):
+            grid_x = Int32(self.fixed_work_grid)
         grid = (grid_x, 1, 1)
         self.kernel(
             a_bf16_flat,
@@ -937,6 +942,10 @@ class W4A16FusedMoeKernel:
         tid = Int32(tidx)
         cta = Int32(bidx)
         grid_x = Int32(grid_x_raw)
+        # The persistent schedule divides by its launch grid in both GEMMs.
+        # The specialized launcher supplies the same constant physical grid.
+        if cutlass.const_expr(self.fixed_work_grid is not None):
+            grid_x = Int32(self.fixed_work_grid)
 
         smem = cutlass.utils.SmemAllocator()
 
@@ -1133,6 +1142,61 @@ class W4A16FusedMoeKernel:
             table_addr = Int64(smem_base + Int32(self.lut_e4m3_smem_off))
             fc1_phase_lut = table_addr
             fc2_phase_lut = table_addr
+        # Separate graph nodes can supply the device-wide ordering between
+        # phases. Keep the same two generation increments for consumers sharing
+        # the lock buffer with ordinary cooperative expert programs.
+        if cutlass.const_expr(self.expert_stage == "fc1"):
+            self.fc1._run_persistent_gemm(
+                a_bf16_flat,
+                a_alt_bf16_flat,
+                w13_i32_flat,
+                fc1_bf16_flat,
+                w13_scales_i32_flat,
+                w13_global_scale,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                topk_weights_flat,
+                fc1_c_tmp_f32_flat,
+                locks_i32_flat,
+                fc1_phase_lut,
+                smem_base,
+                tid,
+                cta,
+                grid_x,
+                active_m,
+                fc1_emit_tile,
+            )
+            return
+        if cutlass.const_expr(self.expert_stage == "activation"):
+            self._run_activation(fc1_bf16_flat, activated_bf16_flat, rot_scales_flat, tid, cta, grid_x, active_m)
+            if cta == Int32(0) and tid == Int32(0):
+                sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
+                red_add_global_release_i32(sense_addr, Int32(2))
+            return
+        if cutlass.const_expr(self.expert_stage == "fc2"):
+            self.fc2._run_persistent_gemm(
+                activated_bf16_flat,
+                activated_bf16_flat,
+                w2_i32_flat,
+                fc2_bf16_flat,
+                w2_scales_i32_flat,
+                w2_global_scale,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                topk_weights_flat,
+                fc2_c_tmp_f32_flat,
+                locks_i32_flat,
+                fc2_phase_lut,
+                smem_base,
+                tid,
+                cta,
+                grid_x,
+                active_m * Int32(self.top_k),
+                fc2_emit_tile,
+            )
+            return
         if cutlass.const_expr(self.full_rotation):
             if cutlass.const_expr(self.intermediate_hadamard):
                 self._run_input_rotation_intermediate_hadamard(
@@ -1221,7 +1285,18 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-            self._grid_barrier(locks_i32_flat, tid, grid_x)
+            if cutlass.const_expr(self.signal_activation_writers):
+                vectors = active_m * Int32(self.top_k * (self.intermediate_size // 8))
+                writers = (vectors + Int32(self.cta_threads - 1)) // Int32(self.cta_threads)
+                if writers > grid_x:
+                    writers = grid_x
+                if writers < Int32(1):
+                    writers = Int32(1)
+                # Every CTA publishes FC1. Only the CTAs with activation rows
+                # must observe every FC1 store before computing SiTU.
+                start_sense = self._grid_barrier(locks_i32_flat, tid, grid_x, cta < writers)
+            else:
+                self._grid_barrier(locks_i32_flat, tid, grid_x)
             if cutlass.const_expr(self.full_rotation):
                 if cutlass.const_expr(self.intermediate_hadamard):
                     self._run_activation_intermediate_hadamard(
@@ -1287,7 +1362,10 @@ class W4A16FusedMoeKernel:
                 active_m,
                 fc1_emit_tile,
             )
-        self._grid_barrier(locks_i32_flat, tid, grid_x)
+        if cutlass.const_expr(self.signal_activation_writers):
+            self._wait_for_activation_writers(locks_i32_flat, tid, cta, writers, start_sense)
+        else:
+            self._grid_barrier(locks_i32_flat, tid, grid_x)
         if cutlass.const_expr(self.collect_activation_amax):
             self._collect_activation_amax_epilogue(
                 a_bf16_flat,
@@ -1428,7 +1506,9 @@ class W4A16FusedMoeKernel:
         locks_i32_flat: cute.Tensor,
         tid: Int32,
         grid_x: Int32,
+        wait_for_arrivals=True,
     ):
+        old_sense = Int32(0)
         cute.arch.sync_threads()
         if tid == Int32(0):
             count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
@@ -1442,10 +1522,37 @@ class W4A16FusedMoeKernel:
                 st_global_i32(count_addr, Int32(0))
                 threadfence()
                 red_add_global_release_i32(sense_addr, Int32(1))
-            else:
+            elif wait_for_arrivals:
                 sense = old_sense
                 while sense == old_sense:
                     sense = ld_global_acquire_i32(sense_addr)
+        cute.arch.sync_threads()
+        return old_sense
+
+    @cute.jit
+    def _wait_for_activation_writers(
+        self, locks_i32_flat: cute.Tensor, tid: Int32, cta: Int32, writers: Int32,
+        start_sense: Int32,
+    ):
+        # FC1 uses one epoch and SiTU the next. Every CTA captures the starting
+        # epoch before its FC1 arrival, including a consumer delayed until after
+        # the last writer publishes. The existing lock storage remains reusable
+        # across graph widths and repeated launches.
+        cute.arch.sync_threads()
+        if tid == Int32(0):
+            count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
+            sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
+            if cta < writers:
+                threadfence()
+                arrived = atomic_add_global_i32(count_addr, Int32(1))
+                if arrived == writers - Int32(1):
+                    st_global_i32(count_addr, Int32(0))
+                    threadfence()
+                    red_add_global_release_i32(sense_addr, Int32(1))
+            expected = start_sense + Int32(2)
+            observed = ld_global_acquire_i32(sense_addr)
+            while observed != expected:
+                observed = ld_global_acquire_i32(sense_addr)
         cute.arch.sync_threads()
 
     @cute.jit
