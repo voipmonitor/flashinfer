@@ -152,6 +152,7 @@ class W4A16GemmKernel:
         small_m_occupancy: int | None = None,
         csf_inline_scales: bool = False,
     ):
+        self.warp_route_metadata = False
         if element_dtype not in {"bf16", "fp16"}:
             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
         if weight_layout not in _WEIGHT_LAYOUTS:
@@ -1319,6 +1320,69 @@ class W4A16GemmKernel:
                         route_block_idx += Int32(1)
 
     @cute.jit
+    def _store_route_metadata(
+        self,
+        idx: Int32,
+        topk_weights_flat: cute.Tensor,
+        smem_base: Int32,
+        tid: Int32,
+        global_scale_f32: cutlass.Float32,
+        active_size_m: Int32,
+    ):
+        rd_row = idx // Int32(self.top_k)
+        if cutlass.const_expr(self.route_major_a):
+            rd_row = idx
+        st_shared_i32(
+            smem_base + Int32(self.sh_rd_route_off * 16) + tid * Int32(4),
+            rd_row,
+        )
+        if cutlass.const_expr(self.mul_topk_weights):
+            safe_idx = idx
+            if idx >= active_size_m * Int32(self.top_k):
+                safe_idx = Int32(0)
+            topk = (
+                topk_weights_flat[safe_idx].to(cutlass.Float32) * global_scale_f32
+            )
+            packed_topk = self._broadcast_f32_to_elem2(topk)
+            # top-k weights are cached as packed element pairs.
+            topk_word_addr = (
+                smem_base + Int32(self.sh_topk_off * 16) + tid * Int32(4)
+            )
+            st_shared_u32(topk_word_addr, packed_topk)
+        elif cutlass.const_expr(self.fused_sum_router_weights_fp32):
+            safe_idx = idx
+            if idx >= active_size_m * Int32(self.top_k):
+                safe_idx = Int32(0)
+            st_shared_f32(
+                smem_base + Int32(self.sh_topk_off * 16) + tid * Int32(4),
+                topk_weights_flat[safe_idx].to(cutlass.Float32),
+            )
+
+    @cute.jit
+    def _read_packed_route_warp(
+        self, packed_route_indices: cute.Tensor, topk_weights_flat: cute.Tensor,
+        smem_base: Int32, tid: Int32, route_block_idx: Int32,
+        global_scale_f32: cutlass.Float32, active_size_m: Int32,
+    ) -> Int32:
+        lane = tid % Int32(32)
+        idx = Int32(0)
+        is_valid = Int32(0)
+        if lane < Int32(16):
+            idx = packed_route_indices[route_block_idx * Int32(16) + lane].to(Int32)
+            is_valid = (idx < active_size_m * Int32(self.top_k)).to(Int32)
+        valid_count = cute.arch.warp_redux_sync(is_valid, "add")
+        # Every warp has the row count; retire previous tile readers before
+        # the first warp publishes both index arrays for this tile.
+        cute.arch.sync_threads()
+        if tid < Int32(16):
+            st_shared_i32(smem_base + Int32(self.sh_route_off * 16) + tid * Int32(4), idx)
+            self._store_route_metadata(
+                idx, topk_weights_flat, smem_base, tid, global_scale_f32, active_size_m
+            )
+        cute.arch.sync_threads()
+        return valid_count
+
+    @cute.jit
     def _read_moe_block_data(
         self,
         packed_route_indices: cute.Tensor,
@@ -1403,6 +1467,12 @@ class W4A16GemmKernel:
                     )
             cute.arch.sync_threads()
             return Int32(1)
+
+        if cutlass.const_expr(self.warp_route_metadata):
+            return self._read_packed_route_warp(
+                packed_route_indices, topk_weights_flat, smem_base, tid,
+                route_block_idx, global_scale_f32, active_size_m,
+            )
 
         route_indices_int4_addr = self._int4_addr(
             smem_base, Int32(self.sh_route_off) + tid

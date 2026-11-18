@@ -104,6 +104,10 @@ def compile_w4a16_fused_moe(
     _require_cached: bool = False,
     small_m_occupancy: int | None = None,
     csf_inline_scales: bool = False,
+    fixed_work_grid: int | None = None,
+    warp_route_metadata: bool = False,
+    signal_activation_writers: bool = False,
+    expert_stage: str | None = None,
 ) -> W4A16FusedMoeCompileResult:
     if small_m_occupancy is None:
         small_m_occupancy = _w4a16_small_m_occupancy()
@@ -524,6 +528,49 @@ def compile_w4a16_fused_moe(
         csf_inline_scales=csf_inline_scales,
     )
     compile_key = ("w4a16_fused_moe", kernel.__cache_key__)
+    if fixed_work_grid is not None:
+        if type(fixed_work_grid) is not int or fixed_work_grid != kernel.sms * kernel.blocks_per_sm:
+            raise ValueError("the fixed work grid must match cooperative CTA residency")
+        kernel.fixed_work_grid = fixed_work_grid
+        compile_key = (*compile_key, "fixed_work_grid", fixed_work_grid)
+    if warp_route_metadata:
+        if kernel.fc1.moe_block_size != 16 or kernel.fc2.moe_block_size != 16 or direct_topk_routes or top_k != 16:
+            raise ValueError("warp route metadata requires packed 16-index routes and top K of 16")
+        kernel.fc1.warp_route_metadata = True
+        kernel.fc2.warp_route_metadata = True
+        compile_key = (*compile_key, "warp_route_metadata")
+    if signal_activation_writers:
+        if (
+            activation != "situ"
+            or element_dtype != "bf16"
+            or intermediate_size % 8
+            or full_rotation
+            or intermediate_rotation
+            or collect_activation_amax
+            or tc_decode_fused_sum
+            or prefill_fused_sum_fp32
+            or zero_fc2_output
+        ):
+            raise ValueError("activation writer signaling requires the vectorized BF16 SiTU path")
+        kernel.signal_activation_writers = True
+        compile_key = (*compile_key, "signal_activation_writers")
+    if expert_stage is not None:
+        if expert_stage not in ("fc1", "activation", "fc2"):
+            raise ValueError("expert stage must be fc1, activation or fc2")
+        if (
+            activation != "situ"
+            or element_dtype != "bf16"
+            or full_rotation
+            or intermediate_rotation
+            or collect_activation_amax
+            or tc_decode_fused_sum
+            or prefill_fused_sum_fp32
+            or zero_fc2_output
+            or use_expert_map
+        ):
+            raise ValueError("separate graph stages require ordinary BF16 SiTU experts")
+        kernel.expert_stage = expert_stage
+        compile_key = (*compile_key, "expert_stage", expert_stage)
     cache_key = (device, compile_key)
     cached = _FUSED_CACHE.get(cache_key)
     if cached is None and _require_cached:
