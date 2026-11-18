@@ -216,7 +216,11 @@ class SelectedGather(_AllGatherHeadsLaunch):
 
 
 @program_cache
-def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, transport):
+def compile_selected_gather(
+    world, rank, row_words, threads, blocks, chunks, transport, *, cross_switch_first=False
+):
+    if cross_switch_first and (world != 16 or transport not in ("recursive", "recursive_ready")):
+        raise ValueError("cross-switch-first ordering requires a sixteen-rank recursive gather")
     if transport in ("recursive", "recursive_ready"):
         from ._recursive_gather_cute import RecursiveGather
 
@@ -228,6 +232,7 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
             blocks,
             chunks,
             acknowledge_consumption=transport == "recursive",
+            cross_switch_first=cross_switch_first,
         )
     elif transport == "ring":
         from ._ring_gather_cute import RingGather
@@ -270,7 +275,8 @@ def compile_selected_gather(world, rank, row_words, threads, blocks, chunks, tra
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.selected_gather",
             12,
-            (world, rank, row_words, threads, blocks, chunks, transport),
+            (world, rank, row_words, threads, blocks, chunks, transport)
+            + (("cross-switch-first",) if cross_switch_first else ()),
         ),
     )
 
