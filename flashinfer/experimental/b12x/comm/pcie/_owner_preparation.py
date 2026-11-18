@@ -184,6 +184,8 @@ def query_from_runtime(
             "inp": _tensor_call(inp),
             "output": None if out is None else _tensor_call(out),
         }
+        if raw.get("parallel_peer_flags", False):
+            controls["parallel_peer_flags"] = True
         setup = {
             "max_elements": int(runtime.max_elements),
             "threads_override": bool(getattr(runtime, "threads_override", False)),
@@ -216,6 +218,36 @@ def _selected_peers(runtime):
     else:
         from .pcie_vocab_argmax import _selected_peers
     return _selected_peers(runtime.rank, runtime.world_size)
+
+
+def _parallel_island_peer_flags(query, capability, sm_count):
+    """Select the measured four-CTA BF16 profiles on 188-SM SM120 devices.
+
+    Eight-CTA profiles retain serial signaling because their parallel peer
+    publication is slower in the component measurements. Shape is interpreted
+    as a flat BF16 element count, independently of model or tensor row layout.
+    """
+    from math import prod
+
+    call = query.call
+    if (
+        query.world_size != 16
+        or tuple(capability) != (12, 0)
+        or sm_count != 188
+        or call.get("blocks") != 64
+        or call.get("active_blocks") != 4
+        or call.get("wait_nanosleep_cycles") != 24
+        or not call.get("local_push", False)
+        or call.get("cross_island_rsag", False)
+    ):
+        return False
+    inp = call.get("inp", {})
+    if inp.get("dtype") != "torch.bfloat16":
+        return False
+    return (call.get("threads"), prod(inp.get("shape", ()))) in (
+        (512, 14_336),
+        (1024, 28_672),
+    )
 
 
 @program_cache(scope="preparation")
@@ -259,6 +291,13 @@ def compile_owner_surface(query_payload, ordinal):
         if query.surface == "PCIeIslandRSAllReduce.all_reduce":
             from ._island_rs_cute import get_island_rs_launcher
 
+            if call.get("parallel_peer_flags"):
+                from ._island_parallel_push import compile_parallel_push
+                properties = torch.cuda.get_device_properties(ordinal)
+                if not _parallel_island_peer_flags(query, (properties.major, properties.minor),
+                                                   properties.multi_processor_count):
+                    raise ValueError("parallel peer publication differs from its prepared device or geometry")
+                return compile_parallel_push(query.rank, int(call["threads"]))
             return get_island_rs_launcher(
                 query.world_size,
                 query.rank,

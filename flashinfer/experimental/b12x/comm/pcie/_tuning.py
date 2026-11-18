@@ -107,6 +107,13 @@ def _validate_query(query: PcieQuery, device) -> None:
             call["active_blocks"],
             cluster_size=call["joint_cluster_size"],
         )
+    if query.call.get("row_blocks"):
+        if not (query.surface.endswith(".all_gather_pair") and query.world_size == 16
+                and query.call["threads"] == 512 and query.call["first_dtype"] == "torch.bfloat16"
+                and query.call["second_dtype"] == "torch.float32"
+                and tuple(query.call["first_shape"]) == (4, 224)
+                and tuple(query.call["second_shape"]) == (4, 56)):
+            raise ValueError("row-parallel paired gather requires four BF16[224]/FP32[56] rows on sixteen peers")
     if query.surface.endswith(".all_gather_heads"):
         transport = query.call.get("gather_transport", "barrier")
         from ._gather_preparation import GATHER_MODES, validate_query as validate_gather

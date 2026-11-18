@@ -145,6 +145,8 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             first_shape=tuple(first.shape),
             second_shape=tuple(second.shape),
         )
+        if call.get("row_blocks", False):
+            metadata["row_blocks"] = True
     elif surface.endswith("all_gather_pair_kimi_topk"):
         metadata["threads"] = 512
     elif surface.endswith("kimi_topk16"):
@@ -184,7 +186,12 @@ def compile_dcp_surface(query_payload, ordinal):
     surface = query.surface
     with torch.cuda.device(ordinal):
         if surface == "kimi_topk16" or surface.endswith("kimi_topk16"):
-            return {False: cute._get_compiled_kimi_topk16(int(call["threads"]))}
+            threads = int(call["threads"])
+            if threads == 256:
+                from ._kimi_topk_cute import compile_kimi_topk16
+
+                return {False: compile_kimi_topk16()}
+            return {False: cute._get_compiled_kimi_topk16(threads)}
         if surface.endswith("lse_reduce_scatter"):
             return {
                 slot: cute._get_compiled_lse_reduce_scatter(
@@ -225,6 +232,13 @@ def compile_dcp_surface(query_payload, ordinal):
                 for slot in (False, True)
             }
         if surface.endswith("all_gather_pair"):
+            if call.get("row_blocks", False):
+                from ._pair_rows_cute import compile_pair_rows
+
+                return {
+                    False: cute._get_compiled_all_gather_pair(query.world_size, query.rank, 512, False),
+                    True: compile_pair_rows(query.rank),
+                }
             return {
                 slot: cute._get_compiled_all_gather_pair(
                     query.world_size, query.rank, int(call["threads"]), slot, False

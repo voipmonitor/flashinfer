@@ -709,6 +709,7 @@ class PCIeDCPA2A:
             ext_module=ext_module,
             stream_affine=stream_affine,
         )
+        runtime._signal_bytes = layout.signal_bytes
         runtime._exchange_chunks = layout.exchange_chunks
         runtime._exchange_offset = layout.exchange_offset
         runtime._exchange_counter_offset = layout.exchange_counter_offset
@@ -1217,6 +1218,10 @@ class PCIeDCPA2A:
         )
         if any(value % 16 for value in row_bytes):
             raise ValueError("paired row widths must be multiples of 16 bytes")
+        row_blocks = bool(state.query.call.get("row_blocks", False))
+        if row_blocks and (tuple(local_first.shape) != (4, 224) or tuple(local_second.shape) != (4, 56)
+                           or local_first.dtype != torch.bfloat16 or local_second.dtype != torch.float32):
+            raise ValueError("row-parallel paired gather inputs differ from the prepared geometry")
         combined_row_bytes = sum(row_bytes)
         if combined_row_bytes != self.query_head_dim:
             raise ValueError(
@@ -1252,7 +1257,7 @@ class PCIeDCPA2A:
                 raise ValueError(f"{name} output must be contiguous")
         threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
         capturing = _is_current_stream_capturing(self.device)
-        if capturing:
+        if capturing and not row_blocks:
             from ._dcp_a2a_cute import is_all_gather_pair_prepared
 
             if not is_all_gather_pair_prepared(

@@ -307,3 +307,23 @@ def test_dcp_materialization_resolves_graph_program_before_capture(monkeypatch):
         assert state.launcher(False)() == "dcp-materialize-False"
         assert state.launcher(True)() == "dcp-materialize-True"
     assert len(loaded) == 2
+
+
+@pytest.mark.parametrize("change", [
+    {"first_shape": (8, 224)}, {"second_shape": (4, 64)}, {"first_dtype": "torch.float16"},
+    {"second_dtype": "torch.bfloat16"}, {"threads": 256},
+])
+def test_paired_row_blocks_validate_transport_geometry(change):
+    from dataclasses import replace
+    from b12x.comm.pcie._dcp_a2a_cute import _pair_launcher_key
+
+    fields = dict(first_shape=(4, 224), second_shape=(4, 56), first_dtype="torch.bfloat16",
+                  second_dtype="torch.float32", threads=512, row_blocks=True)
+    query = PcieQuery(surface="DcpAllToAll.all_gather_pair", world_size=16, rank=7,
+                      topology="pcie_ipc", call=FrozenMapping(fields), setup=FrozenMapping())
+    TUNING.validate_query(query, None)
+    with pytest.raises(ValueError, match="row-parallel"):
+        TUNING.validate_query(replace(query, call=FrozenMapping({**fields, **change})), None)
+    with pytest.raises(ValueError, match="row-parallel"):
+        TUNING.validate_query(replace(query, world_size=8), None)
+    assert _pair_launcher_key(16, 7, 512, True, False) == (16, 7, 512, True, False)
