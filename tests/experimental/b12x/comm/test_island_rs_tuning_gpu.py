@@ -49,12 +49,37 @@ def _worker(rank, directory, blocks):
                 collective_barrier=lambda key, ranks: dist.barrier(),
             )
             cases, requests = [], []
+            observed_alignments = set()
             for rows in (2, 128, 1024):
                 for inplace in (False, True):
-                    source = torch.empty(
-                        (rows, 7168), device=device, dtype=torch.bfloat16
+                    source_offset, output_offset = {
+                        2: (2, 4),
+                        128: (4, 2),
+                        1024: (0, 0),
+                    }[rows]
+                    shape = (rows, 7168)
+                    source = (
+                        torch.empty(
+                            rows * 7168 + source_offset,
+                            device=device,
+                            dtype=torch.bfloat16,
+                        )[source_offset:].view(shape)
+                        if source_offset
+                        else torch.empty(shape, device=device, dtype=torch.bfloat16)
                     )
-                    output = source if inplace else torch.empty_like(source)
+                    output = (
+                        source
+                        if inplace
+                        else (
+                            torch.empty(
+                                rows * 7168 + output_offset,
+                                device=device,
+                                dtype=torch.bfloat16,
+                            )[output_offset:].view(shape)
+                            if output_offset
+                            else torch.empty_like(source)
+                        )
+                    )
                     seed = torch.zeros_like(source)
                     query = query_from_runtime(
                         owner,
@@ -62,6 +87,27 @@ def _worker(rank, directory, blocks):
                         call={"inp": source, "out": output},
                     )
                     prepared = plan(query, runtime=owner)
+
+                    def benchmark(
+                        state,
+                        factory=prepared._benchmark_call,
+                        inplace=inplace,
+                        observed=observed_alignments,
+                    ):
+                        call = factory(state)
+                        operands = call.owners[0]
+                        input_alignment = _owner_preparation._alignment(operands.source)
+                        output_alignment = _owner_preparation._alignment(operands.out)
+                        assert input_alignment == state.query.call["inp"]["alignment"]
+                        assert (
+                            output_alignment == state.query.call["output"]["alignment"]
+                        )
+                        assert (
+                            operands.source.data_ptr() == operands.out.data_ptr()
+                        ) == inplace
+                        observed.add((input_alignment, output_alignment, inplace))
+                        return call
+
                     name = f"rows{rows}-inplace{int(inplace)}"
                     requests.append(
                         prepared.request(
@@ -71,12 +117,22 @@ def _worker(rank, directory, blocks):
                                     state, inp=source, out=output
                                 )
                             ),
+                            benchmark_call=benchmark,
                             collective=CollectiveRequirement(name, tuple(range(16))),
                         )
                     )
                     cases.append((source, output, seed, prepared, inplace))
             result = _drive(session, requests)
             assert (result.benchmarked_candidates == 0) == cached
+            if not cached:
+                assert observed_alignments == {
+                    (4, 8, False),
+                    (4, 4, True),
+                    (8, 4, False),
+                    (8, 8, True),
+                    (256, 256, False),
+                    (256, 256, True),
+                }
             for source, output, seed, prepared, inplace in cases:
                 assert prepared.selection.source == ("cached" if cached else "tuned")
                 config = prepared.selection.config

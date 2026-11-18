@@ -1,4 +1,4 @@
-"""Pull-based island reduce-scatter TP16 all-reduce runtime."""
+"""TP16 BF16 island all-reduce with prepared SM and copy-engine transports."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from torch.distributed import ProcessGroup
 
 from b12x.preparation.types import Plan, require_prepared
 
+from ._island_copy import copy_scratch_bytes
 from ._island_rs_cute import (
+    GROUP_TIMING_FIELDS,
     HEADER_BYTES,
     MAX_BLOCKS,
     island_rs_peers,
@@ -161,7 +163,9 @@ class PCIeIslandRSAllReduce:
         self.stage_offset = _align_up(HEADER_BYTES)
         self.part_offset = _align_up(self.stage_offset + 2 * vector_bytes)
         self.final_offset = _align_up(self.part_offset + 2 * quarter_bytes)
-        self.slab_bytes = _align_up(self.final_offset + 2 * vector_bytes)
+        self.slab_bytes = _align_up(
+            self.final_offset + 2 * vector_bytes
+        ) + copy_scratch_bytes(self.quarter_capacity)
 
         self._ipc = CudaRTLibrary() if ipc is None else ipc
         self._ipc.cudaSetDevice(self.device.index or 0)
@@ -169,6 +173,8 @@ class PCIeIslandRSAllReduce:
         self._local_ptr = 0
         self._remote_ptrs: list[int] = []
         self._closed = False
+        self._group_timing_records = None
+        self._packet_transport = None
         self._mapped_peers = island_rs_peers(self.rank, self.world_size)
 
         shared = PCIeOneshotAllReduce._allocate_shared_buffer(
@@ -265,8 +271,16 @@ class PCIeIslandRSAllReduce:
             state.launcher(), inp, out, selected, stream, active_blocks=participating
         )
 
+    def packet_transport(self):
+        from ._island_copy import PacketTransport
+
+        if self._packet_transport is None:
+            self._packet_transport = PacketTransport(self.device, self._ipc)
+        return self._packet_transport
+
     def _run_prepared(self, launcher, inp, out, blocks, stream, *, active_blocks=None):
         """Invoke an already-prepared native launcher after caller validation."""
+        records = self._group_timing_records
         with torch.cuda.device(self.device):
             launcher(
                 self._slab_ptrs,
@@ -280,8 +294,30 @@ class PCIeIslandRSAllReduce:
                 blocks,
                 stream,
                 active_blocks=active_blocks,
+                timing_address=0 if records is None else records.data_ptr(),
+                timing_calls=0 if records is None else records.shape[0],
+                timing_blocks=0 if records is None else records.shape[1],
+                timing_slices=0 if records is None else records.shape[3],
             )
         return out
+
+    def bind_group_timing(self, records: torch.Tensor) -> None:
+        """Retain caller-owned diagnostic records shaped as calls, CTAs, groups, slices, fields."""
+        if (
+            records.device != self.device
+            or records.dtype != torch.int64
+            or not records.is_contiguous()
+            or records.ndim != 5
+            or records.shape[2] != 4
+            or records.shape[4] != len(GROUP_TIMING_FIELDS)
+            or not 1 <= records.shape[0] <= 0x7FFFFFFF
+            or not 1 <= records.shape[1] <= self.blocks
+            or not 1 <= records.shape[3] <= 0x7FFFFFFF
+        ):
+            raise ValueError(
+                "group timing records require contiguous device int64 storage with shape [calls, CTAs, 4, slices, 16]"
+            )
+        self._group_timing_records = records
 
     def prepare_channels(self, channel_ids: Sequence[str]) -> None:
         """Accept owner names for the single ordered collective channel."""
@@ -330,6 +366,7 @@ class PCIeIslandRSAllReduce:
         self._closed = True
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
+        self._group_timing_records = None
         dist.barrier(group=self.group)
         self._slab_ptrs = ()
         for ptr in self._remote_ptrs:
@@ -340,6 +377,9 @@ class PCIeIslandRSAllReduce:
             self._ipc.cudaFree(self._local_ptr)
             self._local_ptr = 0
         dist.barrier(group=self.group)
+        if self._packet_transport is not None:
+            self._packet_transport.close()
+            self._packet_transport = None
 
 
 __all__ = [

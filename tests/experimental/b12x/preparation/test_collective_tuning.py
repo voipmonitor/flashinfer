@@ -192,6 +192,7 @@ def test_island_native_override_preserves_fixed_declaration():
         "island_rsag",
         "island_push",
         "island_push_rsag",
+        "island_hybrid_rsag",
     }
     assert (
         prepared.query.alternatives["island_rsag"]["call"]["cross_island_rsag"] is True
@@ -207,7 +208,7 @@ def test_island_native_override_preserves_fixed_declaration():
                 COLLECTIVE.configure(prepared.query, device=None)
             )
         ]
-    assert len(configs) == 140
+    assert len(configs) == 175
     assert {c.submode for c in configs} == {""}
     fixed = plan(native, runtime=owner, override=BackendConfig(backend="native"))
     assert fixed.contract is NATIVE

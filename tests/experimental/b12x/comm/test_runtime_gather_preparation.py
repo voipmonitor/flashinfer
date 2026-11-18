@@ -229,7 +229,7 @@ def test_pairwise_gather_requires_its_explicit_geometry(transport):
     assert selected_gather_profile(transport, 8, "barrier", 8) == 8
     for change in (
         {"threads": 32},
-        {"threads": 512},
+        {"threads": 256 if transport == "selected_ring" else 512},
         {"active_blocks": 7},
         {"block_limit": 16},
         {"submode": "word_exchange"},

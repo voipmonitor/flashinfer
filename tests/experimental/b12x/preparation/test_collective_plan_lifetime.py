@@ -99,17 +99,21 @@ def test_full_candidate_envelope_releases_real_native_plans(monkeypatch):
             session.close()
 
 
-def test_compilation_and_materialization_preserve_the_selected_owner(monkeypatch):
+@pytest.mark.parametrize("implementation", ["island_push_rsag", "island_hybrid_rsag"])
+def test_compilation_and_materialization_preserve_the_selected_owner(
+    monkeypatch, implementation
+):
     plan, owner, source, output = island_plan()
-    config = next(
-        c for c in configurations(plan) if c.implementation == "island_push_rsag"
-    )
+    config = next(c for c in configurations(plan) if c.implementation == implementation)
     (job,) = plan._compile_jobs(config, DEVICE)
     payload = job.args[0]
     assert payload["call"]["threads"] == config.threads
     assert payload["call"]["active_blocks"] == config.active_blocks
     assert payload["call"]["local_push"] is True
     assert payload["call"]["cross_island_rsag"] is True
+    assert payload["call"]["cross_island_dma"] == (
+        implementation == "island_hybrid_rsag"
+    )
     assert tuple(payload["call"]["inp"]["shape"]) == tuple(source.shape)
     launcher = SimpleNamespace()
     monkeypatch.setattr(

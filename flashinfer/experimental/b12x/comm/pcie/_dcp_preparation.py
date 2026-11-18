@@ -141,12 +141,18 @@ def query_from_runtime(runtime, *, surface, call) -> PcieQuery:
             _call_value(call, "local_first"),
             _call_value(call, "local_second"),
         )
+        blocks = call.get("row_blocks", 1)
+        if type(blocks) is not int:
+            raise ValueError("paired gather row blocks must be an integer")
+        fixed_rows = call.get("fixed_pair_rows", False)
+        if type(fixed_rows) is not bool or (fixed_rows and (blocks != 1 or call.get("load_batch", 1) != 1)):
+            raise ValueError("the fixed paired-row launcher requires the default generic launch options")
         metadata.update(
             first_dtype=str(first.dtype),
             second_dtype=str(second.dtype),
             first_shape=tuple(first.shape),
             second_shape=tuple(second.shape),
-            row_blocks=call.get("row_blocks", 1),
+            row_blocks=True if fixed_rows else blocks,
             load_batch=call.get("load_batch", 1),
             disjoint_output=_pair_outputs_disjoint(
                 first, second, call.get("out_first"), call.get("out_second")

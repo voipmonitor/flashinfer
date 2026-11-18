@@ -76,8 +76,8 @@ def measure(
             yield
         return result
 
-    def launch_exchange(indices, turn, repetition):
-        state = (indices, turn, repetition)
+    def launch_exchange(indices, turn, repetition, sample):
+        state = (indices, turn, repetition, sample)
         assert all(peer == state for peer in collective(state))
         if False:
             yield

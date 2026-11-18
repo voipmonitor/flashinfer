@@ -186,6 +186,15 @@ def _reduction_repetitions(shape):
     return max(1, (100 + rows - 1) // rows)
 
 
+def _empty_island_operand(shape, dtype, device, alignment):
+    if alignment == 256:
+        return torch.empty(shape, dtype=dtype, device=device)
+    # An alignment-sized offset gives the declared sub-256-byte pointer class.
+    offset = alignment // dtype.itemsize
+    storage = torch.empty(prod(shape) + offset, dtype=dtype, device=device)
+    return storage[offset:].view(shape)
+
+
 class _ReductionInputs:
     def __init__(self, state, *, inplace):
         self.state, self.step = state, 0
@@ -210,8 +219,21 @@ class _ReductionInputs:
         ]
         device = state.runtime.device
         self.reference = _reduction_reference(query, shape, dtype, device, self.fused)
-        self.source = torch.empty(shape, dtype=dtype, device=device)
-        self.out = self.source if inplace else torch.empty_like(self.source)
+        if self.owner:
+            self.source = _empty_island_operand(
+                shape, dtype, device, call["inp"]["alignment"]
+            )
+            if inplace:
+                self.out = self.source
+            elif call["output"] is None or call["output"]["alignment"] == 256:
+                self.out = torch.empty_like(self.source)
+            else:
+                self.out = _empty_island_operand(
+                    shape, dtype, device, call["output"]["alignment"]
+                )
+        else:
+            self.source = torch.empty(shape, dtype=dtype, device=device)
+            self.out = self.source if inplace else torch.empty_like(self.source)
         self.owner_call = None
         if self.owner:
             from ._owner_preparation import prepared_call

@@ -15,7 +15,7 @@ tuning keys. Every caller still binds its own serving operands.
 | Staged fused residual addition and RMSNorm | Native staged transports compatible with declared input, residual, normalization, grouping, and output arithmetic |
 | DCP `all_gather_heads` and `lse_reduce_scatter`, TP2/4/8 | Thread count and block limit; equivalent effective grids are measured once |
 | DCP `all_gather_heads`, TP16 | Ordinary DCP geometry; phased, ring, and recursive profiles on SM120 devices with at least 64 SMs |
-| IslandRS `all_reduce`, TP16 | Thread and active-CTA counts; local pull or push; cross-island full reduction or reduce-scatter/all-gather with a fixed physical grid |
+| IslandRS `all_reduce`, TP16 | Thread and active-CTA counts; four SM transports combining local pull or push with cross-island full reduction or reduce-scatter/all-gather; hybrid local SM writes and cross-island copy-engine transfers |
 
 Payload-ready transports require their reserved incoming slots, BF16 support,
 and sufficient SMs to keep their grid resident. Two-shot retains its native
@@ -51,30 +51,42 @@ configuration. Native low-level plans still use `PcieConfig`.
 TP16 gather tuning retains ordinary DCP as its default. Selected alternatives
 require disjoint contiguous, 16-byte-aligned rows. The phased profile requires a
 compiled kernel that can keep its complete eight-CTA cluster active; its
-unpinned thread counts are 128, 256, and 512. The ring and recursive profiles use 128
-threads and no cluster. All selected profiles have eight physical and active CTAs. Existing DCP
+unpinned thread counts are 128, 256, and 512. The ring profile admits 128 or 512
+threads; recursive profiles use 128 threads. Neither uses a cluster.
+All selected profiles have eight physical and active CTAs. Existing DCP
 thread and block overrides constrain every implementation. A block override
-other than eight excludes the selected profiles; a thread override other than
-128 excludes ring and recursive profiles. `PcieConfig(backend="native")`
-retains the fixed native declaration. Each exact message shape races normally
+other than eight excludes the selected profiles. Ring excludes thread overrides
+outside 128 and 512; recursive profiles exclude thread overrides other than 128.
+`PcieConfig(backend="native")` retains the fixed native declaration. Each exact
+message shape races normally
 without enabling a runtime ladder or changing the all-reduce channel.
 The loaded phased kernel must pass its occupancy check before capture; failure
 stops preparation.
 
-IslandRS channels use one physical grid that fits one CTA per SM on every rank,
-up to 64 CTAs. Preparation races active-CTA counts within that grid and 128,
-256, 512, 768, and 1024 threads. Explicit launch overrides retain their declared
-participation. Candidate choices share the channel's peer mappings and slab
-layout, ordered FP32 sums, and BF16 conversion points. Every physical CTA
-advances the data-buffer generation; only participating CTAs advance their
-communication epoch. Separate counters preserve bank parity and prevent stale
-flags from satisfying waits when an inactive CTA rejoins after counter rollover.
-Each shape and input/output alias pattern keeps its own selection. Local push
-places input quarters and completed reduction quarters in the recipients'
-existing staging planes. Cross-island reduce-scatter/all-gather assigns each
-stride position to one island, then gathers the completed BF16 values. Partial
-and final readiness use distinct tags in the existing mailbox. Their signed
-modular ordering supports generation wrap with the two-bank lifetime bound.
+IslandRS assumes 16 ranks arranged as four contiguous four-rank islands.
+Preparation races five transports over 128, 256, 512, 768, and 1024 threads and
+the active-CTA counts admitted by the channel's physical grid, capped at 64 CTAs
+and one CTA per SM. Explicit launch overrides retain their declared
+participation. All choices share peer mappings, ordered FP32 sums, and BF16
+conversion points. Each shape and input/output alias pattern keeps its own
+selection.
+
+The SM transports combine local pull or push with cross-island full reduction
+or reduce-scatter/all-gather. They launch the fixed physical grid. Every physical
+CTA advances the data-buffer generation; only participating CTAs advance their
+communication epoch. Separate counters preserve bank parity when inactive CTAs
+rejoin. Local push places input and completed reduction quarters in recipients'
+staging planes. Cross-island reduce-scatter/all-gather assigns each stride
+position to one island, then gathers completed BF16 values. Distinct partial
+and final readiness tags use signed modular ordering to support generation wrap.
+
+The hybrid transport, `island_hybrid_rsag`, uses eight transfer batches. Local
+SM writes overlap cross-island copies on a dedicated native CUDA stream.
+Packet scratch and rendezvous flags occupy a separate region of the channel
+slab. At a 14 MiB BF16 input capacity, this region adds 22.75 MiB plus 256 bytes
+per rank. The channel owns the stream and events until queued work drains during
+close. The transport advances the SM protocol's buffer generations and
+communication epochs so serialized calls can alternate transports.
 
 Default-effort plain all-reduce tuning calibrates transfer-size buckets before
 restricting exact-shape races to two families. Bucket upper bounds are
@@ -120,9 +132,10 @@ A caller can supply an explicit `benchmark_call` for a different representative
 execution context.
 
 All ranks compile and bind a candidate before any rank primes it. Each rank
-queues the same captured calls behind a stream gate; the coordinator releases
-the sample block after every rank reports readiness. An untimed collective
-aligns GPU entry. Corresponding event samples reduce with **maximum across
+queues one sample behind a stream gate; the coordinator releases it after every
+rank reports readiness. An untimed replay precedes input production and the
+timed replay to absorb rank-release skew. Each sample drains before submission
+of the next sample. Corresponding event samples reduce with **maximum across
 ranks** before repeat sizing, elimination, and winner selection. The tournament
 retains a champion and one challenger, bounding candidate operand residency to
 two fixtures plus graph/event and cache-eviction storage.
@@ -142,6 +155,11 @@ rank-local query/program identities, and measurement policy. A valid cached
 record from any member is adopted by the group. Cache-only mode fails if none
 has a record. Interrupted collective races restart; completed selections reuse
 the ordinary selection cache.
+
+The selection key does not describe PCIe links or peer-access policy. Use a
+fresh tuning-cache directory after changing those properties on the same
+ordered GPUs. The IslandRS peer schedule remains fixed to its four-island rank
+layout; launch tuning does not discover arbitrary topologies.
 
 ## Validation
 
@@ -423,15 +441,24 @@ profile and serialize calls sharing a channel; profile changes require earlier
 replays to have drained.
 
 The experimental `selected_ring` profile uses one fixed outgoing neighbor and
-one incoming neighbor. Each CTA relays its own 512-byte segments through all
-other ranks, copying received bytes into their final output positions before
-acknowledging receive storage. Later hops read those output positions. Ready
-and acknowledgment records reuse the channel's per-CTA, per-peer counters;
-ordinary calls remain pairwise-compatible with those counters. Staging banks
-and operation epochs retain the same layout.
+one incoming neighbor. The eight CTAs divide a flattened sequence of 16-byte
+input packs, so a warp may span row boundaries.
+Each CTA retains the same pack ownership for every rank's shard. It sends the
+local shard once, then loads each received pack once to write both its token-major
+output position and the outgoing neighbor's staging slot. The final received
+shard only writes output. Ready and acknowledgment records reuse the channel's
+per-CTA, per-peer counters; ordinary calls remain pairwise-compatible with those
+counters. Forwarded packs occupy distinct source slots. Each CTA releases output
+and forwarding stores before acknowledging received storage. At most two ready
+notifications remain outstanding. Before a ready generation reuses a parity slot,
+the control thread waits for and acquires the downstream acknowledgment from two
+generations earlier. The final downstream acknowledgment drains the operation
+before its channel epoch advances. Staging banks and operation epochs retain the
+same layout.
 
-Ring and recursive declarations require TP16, `threads=128`, `block_limit=8`,
-`active_blocks=8`, and `submode="barrier"`; they use no cluster. Set
+Ring and recursive declarations require DCP8 or TP16, `block_limit=8`,
+`active_blocks=8`, and `submode="barrier"`; they use no cluster. Ring accepts
+`threads=128` or `threads=512`; recursive profiles require `threads=128`. Set
 `gather_transport="selected_ring"` in the declaration above to select the ring.
 The `selected_recursive` profile exchanges one, two, four, then eight rank
 segments with XOR partners. Each CTA forwards its own completed output segments

@@ -109,15 +109,14 @@ def plan(
         flags = (
             query.call.get("local_push", False),
             query.call.get("cross_island_rsag", False),
+            query.call.get("cross_island_dma", False),
         )
-        if any(type(value) is not bool for value in flags):
-            raise TypeError("island protocol choices must be booleans")
         default = next(
             name for name, value in ISLAND_VARIANTS.items() if value == flags
         )
         alternatives = {default: (query, runtime)}
         if not query.setup.get("threads_override", False):
-            for name, (push, scattered) in ISLAND_VARIANTS.items():
+            for name, (push, scattered, dma) in ISLAND_VARIANTS.items():
                 alternatives[name] = (
                     replace(
                         query,
@@ -126,6 +125,7 @@ def plan(
                                 **query.call,
                                 "local_push": push,
                                 "cross_island_rsag": scattered,
+                                "cross_island_dma": dma,
                             }
                         ),
                     ),
@@ -161,7 +161,7 @@ def plan(
         alternatives = {"dcp": (query, runtime)}
         specializations = [
             ("dcp_phased", "selected_phased_barrier", (128, 256, 512)),
-            ("dcp_ring", "selected_ring", (128,)),
+            ("dcp_ring", "selected_ring", (128, 512)),
             ("dcp_recursive", "selected_recursive", (128,)),
             ("dcp_recursive_ready", "selected_recursive_ready", (128,)),
         ]

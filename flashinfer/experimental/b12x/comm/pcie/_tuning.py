@@ -75,6 +75,13 @@ def _validate_query(query: PcieQuery, device) -> None:
     if query.surface == "PCIeIslandRSAllReduce.all_reduce":
         from ._island_rs_cute import MAX_BLOCKS
 
+        push = query.call.get("local_push", False)
+        scattered = query.call.get("cross_island_rsag", False)
+        dma = query.call.get("cross_island_dma", False)
+        if any(type(value) is not bool for value in (push, scattered, dma)):
+            raise TypeError("island protocol choices must be booleans")
+        if dma and not (push and scattered):
+            raise ValueError("cross-island DMA requires local push and scatter/gather")
         blocks, active = query.call["blocks"], query.call["active_blocks"]
         if (
             type(blocks) is not int

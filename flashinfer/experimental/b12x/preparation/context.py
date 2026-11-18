@@ -204,7 +204,7 @@ def race_contexts(
             if any(peer.get(field) != value for peer in peers):
                 raise ValueError(f"context ranks declared different {field}")
 
-    def launch_exchange(indices, turn, repetition):
+    def launch_exchange(indices, turn, repetition, sample):
         peers = _peers(
             collective_exchange,
             "launch",
@@ -212,11 +212,13 @@ def race_contexts(
                 "indices": indices,
                 "turn": turn,
                 "repetition": repetition,
+                "sample": sample,
             },
             expected_count,
         )
         if any(
             tuple(peer.get("indices", ())) != indices
+            or peer.get("sample") != sample
             or peer.get("turn") != turn
             or peer.get("repetition") != repetition
             for peer in peers

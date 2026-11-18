@@ -17,12 +17,13 @@ from ._tuning import PcieQuery, TUNING as NATIVE
 from ._joint_profile import JOINT_FAMILIES, profile_records
 
 
-# Compiled transport specializations: (local push, cross-island scatter/gather).
+# Compiled choices for local push, cross-island scatter/gather, and cross-island DMA.
 ISLAND_VARIANTS = {
-    "island_rs": (False, False),
-    "island_rsag": (False, True),
-    "island_push": (True, False),
-    "island_push_rsag": (True, True),
+    "island_rs": (False, False, False),
+    "island_rsag": (False, True, False),
+    "island_push": (True, False, False),
+    "island_push_rsag": (True, True, False),
+    "island_hybrid_rsag": (True, True, True),
 }
 
 
@@ -94,21 +95,18 @@ def _configs(query, device=None):
                 or device.sm_count < 64
             ):
                 continue
-            counts = (
-                (threads,)
-                if payload["setup"].get("threads_override", 0)
-                else (
-                    (128,)
-                    if name
-                    in (
-                        "dcp_phased_push",
-                        "dcp_ring",
-                        "dcp_recursive",
-                        "dcp_recursive_ready",
-                    )
-                    else (128, 256, 512)
-                )
-            )
+            if payload["setup"].get("threads_override", 0):
+                counts = (threads,)
+            elif name == "dcp_ring":
+                counts = (128, 512)
+            elif name in (
+                "dcp_phased_push",
+                "dcp_recursive",
+                "dcp_recursive_ready",
+            ):
+                counts = (128,)
+            else:
+                counts = (128, 256, 512)
             for count in counts:
                 yield CollectiveConfig(
                     implementation=name,
@@ -354,6 +352,7 @@ def _validate_query(query, device):
             if (
                 bool(native.call.get("local_push", False)),
                 bool(native.call.get("cross_island_rsag", False)),
+                bool(native.call.get("cross_island_dma", False)),
             ) != ISLAND_VARIANTS[name]:
                 raise ValueError(
                     "island implementation differs from its compiled protocol"
@@ -499,7 +498,7 @@ def _family_bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=8,
-    candidate_contract_version=6,
+    candidate_contract_version=9,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")

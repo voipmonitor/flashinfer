@@ -179,9 +179,9 @@ def select(job, obligation, selections):
         calibration = job.session._collective_family_buckets.get(bucket_key)
     cache_identity = {
         "measurement": (
-            "collective_max_stream_gated_graph_v5_finalists"
+            "collective_max_stream_gated_graph_v7_aligned_sample_finalists"
             if policy is not None
-            else "collective_max_stream_gated_graph_v4_token_scaled"
+            else "collective_max_stream_gated_graph_v7_aligned_sample_token_scaled"
         ),
         "repetitions": {"reduction_token_target": 100, "default": 1},
         "rounds": job.session.rounds,
@@ -321,10 +321,10 @@ def race(job, obligation, *, family_field=None):
             raise ValueError("collective race produced an invalid latency")
         return result
 
-    def launch_exchange(indices, turn, repetition):
+    def launch_exchange(indices, turn, repetition, sample):
         peers = yield from exchange(
             requirement,
-            f"queued/{job._batch_index}/{turn}/{repetition}",
+            f"queued/{job._batch_index}/{turn}/{repetition}/{sample}",
             indices=indices,
         )
         _same(peers, "indices")

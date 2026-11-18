@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 
-def _worker(rank, directory):
+def _worker(rank, directory, count, threads, cases, hybrid):
     import torch
     import torch.distributed as dist
     from cuda.bindings import driver as cuda
@@ -24,26 +24,43 @@ def _worker(rank, directory):
         init_method=(Path(directory) / "group").as_uri(),
         timeout=timedelta(minutes=5),
     )
-    count, physical = 32768, 64
+    physical = 64
     owner = PCIeIslandRSAllReduce(
         exchange_group=dist.group.WORLD,
         device=torch.device("cuda", rank),
         max_elements=count,
         blocks=physical,
     )
-    launcher = kernel.get_island_rs_launcher(
-        16,
-        rank,
-        rank,
-        threads=128,
-        local_push=True,
-        cross_island_rsag=True,
-    )
-    try:
-        for generation, previously_active, sequence in (
-            (1 << 30, 1, (64,)),
-            (0xFFFFFFFE, 64, (64, 16, 64)),
+    if hybrid:
+        from b12x.comm.pcie._island_copy import get_packet_programs
+
+        transport = owner.packet_transport()
+        capture_streams = {
+            torch.cuda.Stream(device=owner.device).cuda_stream for _ in range(64)
+        }
+        assert transport.stream.cuda_stream not in capture_streams
+        launcher = get_packet_programs(rank, threads, rank).bind(transport)
+        with pytest.raises(
+            ValueError, match="compute and copy streams must be distinct"
         ):
+            launcher(
+                owner._slab_ptrs,
+                0,
+                0,
+                owner.stage_offset,
+                owner.part_offset,
+                owner.final_offset,
+                owner.quarter_capacity,
+                count,
+                physical,
+                stream=transport.stream,
+            )
+    else:
+        launcher = kernel.get_island_rs_launcher(
+            16, rank, rank, threads=threads, local_push=True, cross_island_rsag=True
+        )
+    try:
+        for generation, previously_active, sequence in cases:
             # This state is reachable after repeated calls with a fixed active
             # subset. Inactive CTAs retain their last communication epoch, while
             # every physical CTA tracks the same data-buffer generation.
@@ -52,6 +69,9 @@ def _worker(rank, directory):
                 words[block] = generation
             for block in range(previously_active):
                 words[kernel._ACTIVE_EPOCH_OFFSET // 4 + block] = generation
+                words[
+                    (kernel._RS_ARRIVED + block * 4 * 128 + kernel._STREAM_COUNTER) // 4
+                ] = generation
                 for peer in range(4):
                     offset = (block * 4 + peer) * 128
                     words[(kernel._RS_ARRIVED + offset) // 4] = generation
@@ -59,6 +79,17 @@ def _worker(rank, directory):
                     words[(kernel._XS_ARRIVED + offset) // 4] = (
                         2 * generation + 1
                     ) & 0xFFFFFFFF
+                    for region in (
+                        kernel._RS_ARRIVED,
+                        kernel._XS_ARRIVED,
+                        kernel._AG_ARRIVED,
+                    ):
+                        words[(region + offset + kernel._STREAM_READY) // 4] = (
+                            generation
+                        )
+                    words[(kernel._XS_ARRIVED + offset + kernel._STREAM_FINAL) // 4] = (
+                        generation
+                    )
             torch.cuda.synchronize()
             dist.barrier()
             assert (
@@ -147,10 +178,44 @@ def _worker(rank, directory):
     os.getenv("B12X_RUN_COLLECTIVE_TUNING_TEST") != "1",
     reason="requires sixteen peer-accessible SM120 GPUs",
 )
-def test_island_rs_inactive_ctas_and_counter_rollover(tmp_path):
+@pytest.mark.parametrize(
+    "count, threads, cases",
+    [
+        pytest.param(
+            32768,
+            128,
+            (
+                (1 << 30, 1, (64,)),
+                (0xFFFFFFFE, 64, (64, 16, 64)),
+            ),
+            id="inactive-reactivation",
+        ),
+        pytest.param(
+            1024 * 7168,
+            1024,
+            ((0xFFFFFFFE, 32, (32, 16, 32)),),
+            id="full-capacity-wrap",
+        ),
+        pytest.param(
+            1024 * 7168,
+            768,
+            ((0xFFFFFFFE, 32, (32, 16, 32)),),
+            id="full-capacity-768-threads",
+        ),
+    ],
+)
+@pytest.mark.parametrize("hybrid", [False, True], ids=["sm", "hybrid"])
+def test_island_rs_inactive_ctas_and_counter_rollover(
+    tmp_path, count, threads, cases, hybrid
+):
     import torch
     import torch.multiprocessing as mp
 
     if torch.cuda.device_count() != 16 or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires sixteen SM120 GPUs")
-    mp.spawn(_worker, args=(str(tmp_path),), nprocs=16, join=True)
+    mp.spawn(
+        _worker,
+        args=(str(tmp_path), count, threads, cases, hybrid),
+        nprocs=16,
+        join=True,
+    )

@@ -52,10 +52,10 @@ _RACE = textwrap.dedent(
     ))
     launches, samples = [], []
 
-    def launch_exchange(indices, turn, repetition):
+    def launch_exchange(indices, turn, repetition, sample):
         assert (turn, repetition) == (0, 0)
         assert len(indices) == 1
-        launches.append(indices[0])
+        launches.append((indices[0], sample))
         if False:
             yield
 
@@ -74,7 +74,10 @@ _RACE = textwrap.dedent(
         ))
         assert len(measured.latencies_us) == 128
         assert all(value > 0 for value in measured.latencies_us)
-        assert launches == samples == list(range(128))
+        assert samples == list(range(128))
+        assert launches == [
+            (index, sample) for index in samples for sample in range(4)
+        ]
         torch.cuda.synchronize(device)
         assert torch.equal(output, saved[1][0])
         print("collective race drained 128 restore-heavy candidates", flush=True)

@@ -136,13 +136,30 @@ def test_environment_geometry_overrides_constrain_both_implementations(pins):
     expected = {"dcp", "dcp_phased"}
     if pins[0] in (0, 128):
         expected.update(("dcp_ring", "dcp_recursive", "dcp_recursive_ready"))
+    elif pins[0] == 512:
+        expected.add("dcp_ring")
     assert {value.implementation for value in values} == expected
     if pins[0]:
         assert {value.threads for value in values} == {pins[0]}
     if pins[1]:
         assert {value.blocks for value in values} == {pins[1]}
     if pins == (512, 8):
-        assert len(values) == 2
+        assert len(values) == 3
+
+
+@pytest.mark.parametrize("world", [8, 16])
+@pytest.mark.parametrize("pins", [(0, 0), (128, 8), (512, 8)])
+def test_ring_candidates_keep_both_thread_geometries_and_respect_pins(world, pins):
+    query, runtime = native_query(world=world, pins=pins)
+    plan = _preparation.plan(query, runtime=runtime)
+    ring = [value for value in configs(plan) if value.implementation == "dcp_ring"]
+    assert {value.threads for value in ring} == (
+        {128, 512} if pins[0] == 0 else {pins[0]}
+    )
+    assert all(
+        (value.blocks, value.active_blocks, value.submode) == (8, 8, "barrier")
+        for value in ring
+    )
 
 
 @pytest.mark.parametrize("pins", [(512, 16), (128, 4), (64, 8), (96, 8)])
@@ -333,7 +350,7 @@ def test_shape_rank_and_byte_width_participate_in_collective_identity():
     assert signatures[0] == signatures[1]
     assert signatures[0] != signatures[2]
     assert signatures[0] != signatures[3]
-    assert TUNING.candidate_contract_version == 6
+    assert TUNING.candidate_contract_version == 9
 
 
 @pytest.mark.parametrize(
@@ -341,6 +358,7 @@ def test_shape_rank_and_byte_width_participate_in_collective_identity():
     [
         ("dcp_phased", 512, "phased_barrier"),
         ("dcp_ring", 128, "ring"),
+        ("dcp_ring", 512, "ring"),
         ("dcp_recursive", 128, "recursive"),
         ("dcp_recursive_ready", 128, "recursive_ready"),
     ],
@@ -411,7 +429,7 @@ def test_selected_compile_and_materialization_use_the_winning_profile(
     "changes",
     [
         dict(threads=64),
-        dict(threads=512),
+        dict(threads=256),
         dict(blocks=16),
         dict(active_blocks=4),
         dict(submode="word_exchange"),

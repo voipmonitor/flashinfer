@@ -1,10 +1,9 @@
-"""CuTeDSL pull-based island reduce-scatter TP16 collective.
+"""CuTeDSL TP16 all-reduce over four four-rank islands.
 
-Rank ``island * 4 + lane`` owns one equal quarter of the vector. Each rank
-pulls from six peers: the three other lanes of its four-rank island and the
-same lane in the three other islands. This bounds peer degree at six while
-distributing inter-island traffic across every rank. The three protocol rounds
-move 2.25 times the BF16 payload per rank.
+Rank ``island * 4 + lane`` owns one quarter of the vector and maps six peers:
+the other three lanes and the same lane in each other island. Local-push RSAG
+streams ordered BF16 partials through four warp groups with slice readiness.
+Other specializations use per-CTA phase readiness over the same double banks.
 """
 
 from __future__ import annotations
@@ -25,6 +24,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from b12x._lib.compiler import KernelCompileSpec
 from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.compile_plan import attach_programs
+from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import (
     cuda_stream_from_int_or_current,
@@ -32,6 +32,43 @@ from b12x._lib.utils.device import (
     current_cuda_stream,
 )
 from b12x._lib.utils.pointers import make_ptr
+from ._joint_startup_cute import _globaltimer
+
+
+GROUP_TIMING_FIELDS = (
+    "generation",
+    "entered_ns",
+    "ready_ns",
+    "before_fence_ns",
+    "fence_done_ns",
+    "published_ns",
+    "ag_wait_entered_ns",
+    "ag_ready_ns",
+    *(f"warp_completed_{warp}_ns" for warp in range(8)),
+)
+_GROUP_TIMING_WORDS = 16
+
+
+@cute.jit
+def _record_group_time(records, base, field: cutlass.Constexpr, enabled, group_tid):
+    if enabled:
+        if group_tid == Int32(0):
+            records[base + Int64(field)] = _globaltimer()
+
+
+@cute.jit
+def _start_group_timing(records, base, enabled, generation, group_tid):
+    if enabled:
+        if group_tid == Int32(0):
+            records[base] = Int64(generation)
+            records[base + Int64(1)] = _globaltimer()
+
+
+@cute.jit
+def _finish_group_timing(records, base, enabled, group_tid):
+    if enabled:
+        if group_tid % Int32(32) == Int32(0):
+            records[base + Int64(8) + Int64(group_tid // Int32(32))] = _globaltimer()
 
 
 @dsl_user_op
@@ -195,6 +232,45 @@ def pack_f32x2_to_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Uint
     )
 
 
+@cute.jit
+def _load_payload_words(pointer, index, width: cutlass.Constexpr[int]):
+    if cutlass.const_expr(width == 4):
+        return ld_global_v4_u32(Int64(pointer.toint()) + index * Int64(4))
+    else:
+        return (pointer[index],)
+
+
+@cute.jit
+def _store_payload_words(pointer, index, words, width: cutlass.Constexpr[int]):
+    if cutlass.const_expr(width == 4):
+        st_global_v4_u32(
+            Int64(pointer.toint()) + index * Int64(4),
+            words[0],
+            words[1],
+            words[2],
+            words[3],
+        )
+    else:
+        pointer[index] = words[0]
+
+
+@cute.jit
+def _accumulate_payload_words(totals, words, width: cutlass.Constexpr[int]):
+    result = ()
+    for item in cutlass.range_constexpr(width):
+        lo, hi = unpack_bf16x2(words[item])
+        result += (totals[item * 2] + lo, totals[item * 2 + 1] + hi)
+    return result
+
+
+@cute.jit
+def _pack_payload_words(totals, width: cutlass.Constexpr[int]):
+    result = ()
+    for item in cutlass.range_constexpr(width):
+        result += (pack_f32x2_to_bf16x2(totals[item * 2], totals[item * 2 + 1]),)
+    return result
+
+
 _ISLAND_SIZE = 4
 _MAX_ISLANDS = 4
 _MAX_WORLD_SIZE = _ISLAND_SIZE * _MAX_ISLANDS
@@ -206,6 +282,12 @@ _RS_ARRIVED = ((_ACTIVE_EPOCH_OFFSET + MAX_BLOCKS * 4 + 255) // 256) * 256
 _XS_ARRIVED = _RS_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
 _AG_ARRIVED = _XS_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
 HEADER_BYTES = _AG_ARRIVED + MAX_BLOCKS * _ISLAND_SIZE * 128
+# Slice progress occupies spare words in the legacy flag cache lines. Its
+# counter advances only for streaming calls, independently of invocation tags.
+_STREAM_COUNTER = 4
+_STREAM_READY = 16
+_STREAM_FINAL = 20
+_STREAM_WORDS = 512
 
 
 def island_rs_peers(rank: int, world_size: int) -> tuple[int, ...]:
@@ -281,6 +363,10 @@ class _IslandRSLaunch:
         elements: Int64,
         blocks: Int32,
         active_blocks: Int32,
+        timing_records: cute.Pointer,
+        timing_calls: Int32,
+        timing_blocks: Int32,
+        timing_slices: Int32,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -308,6 +394,10 @@ class _IslandRSLaunch:
             quarter_capacity,
             elements,
             active_blocks,
+            timing_records,
+            timing_calls,
+            timing_blocks,
+            timing_slices,
         ).launch(
             grid=(blocks, 1, 1),
             block=[self._threads, 1, 1],
@@ -342,6 +432,10 @@ class _IslandRSLaunch:
         quarter_capacity: Int64,
         elements: Int64,
         active_blocks: Int32,
+        timing_records: cute.Pointer,
+        timing_calls: Int32,
+        timing_blocks: Int32,
+        timing_slices: Int32,
     ) -> None:
         slabs = (
             slab0,
@@ -368,7 +462,7 @@ class _IslandRSLaunch:
         allocator = cutlass.utils.SmemAllocator()
         shared_generation = allocator.allocate_tensor(
             element_type=cutlass.Uint32,
-            layout=cute.make_layout((2,)),
+            layout=cute.make_layout((3,)),
             byte_alignment=4,
         )
         if tidx == Int32(0):
@@ -382,13 +476,157 @@ class _IslandRSLaunch:
                     Uint32(1),
                 ) + Uint32(1)
             shared_generation[1] = epoch
+            if cutlass.const_expr(
+                self._local_push
+                and self._cross_island_rsag
+                and self._threads % 128 == 0
+            ):
+                if bidx < active_blocks:
+                    quarter = (elements // Int64(2) + Int64(3)) // Int64(4)
+                    partition = (quarter + Int64(3)) // Int64(4)
+                    span = Int64(active_blocks) * Int64(_STREAM_WORDS)
+                    slices = (partition + span - Int64(1)) // span
+                    shared_generation[2] = _atomic_add_global_u32(
+                        _flag_address(self_base, _RS_ARRIVED, bidx, Int32(0))
+                        + Int64(_STREAM_COUNTER),
+                        Uint32(slices),
+                    )
         cute.arch.barrier()
         data_generation = Uint32(shared_generation[0])
         # Every physical CTA advances buffer parity. Communication epochs advance
         # only for participating CTAs, keeping their last flags within one epoch
         # even when a CTA has been inactive across a global counter rollover.
         if bidx < active_blocks:
-            self._participate(
+            if cutlass.const_expr(
+                self._local_push
+                and self._cross_island_rsag
+                and self._threads % 128 == 0
+            ):
+                self._stream_participate(
+                    slabs,
+                    input_ptr,
+                    output_ptr,
+                    stage_offset,
+                    part_offset,
+                    final_offset,
+                    quarter_capacity,
+                    elements,
+                    data_generation,
+                    Uint32(shared_generation[1]),
+                    Uint32(shared_generation[2]),
+                    self_base,
+                    tidx,
+                    bidx,
+                    active_blocks,
+                    timing_records,
+                    timing_calls,
+                    timing_blocks,
+                    timing_slices,
+                )
+            else:
+                self._participate(
+                    slabs,
+                    input_ptr,
+                    output_ptr,
+                    stage_offset,
+                    part_offset,
+                    final_offset,
+                    quarter_capacity,
+                    elements,
+                    data_generation,
+                    Uint32(shared_generation[1]),
+                    self_base,
+                    tidx,
+                    bidx,
+                    active_blocks,
+                )
+
+    @cute.jit
+    def _stream_publish(
+        self,
+        slabs,
+        region: cutlass.Constexpr,
+        offset: cutlass.Constexpr,
+        cross: cutlass.Constexpr,
+        bidx,
+        tag,
+        group_tid,
+        barrier: cutlass.Constexpr,
+        timing_records,
+        timing_record,
+        timing_enabled,
+    ):
+        _record_group_time(timing_records, timing_record, 3, timing_enabled, group_tid)
+        _fence_sc_sys()
+        cute.arch.barrier(barrier_id=barrier, number_of_threads=self._threads // 4)
+        _record_group_time(timing_records, timing_record, 4, timing_enabled, group_tid)
+        if group_tid == Int32(0):
+            for peer in cutlass.range_constexpr(4):
+                if cutlass.const_expr(cross):
+                    destination = peer * 4 + self._lane
+                    sender = self._island
+                else:
+                    destination = self._island * 4 + peer
+                    sender = self._lane
+                _store_release_sys_u32(
+                    _flag_address(
+                        Int64(slabs[destination].toint()), region, bidx, Int32(sender)
+                    )
+                    + Int64(offset),
+                    tag,
+                )
+        _record_group_time(timing_records, timing_record, 5, timing_enabled, group_tid)
+
+    @cute.jit
+    def _stream_wait(
+        self,
+        self_base,
+        region: cutlass.Constexpr,
+        offset: cutlass.Constexpr,
+        bidx,
+        tag,
+        group_tid,
+        barrier: cutlass.Constexpr,
+    ):
+        if group_tid == Int32(0):
+            for peer in cutlass.range_constexpr(4):
+                _wait_for(
+                    _flag_address(self_base, region, bidx, Int32(peer)) + Int64(offset),
+                    tag,
+                    self._wait_nanosleep_cycles,
+                )
+        cute.arch.barrier(barrier_id=barrier, number_of_threads=self._threads // 4)
+
+    @cute.jit
+    def _stream_participate(
+        self,
+        slabs,
+        input_ptr,
+        output_ptr,
+        stage_offset,
+        part_offset,
+        final_offset,
+        quarter_capacity,
+        elements,
+        data_generation,
+        generation,
+        first_slice,
+        self_base,
+        tidx,
+        bidx,
+        gdim,
+        timing_records,
+        timing_calls,
+        timing_blocks,
+        timing_slices,
+    ):
+        # Both transfer widths cover the same CTA slice before publishing it.
+        if (
+            Int64(input_ptr.toint()) % Int64(16) == Int64(0)
+            and Int64(output_ptr.toint()) % Int64(16) == Int64(0)
+            and elements % Int64(128) == Int64(0)
+        ):
+            self._stream_participate_words(
                 slabs,
                 input_ptr,
                 output_ptr,
@@ -398,12 +636,415 @@ class _IslandRSLaunch:
                 quarter_capacity,
                 elements,
                 data_generation,
-                Uint32(shared_generation[1]),
+                generation,
+                first_slice,
                 self_base,
                 tidx,
                 bidx,
-                active_blocks,
+                gdim,
+                timing_records,
+                timing_calls,
+                timing_blocks,
+                timing_slices,
+                4,
             )
+        else:
+            self._stream_participate_words(
+                slabs,
+                input_ptr,
+                output_ptr,
+                stage_offset,
+                part_offset,
+                final_offset,
+                quarter_capacity,
+                elements,
+                data_generation,
+                generation,
+                first_slice,
+                self_base,
+                tidx,
+                bidx,
+                gdim,
+                timing_records,
+                timing_calls,
+                timing_blocks,
+                timing_slices,
+                1,
+            )
+
+    @cute.jit
+    def _stream_participate_words(
+        self,
+        slabs,
+        input_ptr,
+        output_ptr,
+        stage_offset,
+        part_offset,
+        final_offset,
+        quarter_capacity,
+        elements,
+        data_generation,
+        generation,
+        first_slice,
+        self_base,
+        tidx,
+        bidx,
+        gdim,
+        timing_records,
+        timing_calls,
+        timing_blocks,
+        timing_slices,
+        width: cutlass.Constexpr[int],
+    ):
+        if data_generation % Uint32(2) != Uint32(0):
+            stage_offset += quarter_capacity * Int64(16)
+            part_offset += quarter_capacity * Int64(4)
+            final_offset += quarter_capacity * Int64(16)
+        pairs = elements // Int64(2)
+        quarter = (pairs + Int64(3)) // Int64(4)
+        partition = (quarter + Int64(3)) // Int64(4)
+        span = Int64(gdim) * Int64(_STREAM_WORDS)
+        slices = (partition + span - Int64(1)) // span
+        group_threads = self._threads // 4
+        group = tidx // Int32(group_threads)
+        group_tid = tidx % Int32(group_threads)
+        timing_enabled = timing_calls > Int32(0)
+        timing_group = Int64(0)
+        if timing_enabled:
+            slot = Int64(data_generation % Uint32(timing_calls))
+            timing_group = (
+                ((slot * Int64(timing_blocks) + Int64(bidx)) * Int64(4) + Int64(group))
+                * Int64(timing_slices)
+                * Int64(_GROUP_TIMING_WORDS)
+            )
+        input_words = cute.recast_ptr(input_ptr.align(4), dtype=Uint32)
+        output_words = cute.recast_ptr(output_ptr.align(4), dtype=Uint32)
+        self_stage = cute.make_ptr(
+            Uint32, self_base + stage_offset, cute.AddressSpace.gmem, assumed_align=4
+        )
+        self_part = cute.make_ptr(
+            Uint32, self_base + part_offset, cute.AddressSpace.gmem, assumed_align=4
+        )
+        self_final = cute.make_ptr(
+            Uint32, self_base + final_offset, cute.AddressSpace.gmem, assumed_align=4
+        )
+        mine_begin = Int64(self._lane) * quarter
+
+        # Every slice owns distinct payload offsets until the invocation retires.
+        # Slice flags may advance while a consumer reads an earlier slice.
+        if group == Int32(0):
+            for step in cutlass.range(slices):
+                timing_record = timing_group + Int64(step) * Int64(_GROUP_TIMING_WORDS)
+                _start_group_timing(
+                    timing_records,
+                    timing_record,
+                    timing_enabled,
+                    data_generation,
+                    group_tid,
+                )
+                _record_group_time(
+                    timing_records, timing_record, 2, timing_enabled, group_tid
+                )
+                tag = first_slice + Uint32(step) + Uint32(1)
+                begin = Int64(step) * span + Int64(bidx) * Int64(_STREAM_WORDS)
+                for lane in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(lane != self._lane):
+                        peer = self._island * 4 + lane
+                        destination = cute.make_ptr(
+                            Uint32,
+                            Int64(slabs[peer].toint()) + stage_offset,
+                            cute.AddressSpace.gmem,
+                            assumed_align=4,
+                        )
+                        for part in cutlass.range_constexpr(4):
+                            item = Int64(group_tid) * Int64(width)
+                            while item < Int64(_STREAM_WORDS):
+                                position = begin + item
+                                index = Int64(part) * partition + position
+                                source = Int64(lane) * quarter + index
+                                if (
+                                    position < partition
+                                    and index < quarter
+                                    and source < pairs
+                                ):
+                                    words = _load_payload_words(
+                                        input_words, source, width
+                                    )
+                                    _store_payload_words(
+                                        destination,
+                                        Int64(self._lane) * quarter + index,
+                                        words,
+                                        width,
+                                    )
+                                item += Int64(group_threads * width)
+                self._stream_publish(
+                    slabs,
+                    _RS_ARRIVED,
+                    _STREAM_READY,
+                    False,
+                    bidx,
+                    tag,
+                    group_tid,
+                    1,
+                    timing_records,
+                    timing_record,
+                    timing_enabled,
+                )
+                _finish_group_timing(
+                    timing_records, timing_record, timing_enabled, group_tid
+                )
+        elif group == Int32(1):
+            for step in cutlass.range(slices):
+                timing_record = timing_group + Int64(step) * Int64(_GROUP_TIMING_WORDS)
+                _start_group_timing(
+                    timing_records,
+                    timing_record,
+                    timing_enabled,
+                    data_generation,
+                    group_tid,
+                )
+                tag = first_slice + Uint32(step) + Uint32(1)
+                begin = Int64(step) * span + Int64(bidx) * Int64(_STREAM_WORDS)
+                self._stream_wait(
+                    self_base, _RS_ARRIVED, _STREAM_READY, bidx, tag, group_tid, 2
+                )
+                _record_group_time(
+                    timing_records, timing_record, 2, timing_enabled, group_tid
+                )
+                for part in cutlass.range_constexpr(4):
+                    item = Int64(group_tid) * Int64(width)
+                    while item < Int64(_STREAM_WORDS):
+                        position = begin + item
+                        index = Int64(part) * partition + position
+                        if (
+                            position < partition
+                            and index < quarter
+                            and mine_begin + index < pairs
+                        ):
+                            totals = ()
+                            for item_word in cutlass.range_constexpr(width):
+                                totals += (Float32(0.0), Float32(0.0))
+                            for lane in cutlass.range_constexpr(4):
+                                if cutlass.const_expr(lane == self._lane):
+                                    words = _load_payload_words(
+                                        input_words, mine_begin + index, width
+                                    )
+                                else:
+                                    words = _load_payload_words(
+                                        self_stage,
+                                        Int64(lane) * quarter + index,
+                                        width,
+                                    )
+                                totals = _accumulate_payload_words(totals, words, width)
+                            _store_payload_words(
+                                self_part,
+                                index,
+                                _pack_payload_words(totals, width),
+                                width,
+                            )
+                        item += Int64(group_threads * width)
+                self._stream_publish(
+                    slabs,
+                    _XS_ARRIVED,
+                    _STREAM_READY,
+                    True,
+                    bidx,
+                    tag,
+                    group_tid,
+                    2,
+                    timing_records,
+                    timing_record,
+                    timing_enabled,
+                )
+                _finish_group_timing(
+                    timing_records, timing_record, timing_enabled, group_tid
+                )
+        elif group == Int32(2):
+            for step in cutlass.range(slices):
+                timing_record = timing_group + Int64(step) * Int64(_GROUP_TIMING_WORDS)
+                _start_group_timing(
+                    timing_records,
+                    timing_record,
+                    timing_enabled,
+                    data_generation,
+                    group_tid,
+                )
+                tag = first_slice + Uint32(step) + Uint32(1)
+                begin = Int64(step) * span + Int64(bidx) * Int64(_STREAM_WORDS)
+                self._stream_wait(
+                    self_base, _XS_ARRIVED, _STREAM_READY, bidx, tag, group_tid, 3
+                )
+                _record_group_time(
+                    timing_records, timing_record, 2, timing_enabled, group_tid
+                )
+                item = Int64(group_tid) * Int64(width)
+                while item < Int64(_STREAM_WORDS):
+                    position = begin + item
+                    index = Int64(self._island) * partition + position
+                    if (
+                        position < partition
+                        and index < quarter
+                        and mine_begin + index < pairs
+                    ):
+                        totals = ()
+                        for item_word in cutlass.range_constexpr(width):
+                            totals += (Float32(0.0), Float32(0.0))
+                        for island in cutlass.range_constexpr(4):
+                            peer = island * 4 + self._lane
+                            source = cute.make_ptr(
+                                Uint32,
+                                Int64(slabs[peer].toint()) + part_offset,
+                                cute.AddressSpace.gmem,
+                                assumed_align=4,
+                            )
+                            words = _load_payload_words(
+                                source,
+                                index,
+                                width,
+                            )
+                            totals = _accumulate_payload_words(totals, words, width)
+                        _store_payload_words(
+                            self_final,
+                            mine_begin + index,
+                            _pack_payload_words(totals, width),
+                            width,
+                        )
+                    item += Int64(group_threads * width)
+                self._stream_publish(
+                    slabs,
+                    _XS_ARRIVED,
+                    _STREAM_FINAL,
+                    True,
+                    bidx,
+                    tag,
+                    group_tid,
+                    3,
+                    timing_records,
+                    timing_record,
+                    timing_enabled,
+                )
+                _finish_group_timing(
+                    timing_records, timing_record, timing_enabled, group_tid
+                )
+        else:
+            for step in cutlass.range(slices):
+                timing_record = timing_group + Int64(step) * Int64(_GROUP_TIMING_WORDS)
+                _start_group_timing(
+                    timing_records,
+                    timing_record,
+                    timing_enabled,
+                    data_generation,
+                    group_tid,
+                )
+                tag = first_slice + Uint32(step) + Uint32(1)
+                begin = Int64(step) * span + Int64(bidx) * Int64(_STREAM_WORDS)
+                self._stream_wait(
+                    self_base, _XS_ARRIVED, _STREAM_FINAL, bidx, tag, group_tid, 4
+                )
+                _record_group_time(
+                    timing_records, timing_record, 2, timing_enabled, group_tid
+                )
+                for part in cutlass.range_constexpr(4):
+                    peer = part * 4 + self._lane
+                    source = cute.make_ptr(
+                        Uint32,
+                        Int64(slabs[peer].toint()) + final_offset,
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    item = Int64(group_tid) * Int64(width)
+                    while item < Int64(_STREAM_WORDS):
+                        position = begin + item
+                        index = Int64(part) * partition + position
+                        if (
+                            position < partition
+                            and index < quarter
+                            and mine_begin + index < pairs
+                        ):
+                            words = _load_payload_words(
+                                source, mine_begin + index, width
+                            )
+                            _store_payload_words(
+                                output_words, mine_begin + index, words, width
+                            )
+                            for lane in cutlass.range_constexpr(4):
+                                if cutlass.const_expr(lane != self._lane):
+                                    peer = self._island * 4 + lane
+                                    destination = cute.make_ptr(
+                                        Uint32,
+                                        Int64(slabs[peer].toint()) + final_offset,
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=4,
+                                    )
+                                    _store_payload_words(
+                                        destination, mine_begin + index, words, width
+                                    )
+                        item += Int64(group_threads * width)
+                self._stream_publish(
+                    slabs,
+                    _AG_ARRIVED,
+                    _STREAM_READY,
+                    False,
+                    bidx,
+                    tag,
+                    group_tid,
+                    4,
+                    timing_records,
+                    timing_record,
+                    timing_enabled,
+                )
+                _record_group_time(
+                    timing_records, timing_record, 6, timing_enabled, group_tid
+                )
+                self._stream_wait(
+                    self_base, _AG_ARRIVED, _STREAM_READY, bidx, tag, group_tid, 4
+                )
+                _record_group_time(
+                    timing_records, timing_record, 7, timing_enabled, group_tid
+                )
+                for lane in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(lane != self._lane):
+                        for part in cutlass.range_constexpr(4):
+                            item = Int64(group_tid) * Int64(width)
+                            while item < Int64(_STREAM_WORDS):
+                                position = begin + item
+                                index = Int64(part) * partition + position
+                                target = Int64(lane) * quarter + index
+                                if (
+                                    position < partition
+                                    and index < quarter
+                                    and target < pairs
+                                ):
+                                    _store_payload_words(
+                                        output_words,
+                                        target,
+                                        _load_payload_words(self_final, target, width),
+                                        width,
+                                    )
+                                item += Int64(group_threads * width)
+                _finish_group_timing(
+                    timing_records, timing_record, timing_enabled, group_tid
+                )
+        cute.arch.barrier()
+        if tidx == Int32(0):
+            _fence_sc_sys()
+            for peer in cutlass.range_constexpr(4):
+                if cutlass.const_expr(peer != self._lane):
+                    base = Int64(slabs[self._island * 4 + peer].toint())
+                    _store_release_sys_u32(
+                        _flag_address(base, _RS_ARRIVED, bidx, Int32(self._lane)),
+                        generation,
+                    )
+                    _store_release_sys_u32(
+                        _flag_address(base, _AG_ARRIVED, bidx, Int32(self._lane)),
+                        generation,
+                    )
+                if cutlass.const_expr(peer != self._island):
+                    base = Int64(slabs[peer * 4 + self._lane].toint())
+                    _store_release_sys_u32(
+                        _flag_address(base, _XS_ARRIVED, bidx, Int32(self._island)),
+                        generation * Uint32(2) + Uint32(1),
+                    )
 
     @cute.jit
     def _participate(
@@ -894,6 +1535,10 @@ def get_island_rs_launcher(
         1,
         1,
         1,
+        make_ptr(cutlass.Int64, 256, cute.AddressSpace.gmem, assumed_align=8),
+        1,
+        1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.island_rs.bf16",
@@ -922,6 +1567,10 @@ def get_island_rs_launcher(
         blocks: int,
         stream: object = None,
         active_blocks: int | None = None,
+        timing_address: int = 0,
+        timing_calls: int = 0,
+        timing_blocks: int = 0,
+        timing_slices: int = 0,
     ) -> None:
         """Launch the compiled island reduce-scatter with runtime arguments."""
         if len(slab_addresses) != world_size:
@@ -933,6 +1582,21 @@ def get_island_rs_launcher(
         active_blocks = blocks if active_blocks is None else active_blocks
         if not 1 <= int(active_blocks) <= int(blocks):
             raise ValueError("active blocks must fit the fixed physical grid")
+        if timing_calls:
+            if not local_push or not cross_island_rsag or threads % 128:
+                raise ValueError("group timing requires streaming local-push RSAG")
+            partition = (int(elements) + 31) // 32
+            required_slices = (partition + int(active_blocks) * _STREAM_WORDS - 1) // (
+                int(active_blocks) * _STREAM_WORDS
+            )
+            if (
+                timing_address <= 0
+                or timing_address % 8
+                or timing_calls < 0
+                or timing_blocks < active_blocks
+                or timing_slices < required_slices
+            ):
+                raise ValueError("group timing storage does not cover the launch")
         raw(
             *(
                 make_ptr(
@@ -962,6 +1626,12 @@ def get_island_rs_launcher(
             elements,
             blocks,
             active_blocks,
+            make_ptr(
+                cutlass.Int64, timing_address, cute.AddressSpace.gmem, assumed_align=8
+            ),
+            timing_calls,
+            timing_blocks,
+            timing_slices,
             cuda_stream_from_int_or_current(cuda_stream_to_int(stream)),
         )
 

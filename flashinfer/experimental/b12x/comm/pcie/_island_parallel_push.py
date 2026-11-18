@@ -314,9 +314,11 @@ def compile_parallel_push(rank, threads):
         1,
         1,
         1,
+        make_ptr(cutlass.Int64, 256, cute.AddressSpace.gmem, assumed_align=8),
+        1, 1, 1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
-            "comm.pcie.island_rs.parallel_push", 1, (rank, threads), labels=("rank", "threads"),
+            "comm.pcie.island_rs.parallel_push", 2, (rank, threads), labels=("rank", "threads"),
         ),
     )
 
@@ -332,6 +334,10 @@ def compile_parallel_push(rank, threads):
         blocks: int,
         stream: object = None,
         active_blocks: int | None = None,
+        timing_address: int = 0,
+        timing_calls: int = 0,
+        timing_blocks: int = 0,
+        timing_slices: int = 0,
     ) -> None:
         """Launch the compiled island reduce-scatter with runtime arguments."""
         if len(slab_addresses) != 16:
@@ -340,6 +346,8 @@ def compile_parallel_push(rank, threads):
             )
         if blocks != 64 or active_blocks != 4:
             raise ValueError("parallel peer publication requires four participants in a 64-CTA channel")
+        if timing_calls or timing_blocks or timing_slices or timing_address:
+            raise ValueError("group timing requires the streamed cross-island reduce-scatter/all-gather protocol")
         raw(
             *(
                 make_ptr(
@@ -369,6 +377,8 @@ def compile_parallel_push(rank, threads):
             elements,
             blocks,
             active_blocks,
+            make_ptr(cutlass.Int64, 0, cute.AddressSpace.gmem, assumed_align=8),
+            0, 0, 0,
             cuda_stream_from_int_or_current(cuda_stream_to_int(stream)),
         )
 

@@ -43,6 +43,15 @@ def _ordered_reference(elements, variation, device):
     return result.bfloat16()
 
 
+def _assert_canaries(regions, elements, context):
+    for storage, offset in regions:
+        assert (storage[:offset] == -123.0).all().item(), (context, "prefix canary")
+        assert (storage[offset + elements :] == -123.0).all().item(), (
+            context,
+            "suffix canary",
+        )
+
+
 def _seed_generation(owner, generation):
     from b12x.comm.pcie._island_rs_cute import (
         HEADER_BYTES,
@@ -51,17 +60,24 @@ def _seed_generation(owner, generation):
         _RS_ARRIVED,
         _XS_ARRIVED,
         _AG_ARRIVED,
+        _STREAM_COUNTER,
+        _STREAM_READY,
+        _STREAM_FINAL,
     )
 
     words = (ctypes.c_uint32 * (HEADER_BYTES // 4))()
     for block in range(MAX_BLOCKS):
         words[block] = generation
         words[_ACTIVE_EPOCH_OFFSET // 4 + block] = generation
+        words[(_RS_ARRIVED + block * 4 * 128 + _STREAM_COUNTER) // 4] = generation
         for peer in range(4):
             offset = (block * 4 + peer) * 128
             words[(_RS_ARRIVED + offset) // 4] = generation
             words[(_AG_ARRIVED + offset) // 4] = generation
             words[(_XS_ARRIVED + offset) // 4] = (2 * generation + 1) & 0xFFFFFFFF
+            for region in (_RS_ARRIVED, _XS_ARRIVED, _AG_ARRIVED):
+                words[(region + offset + _STREAM_READY) // 4] = generation
+            words[(_XS_ARRIVED + offset + _STREAM_FINAL) // 4] = generation
     stream = torch.cuda.current_stream(owner.device)
     owner._ipc.cudaMemset(
         owner._local_ptr + owner.stage_offset,
@@ -74,10 +90,18 @@ def _seed_generation(owner, generation):
     stream.synchronize()
 
 
-def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
+def _worker(
+    rank,
+    rendezvous,
+    cross_scatter=False,
+    local_push=False,
+    mixed_alignment=False,
+    inplace_protocol=None,
+):
     from dataclasses import replace
 
     from b12x.comm.pcie import _owner_preparation as preparation
+    from b12x.comm.pcie._collective_tuning import ISLAND_VARIANTS
     from b12x.comm.pcie.pcie_island_rs import PCIeIslandRSAllReduce
     from b12x.preparation import FrozenMapping, PreparationSession
 
@@ -94,28 +118,36 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
     )
     capacity = 1024 * 7168
     protocols = (
-        ((False, False), (False, True), (True, False), (True, True))
+        tuple(ISLAND_VARIANTS)
         if local_push
         else (
-            ((False, False), (False, True), (False, True))
+            ("island_rs", "island_rsag", "island_rsag")
             if cross_scatter
-            else ((False, False),) * 3
+            else ("island_rs",) * 3
         )
     )
+    if inplace_protocol is not None:
+        protocols = tuple(p for p in protocols if p != inplace_protocol) + (
+            inplace_protocol,
+        )
     try:
         # Use a separate fixed-grid owner for each geometry. Changing the
         # physical grid would stop advancing some per-CTA generation counters.
-        for blocks, threads in ((16, 512), (32, 1024)):
+        for blocks, threads in ((16, 512), (32, 1024), (32, 768)):
             stride = blocks * threads
             shapes = (
-                2,
-                6,
-                7168,
-                24 * stride - 2,
-                24 * stride + 2,
-                32 * stride - 2,
-                32 * stride + 2,
-                capacity - 2,
+                (128, 7168, capacity)
+                if mixed_alignment
+                else (
+                    2,
+                    6,
+                    7168,
+                    24 * stride - 2,
+                    24 * stride + 2,
+                    32 * stride - 2,
+                    32 * stride + 2,
+                    capacity - 2,
+                )
             )
             owner = PCIeIslandRSAllReduce(
                 exchange_group=dist.group.WORLD,
@@ -132,12 +164,14 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
             graphs = []
             try:
                 for elements in shapes:
-                    # A four-byte offset exercises the documented alignment
-                    # contract rather than relying on allocator alignment.
-                    storage = torch.empty(
-                        elements + 2, dtype=torch.bfloat16, device=device
+                    # Vary both caller alignments across local and cross peers.
+                    source_offset = 8 + (
+                        2 * ((rank ^ (rank >> 2)) & 1) if mixed_alignment else 2
                     )
-                    source = storage[2:]
+                    input_storage = torch.full(
+                        (elements + 24,), -123.0, dtype=torch.bfloat16, device=device
+                    )
+                    source = input_storage[source_offset : source_offset + elements]
                     inputs = [
                         _input(elements, rank, n, device) for n in range(len(protocols))
                     ]
@@ -158,9 +192,30 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
                                         float("inf") if rank == 0 else -float("inf")
                                     )
                                 expected[sample][2] = float("nan")
-                    outputs = [torch.empty_like(source) for _ in range(len(protocols))]
+                    output_offset = 8 + (
+                        2 * (((rank >> 1) ^ (rank >> 3)) & 1) if mixed_alignment else 0
+                    )
+                    output_storages = [
+                        torch.full(
+                            (elements + 24,),
+                            -123.0,
+                            dtype=torch.bfloat16,
+                            device=device,
+                        )
+                        for _ in range(len(protocols))
+                    ]
+                    outputs = [
+                        source
+                        if inplace_protocol == protocols[index]
+                        else storage[output_offset : output_offset + elements]
+                        for index, storage in enumerate(output_storages)
+                    ]
+                    guard_regions = [(input_storage, source_offset)] + [
+                        (storage, output_offset) for storage in output_storages
+                    ]
                     plans = []
                     for index, output in enumerate(outputs):
+                        push, scattered, dma = ISLAND_VARIANTS[protocols[index]]
                         query = preparation.query_from_runtime(
                             owner,
                             call=dict(inp=source, out=output, blocks=blocks),
@@ -171,8 +226,9 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
                                 {
                                     **query.call,
                                     "threads": threads,
-                                    "cross_island_rsag": protocols[index][1],
-                                    "local_push": protocols[index][0],
+                                    "cross_island_rsag": scattered,
+                                    "local_push": push,
+                                    "cross_island_dma": dma,
                                 }
                             ),
                         )
@@ -213,6 +269,11 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
                             equal_nan=True,
                             msg=lambda detail: f"{context}\n{detail}",
                         )
+                    _assert_canaries(
+                        guard_regions,
+                        elements,
+                        f"rank={rank} elements={elements} blocks={blocks} eager",
+                    )
 
                     graph = torch.cuda.CUDAGraph()
                     dist.barrier()
@@ -221,11 +282,27 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
                             inputs, outputs, plans, strict=True
                         ):
                             source.copy_(values)
-                            output.fill_(float("nan"))
+                            if output is not source:
+                                output.fill_(float("nan"))
                             owner.all_reduce(source, out=output, plan=plan)
                     graphs.append(graph)
-                    cases.append((elements, source, inputs, outputs, expected))
+                    cases.append(
+                        (elements, source, inputs, outputs, expected, guard_regions)
+                    )
 
+                if inplace_protocol is not None:
+                    for (
+                        elements,
+                        source,
+                        inputs,
+                        outputs,
+                        expected,
+                        guard_regions,
+                    ) in cases:
+                        inputs[-1].copy_(_input(elements, rank, len(protocols), device))
+                        expected[-1].copy_(
+                            _ordered_reference(elements, len(protocols), device)
+                        )
                 torch.cuda.synchronize()
                 if cross_scatter:
                     dist.barrier()
@@ -242,14 +319,15 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
                 after = torch.cuda.memory_stats(device)
                 for key in ("allocation.all.allocated", "segment.all.allocated"):
                     assert before[key] == after[key], key
-                for elements, source, inputs, outputs, expected in cases:
-                    assert torch.equal(
-                        source.view(torch.int16), inputs[-1].view(torch.int16)
-                    ), (
-                        rank,
-                        elements,
-                        "input mutation",
-                    )
+                for elements, source, inputs, outputs, expected, guard_regions in cases:
+                    if inplace_protocol is None:
+                        assert torch.equal(
+                            source.view(torch.int16), inputs[-1].view(torch.int16)
+                        ), (
+                            rank,
+                            elements,
+                            "input mutation",
+                        )
                     for index, (output, reference) in enumerate(
                         zip(outputs, expected, strict=True)
                     ):
@@ -262,6 +340,11 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
                             equal_nan=True,
                             msg=lambda detail: f"{context}\n{detail}",
                         )
+                    _assert_canaries(
+                        guard_regions,
+                        elements,
+                        f"rank={rank} elements={elements} blocks={blocks} replay",
+                    )
                 if cross_scatter:
                     counters = (ctypes.c_uint32 * blocks)()
                     stream = torch.cuda.current_stream(device)
@@ -279,7 +362,7 @@ def _worker(rank, rendezvous, cross_scatter=False, local_push=False):
                 dist.barrier()
                 if rank == 0:
                     print(
-                        f"TP16 blocks={blocks} threads={threads}: eight shapes, exact eager and queued replay passed",
+                        f"TP16 blocks={blocks} threads={threads}: {len(shapes)} shapes, exact eager and queued replay passed",
                         flush=True,
                     )
             except BaseException:
@@ -317,13 +400,29 @@ def test_island_cross_scatter_mixed_protocols_and_rollover():
         )
 
 
-def test_island_local_push_mixed_protocols_and_rollover():
+@pytest.mark.parametrize(
+    "mixed_alignment", [False, True], ids=["offset-input", "mixed-alignment"]
+)
+def test_island_local_push_mixed_protocols_and_rollover(mixed_alignment):
     if torch.cuda.device_count() != 16:
         pytest.skip("requires exactly sixteen visible GPUs")
     with tempfile.TemporaryDirectory(prefix="island-push-test-") as directory:
         mp.spawn(
             _worker,
-            args=(Path(directory, "gloo").as_uri(), True, True),
+            args=(Path(directory, "gloo").as_uri(), True, True, mixed_alignment),
+            nprocs=16,
+            join=True,
+        )
+
+
+@pytest.mark.parametrize("inplace_protocol", ["island_push_rsag", "island_hybrid_rsag"])
+def test_island_stream_inplace_mixed_alignment_and_rollover(inplace_protocol):
+    if torch.cuda.device_count() != 16:
+        pytest.skip("requires exactly sixteen visible GPUs")
+    with tempfile.TemporaryDirectory(prefix="island-stream-inplace-test-") as directory:
+        mp.spawn(
+            _worker,
+            args=(Path(directory, "gloo").as_uri(), True, True, True, inplace_protocol),
             nprocs=16,
             join=True,
         )

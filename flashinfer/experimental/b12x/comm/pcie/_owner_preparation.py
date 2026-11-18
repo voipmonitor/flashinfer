@@ -301,6 +301,10 @@ def compile_owner_surface(query_payload, ordinal):
         if query.surface == "PCIeIslandRSAllReduce.all_reduce":
             from ._island_rs_cute import get_island_rs_launcher
 
+            if call.get("cross_island_dma", False):
+                from ._island_copy import get_packet_programs
+
+                return get_packet_programs(query.rank, call["threads"], ordinal)
             if call.get("parallel_peer_flags"):
                 from ._island_parallel_push import compile_parallel_push
                 properties = torch.cuda.get_device_properties(ordinal)
@@ -384,11 +388,12 @@ def plan(
         )
 
     def materialize(selection, device):
-        return _OwnerState(
-            query,
-            runtime,
-            compile_owner_surface(TUNING.encode_query(query), device.ordinal),
-        )
+        from ._island_copy import PacketPrograms
+
+        programs = compile_owner_surface(TUNING.encode_query(query), device.ordinal)
+        if isinstance(programs, PacketPrograms):
+            programs = programs.bind(runtime.packet_transport())
+        return _OwnerState(query, runtime, programs)
 
     return Plan(
         contract=TUNING,

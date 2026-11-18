@@ -49,6 +49,7 @@ def _worker(rank, world, directory):
         ("selected_phased_barrier", 128, 8),
         ("selected_phased_barrier", 512, 8),
         ("selected_ring", 128, 8),
+        ("selected_ring", 512, 8),
         ("selected_recursive", 128, 8),
         ("selected_recursive_ready", 128, 8),
     )

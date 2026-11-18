@@ -259,29 +259,49 @@ class _TimedCall:
             for event in pair:
                 event.record()
 
-    def replay(self, *, align=False):
-        import torch
+    def prepare_sample(self, index):
         from .types import call_scope
 
-        stream = torch.cuda.current_stream()
         with call_scope():
-            if align:
-                if self.call.reset is not None:
-                    self.call.reset()
-                self.producers[0]()
+            if (
+                index is not None
+                and self.eviction is not None
+                and not self.eviction_after_produce
+            ):
+                self.eviction()
+            if self.call.reset is not None:
+                self.call.reset()
+            self.producers[0 if index is None else index % len(self.producers)]()
+            if (
+                index is not None
+                and self.eviction is not None
+                and self.eviction_after_produce
+            ):
+                self.eviction()
+
+    def enqueue_sample(self, index, stream):
+        from .types import call_scope
+
+        with call_scope():
+            if index is None:
                 self.call.invoke()
-            for index, (start, end) in enumerate(self.events):
-                if self.eviction is not None and not self.eviction_after_produce:
-                    self.eviction()
-                if self.call.reset is not None:
-                    self.call.reset()
-                self.producers[index % len(self.producers)]()
-                if self.eviction is not None and self.eviction_after_produce:
-                    self.eviction()
-                with _collection_paused(), self.gate.hold(stream):
-                    start.record(stream)
-                    self.call.invoke()
-                    end.record(stream)
+            else:
+                start, end = self.events[index]
+                start.record(stream)
+                self.call.invoke()
+                end.record(stream)
+
+    def replay(self, *, align=False):
+        import torch
+
+        stream = torch.cuda.current_stream()
+        if align:
+            self.prepare_sample(None)
+            self.enqueue_sample(None, stream)
+        for index in range(len(self.events)):
+            self.prepare_sample(index)
+            with _collection_paused(), self.gate.hold(stream):
+                self.enqueue_sample(index, stream)
 
     def samples(self):
         return tuple(
@@ -512,20 +532,24 @@ def measure_race_steps(
                 scored_batches = []
                 with torch.cuda.device(device_ordinal), no_compilation():
                     stream = torch.cuda.current_stream(device_ordinal)
-                    # Release each candidate's gate before submitting another
-                    # candidate's reset and input-production work. A blocked
-                    # stream cannot drain an unbounded queue of those copies.
                     for index in indices:
                         candidate_indices = (index,)
-                        with (
-                            _collection_paused(),
-                            prepared.collective_gate.hold(stream),
-                        ):
-                            prepared.timers[index].replay(align=True)
-                            yield from launch_exchange(
-                                candidate_indices, turn, repetition
-                            )
-                        stream.synchronize()
+                        timer = prepared.timers[index]
+                        # Bound the work behind a closed gate. An untimed collective
+                        # absorbs rank-release skew before the sample's start event.
+                        for sample in range(len(timer.events)):
+                            timer.prepare_sample(None)
+                            with (
+                                _collection_paused(),
+                                prepared.collective_gate.hold(stream),
+                            ):
+                                timer.enqueue_sample(None, stream)
+                                timer.prepare_sample(sample)
+                                timer.enqueue_sample(sample, stream)
+                                yield from launch_exchange(
+                                    candidate_indices, turn, repetition, sample
+                                )
+                            stream.synchronize()
                         sample_groups = (prepared.timers[index].samples(),)
                         if sample_exchange is not None:
                             sample_groups = yield from sample_exchange(

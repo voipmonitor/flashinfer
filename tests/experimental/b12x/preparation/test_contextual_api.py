@@ -331,7 +331,8 @@ def test_context_collective_uses_max_rank_samples_and_ordered_steps(monkeypatch)
         return SimpleNamespace(close=lambda: None)
 
     def measure(race, **kwargs):
-        yield from kwargs["launch_exchange"]((0, 1), 0, 0)
+        for sample in range(2):
+            yield from kwargs["launch_exchange"]((0, 1), 0, 0, sample)
         maxima = yield from kwargs["sample_exchange"](
             (0, 1), 0, 0, ((1.0, 1.0), (2.0, 2.0))
         )
@@ -368,16 +369,16 @@ def test_context_collective_uses_max_rank_samples_and_ordered_steps(monkeypatch)
             candidates, collective_exchange=exchange, collective_ranks=(0, 1)
         )
 
-        def wrong_turn(step, payload):
-            if step == "launch":
-                other = dict(payload)
-                other["turn"] += 1
-                return payload, other
-            return payload, payload
+        for field in ("turn", "sample"):
 
-        with pytest.raises(ValueError, match="different orders"):
-            session.race_contexts(
-                candidates, collective_exchange=wrong_turn, collective_ranks=(0, 1)
-            )
+            def wrong_order(step, payload):
+                if step == "launch":
+                    return payload, {**payload, field: 1}
+                return payload, payload
+
+            with pytest.raises(ValueError, match="different orders"):
+                session.race_contexts(
+                    candidates, collective_exchange=wrong_order, collective_ranks=(0, 1)
+                )
     assert observed == [((5.0, 5.0), (2.0, 2.0))]
     assert result.winner == "b"  # Rank zero alone would choose a.
