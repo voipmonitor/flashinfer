@@ -6,7 +6,7 @@ the weight read.  Each CTA owns 16 output features and its warps split K into
 live rows its 8-column B operand, so one weight fragment serves every row.
 The warp count evenly divides K/64, with at most eight warps per CTA.
 Products accumulate in FP32; the warps reduce through shared memory in a fixed
-order and the result is rounded once, so the output is deterministic.
+order. FP32 output preserves that reduction; BF16 output rounds it at the store.
 
 Within a chunk, K is permuted identically for both operands so that each
 thread's fragments come from 32 contiguous bytes (two 16-byte loads); the
@@ -18,7 +18,7 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import BFloat16, Float32, Int32, Int64
+from cutlass import Float32, Int32, Int64
 
 from b12x._lib.intrinsics.mma import bf16_mma_m16n8k16_f32
 from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
@@ -105,7 +105,15 @@ class TensorCoreGemvKernel:
         output_stride: Int64,
     ):
         self.project_tile(
-            x, weight, output, rows, x_stride, weight_stride, output_stride, Int32(0)
+            x,
+            weight,
+            output,
+            rows,
+            x_stride,
+            weight_stride,
+            output_stride,
+            Int32(0),
+            output.element_type,
         )
 
     @cute.jit
@@ -119,6 +127,7 @@ class TensorCoreGemvKernel:
         weight_stride: Int64,
         output_stride: Int64,
         first_row: Int32,
+        result_dtype: cutlass.Constexpr,
     ):
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
@@ -186,5 +195,5 @@ class TensorCoreGemvKernel:
                 row = first_row + quad * 2 + (e % 2)
                 if feature < self.n and row < rows:
                     output[Int64(row) * output_stride + Int64(feature)] = total.to(
-                        BFloat16
+                        result_dtype
                     )

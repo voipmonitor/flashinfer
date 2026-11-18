@@ -70,8 +70,28 @@ def plan_execution(
     invocation: FrozenMapping = FrozenMapping(),
     override=None,
     scale_expansion=None,
+    activation_mode=None,
 ):
-    """Return a composite declaration, never an executable plan or warmup handle."""
+    """Declare execution with an optional A4/A16 override of the token cutoff.
+
+    An explicit mode must be available on the prepared weight owner. Omission
+    preserves the owner's activation mode and inclusive A16 token cutoff.
+    """
+    from .planning import ActivationMode, _packed_recipe
+    from .source import PackedSource
+
+    if activation_mode is not None:
+        activation_mode = ActivationMode(activation_mode)
+        if activation_mode not in (ActivationMode.A4, ActivationMode.A16):
+            raise ValueError("execution activation_mode must be a4 or a16")
+        if (
+            not isinstance(experts.plan.source, PackedSource)
+            or _packed_recipe(experts.plan.source, activation_mode)
+            not in experts.plan._impl.quant_modes
+        ):
+            raise ValueError(
+                "execution activation mode is unavailable on the prepared weight owner"
+            )
     if experts.plan.activation.outer_scale == "token":
         from ._token_outer import plan
     else:
@@ -95,6 +115,11 @@ def plan_execution(
             "unweighted route outputs cannot apply router weights on input"
         )
 
+    options = (
+        {}
+        if experts.plan.activation.outer_scale == "token"
+        else {"activation_mode": activation_mode}
+    )
     return plan(
         experts,
         capacity=capacity,
@@ -102,6 +127,7 @@ def plan_execution(
         invocation=invocation,
         override=override,
         scale_expansion=scale_expansion,
+        **options,
     )
 
 

@@ -1,7 +1,8 @@
 """One serial preparation lifecycle with cooperative compilation and tuning.
 
 The session fills each plan's prepared slot in place. Plans that are already
-prepared are skipped, so a later batch is incremental. Candidate races are
+prepared are skipped unless a job supplies a different selected configuration.
+Plan handles remain stable when their prepared payloads change. Candidate races are
 timed in bounded batches; the running best candidate is carried into every
 later batch so each candidate is compared head to head with it.
 Completed batches checkpoint their measurements and champion before releasing
@@ -603,8 +604,14 @@ class PreparationSession:
 
             torch.cuda.synchronize(self.device.ordinal)
 
-    def begin(self, requests, *, autotune=None):
-        """Start one preparation job after the prior collective barrier drains."""
+    def begin(self, requests, *, autotune=None, selected_configs=None):
+        """Start a job, optionally replacing scalar plans' selected configurations.
+
+        ``selected_configs`` maps original scalar plans to validated configurations.
+        Choices apply to declaration-equivalent aliases in this batch, preserve
+        plan handles, and cannot replace an explicit declaration override or
+        supply a measured finalist family. Composite children are scalar plans.
+        """
         self._check_thread()
         if self._job is not None:
             raise RuntimeError("one preparation job may be active")
@@ -617,6 +624,54 @@ class PreparationSession:
             raise TypeError("job autotune override must be boolean or None")
         requests = tuple(requests)
         _topological(requests)
+        selected_configs = dict(selected_configs or {})
+        if selected_configs:
+            if self.state == "FROZEN":
+                raise KernelResolutionFrozenError(
+                    "selected configurations cannot change after session freeze"
+                )
+            expanded, _ = _expand_requests(requests)
+            if not selected_configs.keys() <= {item.plan for item in expanded}:
+                raise ValueError(
+                    "selected configurations must name scalar plans in this batch"
+                )
+            for group in _coalesce_requests(expanded):
+                choices = [
+                    (item.plan, selected_configs[item.plan])
+                    for item in group
+                    if item.plan in selected_configs
+                ]
+                if not choices:
+                    continue
+                plan, config = choices[0]
+                payload = plan.contract.config_payload(config)
+                if any(
+                    other.contract.config_payload(value) != payload
+                    for other, value in choices[1:]
+                ):
+                    raise ValueError(
+                        "declaration-equivalent plans selected different configurations"
+                    )
+                for item in group:
+                    plan = item.plan
+                    plan.contract.configure(
+                        plan.query,
+                        device=self.device.identity,
+                        override=config,
+                        search=False,
+                    )
+                    if (
+                        plan.override is not None
+                        and plan.contract.config_payload(plan.override) != payload
+                    ):
+                        raise ValueError(
+                            "selected configuration conflicts with the plan override"
+                        )
+                    if item.finalist_policy is not None:
+                        raise ValueError(
+                            "selected configurations do not supply measured finalist families"
+                        )
+                    selected_configs[plan] = config
         if self.state == "FROZEN":
             for request in requests:
                 if any(plan.prepared is None for plan in _plans_of(request)):
@@ -628,6 +683,7 @@ class PreparationSession:
             requests,
             autotune=(self.autotune if autotune is None else autotune)
             and self._autotune_effort is not AutotuneEffort.OFF,
+            selected_configs=selected_configs,
         )
         self._scratch_limit_locked = True
         self._job = job
@@ -635,13 +691,21 @@ class PreparationSession:
             self.state = "PREPARING"
         return job
 
-    def prepare(self, requests, *, coordinator=None, progress=None, autotune=None):
+    def prepare(
+        self,
+        requests,
+        *,
+        coordinator=None,
+        progress=None,
+        autotune=None,
+        selected_configs=None,
+    ):
         requests = tuple(requests)
         if coordinator is None and any(
             request.collective is not None for request in requests
         ):
             raise ValueError("collective preparation requires a coordinator")
-        job = self.begin(requests, autotune=autotune)
+        job = self.begin(requests, autotune=autotune, selected_configs=selected_configs)
         authorization = {}
         while True:
             state = job.advance(**authorization)
@@ -931,10 +995,11 @@ class PreparationSession:
 
 
 class PreparationJob:
-    def __init__(self, session, requests, *, autotune):
+    def __init__(self, session, requests, *, autotune, selected_configs=None):
         """Initialize state for one bounded sequence of preparation requests."""
         self.session, self.requests = session, requests
         self.autotune = autotune
+        self._selected_configs = dict(selected_configs or {})
         self._steps = self._run()
         self._blocked = None
         self._result = None
@@ -1530,6 +1595,10 @@ class PreparationJob:
         if owner is None or owner is plan or owner.prepared is None:
             return False
         prepared = owner.prepared
+        if obligation.selection is not None and plan.contract.config_payload(
+            prepared.selection.config
+        ) != plan.contract.config_payload(obligation.selection.config):
+            return False
         if prepared.finalist_policy != obligation.request.finalist_policy:
             return False
         if (
@@ -1624,7 +1693,7 @@ class PreparationJob:
             configuration = plan.contract.configure(
                 plan.query,
                 device=self.session.device.identity,
-                override=plan.override,
+                override=self._selected_configs.get(plan, plan.override),
                 search=not self._warmup_only,
             )
             if request.finalist_policy is not None and not self._locally_stopped:
@@ -1644,7 +1713,17 @@ class PreparationJob:
             obligation = _Obligation(request, configuration, requests=requests)
             obligations.append(obligation)
             prepared = plan.prepared
-            if prepared is not None and (
+            if plan in self._selected_configs:
+                obligation.selection = self._selection(
+                    obligation, configuration.pinned, "override"
+                )
+                if prepared is not None and plan.contract.config_payload(
+                    prepared.selection.config
+                ) == plan.contract.config_payload(obligation.selection.config):
+                    self._validate_retained_scratch(obligation, prepared)
+                    obligation.selection = prepared.selection
+                    obligation.ready = True
+            elif prepared is not None and (
                 prepared.finalist_policy == request.finalist_policy
                 and (
                     not self.autotune
@@ -2171,7 +2250,7 @@ class PreparationJob:
             pool = self.session._pool
             if pool is None:
                 raise LookupError("required compiler artifacts are unavailable")
-            if pool.ready(tuple(programs)):
+            if pool.ready(tuple(programs)) and not self._programs_available(programs):
                 raise RuntimeError(
                     "compiler completed without publishing required artifacts"
                 )
@@ -2309,6 +2388,13 @@ class PreparationJob:
         while not self._programs_available(programs):
             if self.session._stop.is_set():
                 return None
+            pool = self.session._pool
+            if pool is None:
+                raise LookupError("required compiler artifacts are unavailable")
+            if pool.ready(tuple(programs)) and not self._programs_available(programs):
+                raise RuntimeError(
+                    "compiler completed without publishing required artifacts"
+                )
             yield from self._pump_pipeline(obligation)
             yield "compile"
         selection = self._selection(obligation, config, "tuned", assignment)
@@ -2827,6 +2913,8 @@ class PreparationJob:
 
         def warmup_selection(prepared):
             nonlocal default_selection
+            if plan in self._selected_configs:
+                return obligation.selection
             if prepared is not None:
                 return prepared.selection
             if default_selection is None:
@@ -2897,7 +2985,7 @@ class PreparationJob:
                 or prepared.finalist_policy
                 != (item.finalist_policy if obligation.finalists else None)
             ):
-                alias = _Obligation(item, obligation.configuration)
+                alias = _Obligation(item, obligation.configuration, selection=selection)
                 if not self._alias_shared(alias):
                     if item.collective is not None:
                         yield item.collective

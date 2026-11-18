@@ -271,3 +271,115 @@ def test_q8_exact_values_across_short_blocks_and_k_tails(k, config):
         actual = blockscaled.mm(source, weight, plan=plan)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert weight.values.numel() + weight.metadata.numel() == raw.numel()
+
+
+@pytest.mark.parametrize(
+    "tile_k,split,n,k",
+    [
+        pytest.param(64, 1, 136, 800, id="k64_tail"),
+        pytest.param(128, 8, 136, 800, id="k128_tail"),
+        pytest.param(256, 8, 136, 800, id="k256_tail"),
+        pytest.param(64, 16, 256, 4096, id="k64_split16"),
+        pytest.param(128, 8, 256, 4096, id="k128_split8"),
+        pytest.param(128, 16, 256, 4096, id="k128_split16"),
+        pytest.param(256, 8, 256, 4096, id="k256_split8"),
+        pytest.param(256, 16, 256, 4096, id="k256_split16"),
+        pytest.param(256, 1, 24, 32, id="short_nk"),
+        pytest.param(128, 1, 136, 96, id="short_k"),
+    ],
+)
+def test_q8_n32_graph_with_caller_scratch(tile_k, split, n, k):
+    device = require_b12x()
+    capacity = 32
+    raw = blocks(n, k, "q8_0")
+    weight = blockscaled.pack_weight(raw.to(device), recipe="q8_0")
+    decoded = dequantize_blocks(raw).bfloat16().to(device)
+    source = torch.randn((capacity, k), device=device, dtype=torch.bfloat16)
+    output = torch.empty((capacity, n), device=device, dtype=torch.bfloat16)
+    workspace = torch.empty(
+        split * capacity * n * 4 if split > 1 else 0,
+        device=device,
+        dtype=torch.uint8,
+    )
+    config = blockscaled.BlockscaledConfig(
+        mode="a16",
+        tile_m=16,
+        tile_n=32,
+        tile_k=tile_k,
+        split_k=split,
+    )
+    with prepared(
+        source, weight, out=output, workspace=workspace, override=config
+    ) as plan:
+        with kernel_resolution_guard("Q8 N32 replay"):
+            for live in (1, 7, 8, 17, capacity):
+                x, y = source[:live], output[:live]
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    blockscaled.mm(x, weight, out=y, workspace=workspace, plan=plan)
+                for seed in (13, 29, 47):
+                    torch.manual_seed(seed)
+                    source.normal_()
+                    expected = (x.float() @ decoded.float().T).bfloat16()
+                    output.fill_(float("nan"))
+                    workspace.fill_(255)
+                    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+                    for _ in range(3):
+                        graph.replay()
+                    torch.cuda.synchronize()
+                    assert (
+                        torch.cuda.memory_stats()["allocation.all.allocated"] == before
+                    )
+                    assert_gemm_close(y, expected)
+                    assert torch.isnan(output[live:]).all()
+                graph.reset()
+
+
+@pytest.mark.parametrize("n", [24, 136])
+@pytest.mark.parametrize("k,tile_k", [(32, 256), (96, 128), (288, 64)])
+def test_q8_n32_exact_values_across_scale_blocks(n, k, tile_k):
+    device = require_b12x()
+    raw = blocks(n, k, "q8_0")
+    raw[..., 2:] = (
+        torch.arange(n * k, dtype=torch.int32).to(torch.uint8).reshape(n, k // 32, 32)
+    )
+    bases = torch.tensor(
+        [0.0, -0.0, 2**-24, -(2**-14), 0.125, -0.25, 64.0], dtype=torch.float16
+    )
+    raw[..., :2] = bases[torch.arange(n * (k // 32)).reshape(n, k // 32) % len(bases)][
+        ..., None
+    ].view(torch.uint8)
+    weight = blockscaled.pack_weight(raw.to(device), recipe="q8_0")
+    expected = dequantize_blocks(raw).bfloat16().T.contiguous().to(device)
+    source = torch.zeros((32, k), device=device, dtype=torch.bfloat16)
+    output = torch.empty((32, n), device=device, dtype=torch.bfloat16)
+    workspace = torch.empty(0, device=device, dtype=torch.uint8)
+    with prepared(
+        source,
+        weight,
+        out=output,
+        workspace=workspace,
+        override=blockscaled.BlockscaledConfig(
+            mode="a16",
+            tile_m=16,
+            tile_n=32,
+            tile_k=tile_k,
+            split_k=1,
+        ),
+    ) as plan:
+        with kernel_resolution_guard("Q8 N32 exact block replay"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                blockscaled.mm(
+                    source, weight, out=output, workspace=workspace, plan=plan
+                )
+            rows = torch.arange(32, device=device)
+            for start in range(0, k, 32):
+                source.zero_()
+                source[rows, rows + start] = 1
+                output.fill_(float("nan"))
+                graph.replay()
+                torch.testing.assert_close(
+                    output, expected[start : start + 32], rtol=0, atol=0
+                )
+            graph.reset()

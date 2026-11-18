@@ -21,6 +21,7 @@ class Caps:
     head_dim_v: int
     page_size: int
     kv_dtype: torch.dtype = torch.bfloat16
+    caller_owned_placeholders: bool = False
 
 
 def plan(caps: Caps, *, invocation=None, override=None) -> Plan:
@@ -40,6 +41,7 @@ def run(
     slot_mapping: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    dummy_scale: torch.Tensor | None = None,
 ) -> None:
     """Write BF16 rows to caller-owned paged caches without allocating.
 
@@ -58,7 +60,17 @@ def run(
     Device metadata values are caller invariants and are not read on the host.
     A registered mutating operator retains cache writes under full-graph compilation.
     """
-    _write_op(plan.handle, key, value, k_cache, v_cache, slot_mapping, k_scale, v_scale)
+    _write_op(
+        plan.handle,
+        key,
+        value,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        k_scale,
+        v_scale,
+        dummy_scale,
+    )
 
 
 @torch.library.custom_op("b12x::paged_kv_write", mutates_args=("k_cache", "v_cache"))
@@ -71,6 +83,7 @@ def _write_op(
     slot_mapping: torch.Tensor,
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
+    dummy_scale: torch.Tensor | None,
 ) -> None:
     plan = plan_from_handle(plan_handle)
     require_prepared(plan, "attention.paged_kv_write", key.device).run(
@@ -81,12 +94,21 @@ def _write_op(
         slot_mapping=slot_mapping,
         k_scale=k_scale,
         v_scale=v_scale,
+        dummy_scale=dummy_scale,
     )
 
 
 @_write_op.register_fake
 def _write_fake(
-    plan_handle, key, value, k_cache, v_cache, slot_mapping, k_scale, v_scale
+    plan_handle,
+    key,
+    value,
+    k_cache,
+    v_cache,
+    slot_mapping,
+    k_scale,
+    v_scale,
+    dummy_scale,
 ):
     pass
 

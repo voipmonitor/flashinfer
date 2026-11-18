@@ -1,6 +1,6 @@
 """Prepared NVFP4 MoE with independently scaled input and intermediate rows."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from collections.abc import Mapping
 from types import MappingProxyType
 
@@ -850,6 +850,17 @@ class State:
 
     def bind(self, *, a, topk_ids, topk_weights, output, scratch, **kwargs):
         q = self.query
+        scale_buffers = kwargs.pop("_scale_buffers", ())
+        bound_state = self
+        if scale_buffers:
+            from ._binding_ops import _scale_view
+
+            impl = _scale_view(self.experts._impl, scale_buffers)
+            bound_state = replace(
+                self,
+                experts=replace(self.experts, _impl=impl),
+                scale_decoder=replace(self.scale_decoder, active=scale_buffers[2]),
+            )
         if (
             a.ndim != 2
             or a.shape[1] != q.hidden
@@ -955,7 +966,7 @@ class State:
             for name, shape, dtype, offset, size in _layout(q, self.config)[0]
         }
         return TokenOuterBinding(
-            self,
+            bound_state,
             a,
             topk_weights,
             topk_ids,

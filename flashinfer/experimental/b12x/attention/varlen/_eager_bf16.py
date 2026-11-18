@@ -276,6 +276,7 @@ class _State:
                 v,
                 cu_seqlens_q,
                 cu_seqlens_k,
+                allow_row_padding=False,
             )
         )
         validate_extents(qshape, kshape, vshape, cqshape, ckshape)

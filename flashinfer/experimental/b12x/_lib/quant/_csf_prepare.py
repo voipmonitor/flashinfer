@@ -602,7 +602,13 @@ def _arguments(source):
 
 
 def prepare_csf_payload(
-    source, *, destination=0, rotation=0, group_rows=None, value_table=None
+    source,
+    *,
+    destination=0,
+    rotation=0,
+    group_rows=None,
+    value_table=None,
+    allocate=None,
 ):
     """Gather native codes and compact exceptions without expanding a scale matrix."""
     args, geometry = _arguments(source)
@@ -659,11 +665,11 @@ def prepare_csf_payload(
         total = int(prefix[-1].item())
         if total * 3 >= 1 << 32:
             raise ValueError("CSF exception arena must be smaller than 4 GiB")
-        storage = torch.zeros(
-            _align16(layout.source_records + 3 * total),
+        storage = (torch.empty if allocate is None else allocate)(
+            (_align16(layout.source_records + 3 * total),),
             dtype=torch.uint8,
             device=source.device,
-        )
+        ).zero_()
         values = layout.source_records + 2 * total
         storage[:8].view(torch.int64).fill_(values)
         _pack_codes[grid](

@@ -126,6 +126,7 @@ class _W4A16SmallMDirectLaunch(NamedTuple):
 class W4A16SmallMDirectCompileResult:
     moe_block_size: int
     small_m_direct_launches: tuple[_W4A16SmallMDirectLaunch, ...]
+    fc2_launches: tuple[_W4A16SmallMDirectLaunch, ...] = ()
 
 
 class _W4A16FC2DirectLaunch(NamedTuple):

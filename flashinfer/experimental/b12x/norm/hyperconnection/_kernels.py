@@ -673,7 +673,8 @@ def _head_gate_op(values: torch.Tensor, gates: torch.Tensor, plan_handle: int) -
         or values.dtype != torch.bfloat16
         or not values.is_contiguous()
         or gates.shape != values.shape[:2]
-        or gates.stride() != (q.gate_stride, 1)
+        or gates.stride(1) != 1
+        or (gates.shape[0] > 1 and gates.stride(0) != q.gate_stride)
         or gates.dtype != values.dtype
         or gates.device != values.device
     ):

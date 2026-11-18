@@ -29,6 +29,7 @@ _OPERANDS = (
     "num_tokens",
     "output",
 )
+_SCALAR_COUNTS = frozenset(("num_seqs", "num_tokens"))
 _QWEN_ALIGNED_OPERANDS = frozenset(
     (
         "query_start_loc",
@@ -93,7 +94,7 @@ class GdnQuery:
                 else tuple(strides)
             )
         object.__setattr__(self, "kda_strides", strides)
-        alignments = {name: 16 for name in _OPERANDS}
+        alignments = {name: 4 if name in _SCALAR_COUNTS else 16 for name in _OPERANDS}
         if self.pointer_alignments is not None:
             alignments.update(self.pointer_alignments)
         if any(

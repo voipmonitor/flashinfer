@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from b12x._lib.quant.block_codec import BLOCK_CODECS, block_codec
+from b12x.moe._shared.kernels.activations import moe_activation_w1_rows
 
 from dataclasses import dataclass, replace
 
@@ -112,11 +113,13 @@ class MoeDecodeConfig:
     w4a16_tile_config: tuple[int, int, int, int] | None = None
     w4a16_block_size_m: int | None = None
     w4a16_pipeline_stages: int | None = None
+    w4a16_fc1_pipeline_stages: int | None = None
     micro_fc1_tile_n: int = 128
     materialized_fc1_cta_budget: int = 2
     micro_fc1_max_copy_groups: int = 2
     compact_fuse_input_quantization: bool = False
     micro_fc1_pipeline_stages: int = 2
+    w4a16_direct_schedule: str = "fused"
 
     @classmethod
     def from_config(cls, payload: FrozenMapping) -> "MoeDecodeConfig":
@@ -139,6 +142,8 @@ class MoeDecodeConfig:
             "w4a16_tile_config",
             "w4a16_block_size_m",
             "w4a16_pipeline_stages",
+            "w4a16_fc1_pipeline_stages",
+            "w4a16_direct_schedule",
         }
         if set(payload) != expected:
             raise ValueError(
@@ -181,6 +186,8 @@ class MoeDecodeConfig:
             raise TypeError("dynamic_route_mode must be a string or null")
         if w4a16_route_mode is not None and not isinstance(w4a16_route_mode, str):
             raise TypeError("w4a16_route_mode must be a string or null")
+        if not isinstance(payload["w4a16_direct_schedule"], str):
+            raise TypeError("w4a16_direct_schedule must be a string")
         if any(
             type(payload[name]) is not bool
             for name in (
@@ -191,7 +198,11 @@ class MoeDecodeConfig:
             )
         ):
             raise TypeError("Scale and NVFP4 lowering controls must be boolean")
-        for name in ("w4a16_block_size_m", "w4a16_pipeline_stages"):
+        for name in (
+            "w4a16_block_size_m",
+            "w4a16_pipeline_stages",
+            "w4a16_fc1_pipeline_stages",
+        ):
             if payload[name] is not None and type(payload[name]) is not int:
                 raise TypeError(f"{name} must be an integer or null")
         tiles = payload["w4a16_tile_config"]
@@ -222,6 +233,8 @@ class MoeDecodeConfig:
             w4a16_tile_config=tiles,
             w4a16_block_size_m=payload["w4a16_block_size_m"],
             w4a16_pipeline_stages=payload["w4a16_pipeline_stages"],
+            w4a16_fc1_pipeline_stages=payload["w4a16_fc1_pipeline_stages"],
+            w4a16_direct_schedule=payload["w4a16_direct_schedule"],
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -244,6 +257,8 @@ class MoeDecodeConfig:
             "w4a16_tile_config": self.w4a16_tile_config,
             "w4a16_block_size_m": self.w4a16_block_size_m,
             "w4a16_pipeline_stages": self.w4a16_pipeline_stages,
+            "w4a16_fc1_pipeline_stages": self.w4a16_fc1_pipeline_stages,
+            "w4a16_direct_schedule": self.w4a16_direct_schedule,
         }
 
 
@@ -259,7 +274,10 @@ def _validate_w4a16_launch(query, config):
         config.w4a16_block_size_m,
         config.w4a16_pipeline_stages,
     )
-    if all(value is None for value in knobs):
+    if (
+        all(value is None for value in knobs)
+        and config.w4a16_fc1_pipeline_stages is None
+    ):
         return
     is_block_codec = query.source_format in BLOCK_CODECS
     if config.backend != "w4a16" or not (
@@ -273,6 +291,11 @@ def _validate_w4a16_launch(query, config):
             "W4A16 tile, route-block and pipeline choices must be specified together"
         )
     tiles, block, stages = knobs
+    fc1_stages = config.w4a16_fc1_pipeline_stages
+    if fc1_stages is not None and (
+        type(fc1_stages) is not int or fc1_stages not in (2, 3, 4, 5)
+    ):
+        raise ValueError("unsupported W4A16 FC1 pipeline depth")
     if (
         not isinstance(tiles, tuple)
         or len(tiles) != 4
@@ -296,10 +319,10 @@ def _validate_w4a16_launch(query, config):
         _DEFAULT_MAX_SHARED_MEM,
     )
 
-    fc1_n = query.intermediate_size * (2 if query.activation == "silu" else 1)
-    for n, k, tile_k, tile_n in (
-        (fc1_n, query.hidden_size, *tiles[:2]),
-        (query.hidden_size, query.intermediate_size, *tiles[2:]),
+    fc1_n = moe_activation_w1_rows(query.activation, query.intermediate_size)
+    for n, k, tile_k, tile_n, phase_stages in (
+        (fc1_n, query.hidden_size, *tiles[:2], fc1_stages or stages),
+        (query.hidden_size, query.intermediate_size, *tiles[2:], stages),
     ):
         if not _candidate_tile_fits(
             problem_n=n,
@@ -314,7 +337,7 @@ def _validate_w4a16_launch(query, config):
             else (query.w4a16_weight_layout or "packed"),
             scale_format=query.w4a16_scale_format or "e4m3_k16",
             uses_m_block_8=block == 8,
-            pipeline_stages=stages,
+            pipeline_stages=phase_stages,
         ):
             raise ValueError(
                 "W4A16 tile/pipeline exceeds geometry or shared-memory limits"
@@ -611,6 +634,14 @@ def validate_moe_decode_config(
         )
     if config.backend not in {"micro", "dynamic", "w4a16"}:
         raise ValueError(f"unsupported MoE backend {config.backend!r}")
+    if config.w4a16_direct_schedule not in {"fused", "split"}:
+        raise ValueError("W4A16 direct schedule must be 'fused' or 'split'")
+    if config.w4a16_direct_schedule == "split" and not (
+        config.backend == "w4a16"
+        and config.w4a16_route_mode == "direct"
+        and query.w4a16_weight_layout == "modelopt"
+    ):
+        raise ValueError("split W4A16 execution requires native direct routing")
     if query.quant_mode == "w4a16":
         if config.backend != "w4a16":
             raise ValueError("W4A16 queries require the W4A16 backend")
@@ -1010,6 +1041,14 @@ def _tuning_parameters(query, device):
             "w4a16_block_size_m": (None, *blocks),
             "w4a16_pipeline_stages": (None, 2, 3, 4, 5),
         }
+    if (
+        query.source_format == "fp4_e8m0_k32"
+        and query.io_dtype == "bfloat16"
+        and query.hidden_size >= 1024
+        and query.num_tokens <= 8
+        and w4a16_values
+    ):
+        w4a16_values["w4a16_fc1_pipeline_stages"] = (None, 2, 3, 4, 5)
     # Compact W4A8 backend, tile, and inline-scale choices are measured, not
     # pruned. The per-row micro kernel, the M16 dynamic kernel, and inline
     # scales each win in a band that depends on the device and routing density;
@@ -1145,7 +1184,7 @@ FC2_TUNING = replace(FC2_TUNING, validate_query=_validate_fc2_query)
 TUNING = TuningContract(
     component_id="moe.decode",
     query_schema_version=33,
-    config_schema_version=31,
+    config_schema_version=33,
     query_fields=frozenset(MoeDecodeQuery.__dataclass_fields__),
     config_fields=frozenset(MoeDecodeConfig.__dataclass_fields__),
     encode_query=MoeDecodeQuery.to_dict,
@@ -1154,7 +1193,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=validate_moe_decode_config,
     default_config=_default_config,
-    candidate_contract_version=63,
+    candidate_contract_version=72,
     knobs=(
         Knob(
             name="backend",
@@ -1259,6 +1298,13 @@ TUNING = TuningContract(
             when=FrozenMapping({"backend": "w4a16"}),
         ),
         Knob(
+            name="w4a16_direct_schedule",
+            values=("fused", "split"),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "w4a16", "w4a16_route_mode": "direct"}),
+            otherwise="fused",
+        ),
+        Knob(
             name="w4a16_block_size_m",
             values=(None,),
             binding=ParameterBinding.COMPILE,
@@ -1269,6 +1315,12 @@ TUNING = TuningContract(
             values=(None,),
             binding=ParameterBinding.COMPILE,
             when=FrozenMapping({"backend": "w4a16"}),
+        ),
+        Knob(
+            name="w4a16_fc1_pipeline_stages",
+            values=(None,),
+            binding=ParameterBinding.COMPILE,
+            when=FrozenMapping({"backend": "w4a16", "w4a16_route_mode": "packed"}),
         ),
     ),
     materialize=_materialize_tuning,

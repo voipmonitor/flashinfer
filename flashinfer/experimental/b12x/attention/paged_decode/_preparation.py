@@ -24,7 +24,7 @@ from ._tuning import TUNING, PagedDecodeConfig, PagedDecodeQuery, _consumer_warp
 _FORWARD_ID = "attention.paged_decode.forward"
 _MERGE_ID = "attention.paged_decode.merge"
 _KV_WRITE_ID = "attention.paged_decode.kv_write"
-_COMPILE_VERSION = 2
+_COMPILE_VERSION = 5
 _KV_CUTE_DTYPE = {"bfloat16": cutlass.BFloat16, "float8_e4m3fn": cutlass.Uint8}
 
 # (name, rank, cutlass dtype or kv marker, assumed alignment) in launch order.
@@ -38,9 +38,12 @@ _FORWARD_OPERANDS = (
     ("output", 3, cutlass.BFloat16, 16),
     ("o_part", 4, cutlass.Float32, 16),
     ("lse_part", 3, cutlass.Float32, 4),
-    ("sinks", 1, cutlass.Float32, 4),
+    ("sinks", "sinks", cutlass.Float32, 4),
     ("k_descale", "descale", cutlass.Float32, 4),
     ("v_descale", "descale", cutlass.Float32, 4),
+    ("relative_bias", 3, cutlass.BFloat16, 2),
+    ("tail_k_cache", 4, "kv", 16),
+    ("tail_v_cache", 4, "kv", 16),
 )
 _MERGE_OPERANDS = (
     ("o_part", 4, cutlass.Float32, 16),
@@ -48,7 +51,7 @@ _MERGE_OPERANDS = (
     ("cache_seqlens", 1, cutlass.Int32, 4),
     ("cu_seqlens_q", 1, cutlass.Int32, 4),
     ("output", 3, cutlass.BFloat16, 16),
-    ("sinks", 1, cutlass.Float32, 4),
+    ("sinks", "sinks", cutlass.Float32, 4),
 )
 
 
@@ -71,6 +74,8 @@ def _operand_dtype(dtype, query: PagedDecodeQuery):
 def _operand_rank(rank, query: PagedDecodeQuery) -> int:
     if rank == "descale":
         return 2 if query.descale_layout == "head" else 1
+    if rank == "sinks":
+        return 2 if query.sink_layout == "row" else 1
     return rank
 
 
@@ -127,6 +132,9 @@ def _forward_kernel(query: PagedDecodeQuery, config: PagedDecodeConfig):
         causal=query.causal,
         kv_fp8=query.kv_dtype == "float8_e4m3fn",
         descale_layout=query.descale_layout,
+        has_relative_bias=query.has_relative_bias,
+        sink_layout=query.sink_layout,
+        tail_pages_per_request=query.tail_pages_per_request,
     )
 
 
@@ -165,6 +173,7 @@ def _merge_kernel(query: PagedDecodeQuery, config: PagedDecodeConfig):
         window_left=query.window_left,
         heads_per_cta=heads_per_cta,
         has_sinks=query.has_sinks,
+        sink_layout=query.sink_layout,
     )
 
 
@@ -204,7 +213,8 @@ def compile_paged_decode(query_payload, config_payload, ordinal):
         )
         if config.split_kv:
             merge_args = [
-                _fake_operand(dt, rank, align) for _, rank, dt, align in _MERGE_OPERANDS
+                _fake_operand(dt, _operand_rank(rank, query), align)
+                for _, rank, dt, align in _MERGE_OPERANDS
             ]
             programs["merge"] = b12x_compile(
                 _merge_kernel(query, config),
@@ -233,10 +243,12 @@ def compile_paged_decode(query_payload, config_payload, ordinal):
 def scratch_specs(query: PagedDecodeQuery, config: PagedDecodeConfig, device):
     """FP32 split partials for the full row capacity (one set per device,
     reused by every layer that shares the geometry)."""
-    if not config.split_kv:
+    if not config.split_kv and not query.caller_owned_placeholders:
         return ()
-    rows, heads, splits = query.max_total_q, query.num_q_heads, config.max_splits
-    return (
+    rows = query.max_total_q if config.split_kv else 1
+    heads = query.num_q_heads
+    splits = config.max_splits if config.split_kv else 1
+    partials = (
         ScratchBufferSpec(
             name="paged_decode.o_part",
             shape=(rows, heads, splits, query.head_dim_vo),
@@ -246,6 +258,23 @@ def scratch_specs(query: PagedDecodeQuery, config: PagedDecodeConfig, device):
         ScratchBufferSpec(
             name="paged_decode.lse_part",
             shape=(rows, heads, splits),
+            dtype=torch.float32,
+            device=device,
+        ),
+    )
+    if not query.caller_owned_placeholders:
+        return partials
+    return (
+        *partials,
+        ScratchBufferSpec(
+            name="paged_decode.unused_sinks",
+            shape=(query.num_q_heads,),
+            dtype=torch.float32,
+            device=device,
+        ),
+        ScratchBufferSpec(
+            name="paged_decode.unused_descale",
+            shape=(1, query.num_kv_heads) if query.descale_layout == "head" else (1,),
             dtype=torch.float32,
             device=device,
         ),
@@ -267,6 +296,9 @@ class Binding:
     sinks: torch.Tensor
     k_descale: torch.Tensor
     v_descale: torch.Tensor
+    relative_bias: torch.Tensor
+    tail_k_cache: torch.Tensor
+    tail_v_cache: torch.Tensor
     softmax_scale: float
 
 
@@ -295,6 +327,9 @@ class PreparedPagedDecode:
         attention_sink_bias: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        relative_attention_bias: torch.Tensor | None = None,
+        tail_k_cache: torch.Tensor | None = None,
+        tail_v_cache: torch.Tensor | None = None,
         softmax_scale: float | None = None,
     ) -> Binding:
         """Validate caller tensors against the prepared contract (no allocation,
@@ -371,10 +406,75 @@ class PreparedPagedDecode:
                     f"{name} must have positive outer strides and a page stride "
                     "divisible by the KV stage stride"
                 )
+        if query.tail_pages_per_request:
+            for name, tail, dim in (
+                ("tail_k_cache", tail_k_cache, query.head_dim_qk),
+                ("tail_v_cache", tail_v_cache, query.head_dim_vo),
+            ):
+                if tail is None:
+                    raise ValueError(f"{name} is required by the private-tail plan")
+                _validate_operand(
+                    name,
+                    tail,
+                    device=self.device,
+                    rank=4,
+                    align=16,
+                    aligned_strides=True,
+                )
+                if (
+                    tuple(tail.shape)
+                    != (
+                        batch * query.tail_pages_per_request,
+                        query.page_size,
+                        query.num_kv_heads,
+                        dim,
+                    )
+                    or tail.dtype != kv_dtype
+                    or any(s <= 0 for s in tail.stride()[:-1])
+                    or tail.stride(0) % (cfg.stage_rows * tail.stride(1))
+                ):
+                    raise ValueError(
+                        f"{name} must match the private page capacity, dtype and head geometry"
+                    )
+        elif tail_k_cache is not None or tail_v_cache is not None:
+            raise ValueError("the plan was declared without private tail pages")
+        else:
+            tail_k_cache, tail_v_cache = k_cache, v_cache
         if k_cache.shape[0] != v_cache.shape[0]:
             raise ValueError("k_cache and v_cache must have the same page count")
+        if query.caller_owned_placeholders:
+            specs = scratch_specs(query, cfg, self.device)
+            buffers = tuple(scratch)
+            if len(buffers) != len(specs):
+                raise ValueError(
+                    "paged_decode scratch must match its prepared specifications"
+                )
+            for spec, buf in zip(specs, buffers, strict=True):
+                if (
+                    buf.device != self.device
+                    or not buf.is_contiguous()
+                    or buf.nbytes < spec.nbytes
+                ):
+                    raise ValueError(
+                        f"{spec.name} scratch must cover its prepared capacity on the device"
+                    )
+                if buf.data_ptr() % (16 if spec.name == "paged_decode.o_part" else 4):
+                    raise ValueError(f"{spec.name} scratch is not aligned")
+            placeholders = tuple(
+                buf.view(torch.uint8)
+                .view(-1)[: spec.nbytes]
+                .view(torch.float32)
+                .view(spec.shape)
+                for spec, buf in zip(specs, buffers, strict=True)
+            )
+        else:
+            placeholders = None
         if query.kv_dtype == "float8_e4m3fn":
             k_cache, v_cache = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
+            tail_k_cache, tail_v_cache = (
+                tail_k_cache.view(torch.uint8),
+                tail_v_cache.view(torch.uint8),
+            )
             if k_descale is None or v_descale is None:
                 raise ValueError("FP8 KV requires k_descale and v_descale")
             want = {
@@ -404,23 +504,65 @@ class PreparedPagedDecode:
                 scales.append(scale)
             k_descale, v_descale = scales
         else:
-            k_descale = v_descale = self.dummy_descale
+            k_descale = v_descale = (
+                self.dummy_descale if placeholders is None else placeholders[3]
+            )
         if query.has_sinks:
+            per_row = query.sink_layout == "row"
             if (
                 attention_sink_bias is None
-                or tuple(attention_sink_bias.shape) != (query.num_q_heads,)
                 or attention_sink_bias.dtype != torch.float32
+                or attention_sink_bias.ndim != (2 if per_row else 1)
+                or attention_sink_bias.shape[-1] != query.num_q_heads
+                or (per_row and attention_sink_bias.shape[0] < total_q)
             ):
-                raise ValueError("attention_sink_bias must be float32 [num_q_heads]")
+                raise ValueError(
+                    "attention_sink_bias must be float32 "
+                    + (
+                        f"[at least {total_q}, {query.num_q_heads}]"
+                        if per_row
+                        else f"[{query.num_q_heads}]"
+                    )
+                )
             sinks = attention_sink_bias
             _validate_operand(
-                "attention_sink_bias", sinks, device=self.device, rank=1, align=4
+                "attention_sink_bias",
+                sinks,
+                device=self.device,
+                rank=2 if per_row else 1,
+                align=4,
             )
         elif attention_sink_bias is not None:
             raise ValueError("the plan was declared without attention sinks")
         else:
-            sinks = self.dummy_sinks
-        if cfg.split_kv:
+            sinks = self.dummy_sinks if placeholders is None else placeholders[2]
+        if query.has_relative_bias:
+            bias = relative_attention_bias
+            if bias is None or bias.dtype != torch.bfloat16:
+                raise ValueError(
+                    "relative_attention_bias must be BF16 [rows, num_q_heads, extent]"
+                )
+            _validate_operand(
+                "relative_attention_bias", bias, device=self.device, rank=3, align=2
+            )
+            if (
+                bias.shape[0] < total_q
+                or bias.shape[1] != query.num_q_heads
+                or bias.shape[2] < 1
+            ):
+                raise ValueError(
+                    "relative_attention_bias must be "
+                    f"[at least {total_q}, {query.num_q_heads}, extent], "
+                    f"got {tuple(bias.shape)}"
+                )
+        elif relative_attention_bias is not None:
+            raise ValueError("the plan was declared without a relative bias")
+        else:
+            # Never read; q satisfies the operand's rank, dtype and alignment.
+            bias = q
+        if placeholders is not None:
+            o_part, lse_part = placeholders[:2]
+        elif cfg.split_kv:
             # Full-capacity partial buffers: the split extent is read from them.
             buffers = tuple(scratch)
             if len(buffers) != 2:
@@ -458,6 +600,9 @@ class PreparedPagedDecode:
             sinks=sinks,
             k_descale=k_descale,
             v_descale=v_descale,
+            relative_bias=bias,
+            tail_k_cache=tail_k_cache,
+            tail_v_cache=tail_v_cache,
             softmax_scale=scale,
         )
 
@@ -471,6 +616,7 @@ class PreparedPagedDecode:
         slot_mapping: torch.Tensor,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
+        dummy_scale: torch.Tensor | None = None,
     ) -> None:
         """Append each token's K/V rows to its cache slot (capture-safe)."""
         query = self.query
@@ -541,7 +687,15 @@ class PreparedPagedDecode:
                 _validate_operand(name, scale, device=self.device, rank=1, align=4)
             k_cache, v_cache = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
         else:
-            k_scale = v_scale = self.dummy_descale.reshape(-1)[:1]
+            unused = self.dummy_descale if dummy_scale is None else dummy_scale
+            if unused is None or unused.dtype != torch.float32 or unused.numel() < 1:
+                raise ValueError(
+                    "BF16 cache write requires a caller-owned float32 placeholder"
+                )
+            k_scale = v_scale = unused.reshape(-1)[:1]
+            _validate_operand(
+                "dummy_scale", k_scale, device=self.device, rank=1, align=4
+            )
         tensors = {
             "key": key,
             "value": value,
@@ -579,6 +733,9 @@ class PreparedPagedDecode:
             "sinks": binding.sinks,
             "k_descale": binding.k_descale,
             "v_descale": binding.v_descale,
+            "relative_bias": binding.relative_bias,
+            "tail_k_cache": binding.tail_k_cache,
+            "tail_v_cache": binding.tail_v_cache,
         }
         with torch.cuda.device(self.device):
             stream = current_cuda_stream()
@@ -633,6 +790,10 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
         has_sinks=bool(caps.has_sinks),
         descale_layout=str(caps.descale_layout),
         sm_count=int(sm_count),
+        caller_owned_placeholders=bool(caps.caller_owned_placeholders),
+        has_relative_bias=bool(caps.has_relative_bias),
+        sink_layout=str(caps.sink_layout),
+        tail_pages_per_request=int(caps.tail_pages_per_request),
     )
     TUNING.validate_query(query, None)
     compile_query = TUNING.encode_query(replace(query, autotune_effort="default"))
@@ -661,12 +822,16 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
         )
         load_programs(programs)
         dummy_part = (
-            torch.zeros(
-                (1, query.num_q_heads, 1, query.head_dim_vo),
-                dtype=torch.float32,
-                device=dev,
-            ),
-            torch.zeros((1, query.num_q_heads, 1), dtype=torch.float32, device=dev),
+            None
+            if query.caller_owned_placeholders
+            else (
+                torch.zeros(
+                    (1, query.num_q_heads, 1, query.head_dim_vo),
+                    dtype=torch.float32,
+                    device=dev,
+                ),
+                torch.zeros((1, query.num_q_heads, 1), dtype=torch.float32, device=dev),
+            )
         )
         descale_shape = (
             (1, query.num_kv_heads) if query.descale_layout == "head" else (1,)
@@ -677,10 +842,12 @@ def make_plan(caps, *, invocation=None, override=None) -> Plan:
             device=dev,
             programs=programs,
             dummy_part=dummy_part,
-            dummy_sinks=torch.zeros(
-                (query.num_q_heads,), dtype=torch.float32, device=dev
-            ),
-            dummy_descale=torch.ones(descale_shape, dtype=torch.float32, device=dev),
+            dummy_sinks=None
+            if query.caller_owned_placeholders
+            else torch.zeros((query.num_q_heads,), dtype=torch.float32, device=dev),
+            dummy_descale=None
+            if query.caller_owned_placeholders
+            else torch.ones(descale_shape, dtype=torch.float32, device=dev),
         )
         return attach_programs(state, *programs.values())
 

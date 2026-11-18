@@ -195,7 +195,17 @@ def compile_expansion(query_payload, config_payload, ordinal):
             compile_nvfp4_csf_pair(*geometries, ids64, fuse_tasks=True)
             for ids64 in (False, True)
         )
-    return programs, routing, task_programs
+        mapped_programs = tuple(
+            compile_nvfp4_csf_pair(*geometries, ids64, mapped=True)
+            for ids64 in (False, True)
+        )
+        mapped_routing = tuple(
+            compile_csf_active_experts(
+                ids64, query.first[6] if config.bitmap_routes else 0, mapped=True
+            )
+            for ids64 in (False, True)
+        )
+    return programs, routing, task_programs, mapped_programs, mapped_routing
 
 
 def _scratch(experts, device):
@@ -231,6 +241,8 @@ class _ExpansionState:
     bitmap_routes: bool
     direct_routes: bool
     task_programs: tuple
+    mapped_programs: tuple
+    mapped_routing: tuple
 
     def decoder(self, scratch):
         active = scratch_tensor(
@@ -246,6 +258,8 @@ class _ExpansionState:
             active[: self.first.num_experts],
             bitmap_routes=self.bitmap_routes,
             direct_routes=self.direct_routes,
+            mapped_programs=self.mapped_programs,
+            mapped_routing_programs=self.mapped_routing,
         )
 
     def bind(self, *, ids, out13, out2, scratch):
@@ -308,8 +322,12 @@ def plan_csf_block_expansion(
             )
             for p in (first, second)
         )
-        programs, routing, task_programs = compile_expansion(
-            _program_query_payload(query), TUNING.encode_config(config), device.ordinal
+        programs, routing, task_programs, mapped_programs, mapped_routing = (
+            compile_expansion(
+                _program_query_payload(query),
+                TUNING.encode_config(config),
+                device.ordinal,
+            )
         )
         return _ExpansionState(
             query,
@@ -320,6 +338,8 @@ def plan_csf_block_expansion(
             config.bitmap_routes,
             config.direct_routes,
             task_programs,
+            mapped_programs,
+            mapped_routing,
         )
 
     return Plan(

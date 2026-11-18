@@ -155,12 +155,13 @@ def test_route_pack_reuses_provided_fixed_capacity_for_prefill_tail() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "capacity, bucket_tokens", ((128, True), (129, False), (8192, True))
+    "capacity, bucket_tokens",
+    ((16, True), (64, True), (128, True), (129, False), (8192, True)),
 )
 @pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
 @pytest.mark.parametrize("mapped", (False, True))
 def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(
-    capacity, bucket_tokens, ids_dtype, mapped
+    capacity, bucket_tokens, ids_dtype, mapped, wide_invalid=False
 ):
     launches = route_pack_module.compile_w4a16_route_pack_launches(
         tokens=capacity,
@@ -239,16 +240,39 @@ def test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(
     run(capacity)
     torch.cuda.synchronize()
     with kernel_resolution_guard("prepared route packing reuses fixed geometry"):
-        for rows in (1, 3, 17, capacity):
+        for rows in (1, 3, min(17, capacity), capacity):
             check(rows, run(rows))
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 output = run(rows)
-            for tensor in buffers.values():
-                tensor.fill_(-999)
-            ids.add_(5).remainder_(32)
-            graph.replay()
-            check(rows, output)
+            for pattern in range(3 if wide_invalid else 1):
+                for tensor in buffers.values():
+                    tensor.fill_(-999)
+                ids.add_(5).remainder_(32)
+                if wide_invalid and pattern == 0:
+                    values = (
+                        2**32 + 1,
+                        -(2**32) + 1,
+                        2**32,
+                        -(2**32),
+                        2**63 - 1,
+                        -(2**63),
+                        32,
+                        -1,
+                        0,
+                        1,
+                    )
+                    for index, value in enumerate(values):
+                        ids.view(-1)[index :: len(values)] = value
+                elif wide_invalid and pattern == 1:
+                    ids.fill_(2**32 + 1)
+                elif wide_invalid and pattern == 2:
+                    ids.fill_(1)
+                before = torch.cuda.memory_stats()["allocation.all.allocated"]
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+                check(rows, output)
 
 
 def test_small_prefix_reuses_fixed_arena_numel_capacity(monkeypatch) -> None:
@@ -269,6 +293,11 @@ def test_small_prefix_reuses_fixed_arena_numel_capacity(monkeypatch) -> None:
     monkeypatch.setattr(
         route_pack_module,
         "_pack_topk_routes_small_prefix_kernel",
+        small_prefix,
+    )
+    monkeypatch.setattr(
+        route_pack_module,
+        "_pack_topk_routes_sorted_kernel",
         small_prefix,
     )
     monkeypatch.setattr(route_pack_module, "_pack_topk_routes_sort_kernel", sort)
@@ -606,3 +635,12 @@ def test_pack_topk_routes_by_expert_large_expert_decode_capture(
         )
         expected = expected.flatten().sort().values
         assert torch.equal(actual, expected), expert
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("capacity", [32, 129, 8192])
+@pytest.mark.parametrize("mapped", [False, True])
+def test_route_pack_rejects_int64_ids_that_wrap_to_local_experts(capacity, mapped):
+    test_prepared_route_pack_uses_live_bounds_with_fixed_geometry(
+        capacity, False, torch.int64, mapped, wide_invalid=True
+    )

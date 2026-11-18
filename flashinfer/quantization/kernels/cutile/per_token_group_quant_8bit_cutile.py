@@ -183,6 +183,8 @@ def per_token_group_quant_8bit_cutile(
     column_major_scales: bool = False,
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
+    *,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token group 8-bit quantization (FP8 or INT8) — cuTile backend.
 
@@ -196,6 +198,8 @@ def per_token_group_quant_8bit_cutile(
         column_major_scales: Store scales in column-major layout (for TMA compatibility).
         scale_tma_aligned: Align scale storage to 4-element (16B) boundaries.
         scale_ue8m0: Round scales to UE8M0 (power-of-2) format.
+        out: Optional contiguous quantized values and FP32 scales on the input
+            device. Requires row-major scales and disjoint source/output byte ranges.
 
     Returns:
         (x_q, x_s): Quantized tensor and scale tensor.
@@ -229,7 +233,42 @@ def per_token_group_quant_8bit_cutile(
     # groups covers the whole output — no pre-zeroing needed (unlike the beta=0
     # GEMM epilogue). Using empty_like avoids a redundant full-tensor memset on a
     # bandwidth-bound path.
-    x_q = torch.empty_like(x, device=x.device, dtype=dst_dtype)
+    if out is not None:
+        if column_major_scales:
+            raise ValueError(
+                "caller-owned quantization outputs require row-major scales"
+            )
+        x_q, x_s = out
+        for name, tensor, shape, dtype in (
+            ("quantized values", x_q, x.shape, dst_dtype),
+            (
+                "quantized scales",
+                x_s,
+                (*x.shape[:-1], x.shape[-1] // group_size),
+                torch.float32,
+            ),
+        ):
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or tensor.device != x.device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must match the quantization shape, dtype, and device"
+                )
+        for left, right in ((x, x_q), (x, x_s), (x_q, x_s)):
+            if (
+                left.numel()
+                and right.numel()
+                and left.data_ptr() < right.data_ptr() + right.nbytes
+                and right.data_ptr() < left.data_ptr() + left.nbytes
+            ):
+                raise ValueError(
+                    "quantization source and output byte ranges must be disjoint"
+                )
+    else:
+        x_q = torch.empty_like(x, device=x.device, dtype=dst_dtype)
     M = x.numel() // group_size
     N = group_size
 
@@ -262,7 +301,8 @@ def per_token_group_quant_8bit_cutile(
         x_s = x_s_raw
     else:
         shape = x.shape[:-1] + (x.shape[-1] // group_size,)
-        x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
+        if out is None:
+            x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
     BLOCK = _next_power_of_2(N)
 

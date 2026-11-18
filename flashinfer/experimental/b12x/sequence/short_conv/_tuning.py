@@ -20,6 +20,7 @@ OPERANDS = (
     "request_ids",
     "conv_bias",
 )
+SCALAR_COUNTS = frozenset(("num_seqs", "num_tokens"))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -37,7 +38,9 @@ class ShortConvQuery:
     weight_dtype: str = "bfloat16"
     state_strides: tuple[int, int, int] | None = None
     input_row_stride: int | None = None
-    input_alignments: tuple[int, ...] = (16,) * len(OPERANDS)
+    input_alignments: tuple[int, ...] = tuple(
+        4 if name in SCALAR_COUNTS else 16 for name in OPERANDS
+    )
 
     def __post_init__(self):
         if (

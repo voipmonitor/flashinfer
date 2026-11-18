@@ -201,14 +201,10 @@ def bfloat2_broadcast_lane(x: Uint32, lane: Int32, *, loc=None, ip=None) -> Uint
             """
             {
                 .reg .pred p;
-                .reg .b32 lo, hi, val, shifted;
-                and.b32 lo, $1, 0x0000ffff;
-                shr.u32 hi, $1, 16;
+                .reg .b32 selector;
                 setp.eq.s32 p, $2, 0;
-                @p  mov.b32 val, lo;
-                @!p mov.b32 val, hi;
-                shl.b32 shifted, val, 16;
-                or.b32 $0, val, shifted;
+                selp.b32 selector, 0x1010, 0x3232, p;
+                prmt.b32 $0, $1, $1, selector;
             }
             """,
             "=r,r,r",
@@ -773,30 +769,13 @@ def packed_dequant_e8m0x4_to_bfloat2x2(
         [Uint32(packed).ir_value(loc=loc, ip=ip)],
         """
         {
-            .reg .u32 b0, b1, b2, b3;
-            .reg .u32 h0, h1, h2, h3;
-            .reg .u32 t0, t1;
-
-            and.b32 b0, $2, 0x000000ff;
-            shr.u32 b1, $2, 8;
-            and.b32 b1, b1, 0x000000ff;
-            shr.u32 b2, $2, 16;
-            and.b32 b2, b2, 0x000000ff;
-            shr.u32 b3, $2, 24;
-
-            add.u32 h0, b0, 71;
-            add.u32 h1, b1, 71;
-            add.u32 h2, b2, 71;
-            add.u32 h3, b3, 71;
-            shl.b32 h0, h0, 7;
-            shl.b32 h1, h1, 7;
-            shl.b32 h2, h2, 7;
-            shl.b32 h3, h3, 7;
-
-            shl.b32 t0, h2, 16;
-            or.b32 $0, h0, t0;
-            shl.b32 t1, h3, 16;
-            or.b32 $1, h1, t1;
+            .reg .u32 lo, hi;
+            prmt.b32 lo, $2, 0, 0x4240;
+            prmt.b32 hi, $2, 0, 0x4341;
+            add.u32 lo, lo, 0x00470047;
+            add.u32 hi, hi, 0x00470047;
+            shl.b32 $0, lo, 7;
+            shl.b32 $1, hi, 7;
         }
         """,
         "=r,=r,r",

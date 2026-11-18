@@ -114,6 +114,7 @@ def _compile_w4a16_small_m_direct(
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
     w13_layout: str = "w13",
+    compile_time_phase: int = 0,
 ) -> _W4A16SmallMDirectLaunch:
     if topk_ids_dtype not in (torch.int32, torch.int64):
         raise TypeError("small-M W4A16 direct path requires int32/int64 topk_ids")
@@ -141,6 +142,7 @@ def _compile_w4a16_small_m_direct(
         swiglu_alpha,
         swiglu_beta,
         w13_layout,
+        int(compile_time_phase),
     )
     cached = _SMALL_M_DIRECT_CACHE.get(cache_key)
     if cached is not None:
@@ -158,6 +160,7 @@ def _compile_w4a16_small_m_direct(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         w13_layout=w13_layout,
+        compile_time_phase=compile_time_phase,
     )
     kernel.configure(
         int(m),
@@ -218,6 +221,7 @@ def _compile_w4a16_small_m_direct(
             ("swiglu_alpha", swiglu_alpha),
             ("swiglu_beta", swiglu_beta),
             ("w13_layout", w13_layout),
+            ("compile_time_phase", int(compile_time_phase)),
             ("grid_x", int(kernel.grid_x)),
         ),
     )

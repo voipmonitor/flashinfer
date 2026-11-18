@@ -108,7 +108,7 @@ def _thaw_value(value: object) -> object:
 
 def _restore_frozen_mapping(items):
     mapping = object.__new__(FrozenMapping)
-    object.__setattr__(mapping, "_items", items)
+    object.__setattr__(mapping, "_data", items if type(items) is dict else dict(items))
     return mapping
 
 
@@ -120,40 +120,36 @@ def _item_key(item):
 class FrozenMapping(Mapping[str, object]):
     """A recursively immutable, hashable mapping for preparation metadata."""
 
-    _items: tuple[tuple[str, object], ...]
+    _data: dict[str, object]
 
     def __init__(self, values: Mapping[str, object] | None = None) -> None:
         if type(values) is FrozenMapping:
-            items = values._items
+            data = values._data
         elif values:
-            items = tuple(
+            data = dict(
                 sorted(
                     [(key, _freeze_value(value)) for key, value in values.items()],
                     key=_item_key,
                 )
             )
         else:
-            items = ()
-        object.__setattr__(self, "_items", items)
+            data = {}
+        object.__setattr__(self, "_data", data)
 
     def __hash__(self) -> int:
         # Payloads key per-candidate dictionaries; hashing nested tuples on
         # every lookup dominated preparation.
         cached = self.__dict__.get("_hash")
         if cached is None:
-            cached = hash(self._items)
+            cached = hash(tuple(self._data.items()))
             object.__setattr__(self, "_hash", cached)
         return cached
 
     def __reduce__(self):
-        return _restore_frozen_mapping, (self._items,)
+        return _restore_frozen_mapping, (self._data,)
 
     def __getitem__(self, key: str) -> object:
-        index = self.__dict__.get("_index")
-        if index is None:
-            index = dict(self._items)
-            object.__setattr__(self, "_index", index)
-        return index[key]
+        return self._data[key]
 
     def __contains__(self, key: object) -> bool:
         try:
@@ -163,13 +159,13 @@ class FrozenMapping(Mapping[str, object]):
         return True
 
     def __iter__(self) -> Iterator[str]:
-        return (key for key, _ in self._items)
+        return iter(self._data)
 
     def __len__(self) -> int:
-        return len(self._items)
+        return len(self._data)
 
     def to_dict(self) -> dict[str, object]:
-        return {key: _thaw_value(value) for key, value in self._items}
+        return {key: _thaw_value(value) for key, value in self._data.items()}
 
 
 @dataclass(frozen=True)

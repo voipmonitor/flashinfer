@@ -38,7 +38,8 @@ def make_swizzle_indices(
     return idx_5d.permute(0, 3, 2, 1, 4).contiguous().reshape(-1)
 
 
-def swizzle_block_scale(scale: torch.Tensor) -> torch.Tensor:
+def swizzle_block_scale(scale: torch.Tensor, *, allocate=None) -> torch.Tensor:
+    """Swizzle scales, optionally allocating the returned storage through ``allocate``."""
     if scale.ndim == 2:
         scale = scale.unsqueeze(0)
         squeeze_batch = True
@@ -56,9 +57,18 @@ def swizzle_block_scale(scale: torch.Tensor) -> torch.Tensor:
     )
     padded[:, :rows, :cols] = scale
     swizzled = padded.reshape(batch, rows_padded // 128, 4, 32, cols_padded // 4, 4)
-    swizzled = swizzled.permute(0, 1, 4, 3, 2, 5).contiguous()
-    swizzled = swizzled.reshape(batch, rows_padded, cols_padded)
-    return swizzled[0] if squeeze_batch else swizzled
+    swizzled = swizzled.permute(0, 1, 4, 3, 2, 5)
+    if allocate is None:
+        swizzled = swizzled.contiguous().reshape(batch, rows_padded, cols_padded)
+        return swizzled[0] if squeeze_batch else swizzled
+    shape = (
+        (rows_padded, cols_padded)
+        if squeeze_batch
+        else (batch, rows_padded, cols_padded)
+    )
+    result = allocate(shape, dtype=scale.dtype, device=scale.device)
+    result.view(batch, rows_padded // 128, cols_padded // 4, 32, 4, 4).copy_(swizzled)
+    return result
 
 
 def validate_e8m0_scale_grid(

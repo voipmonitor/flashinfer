@@ -23,6 +23,7 @@ PAGE_SIZES = (64, 128)
 MAX_Q_PER_REQ = 16
 MAX_SPLITS = 128
 DESCALE_LAYOUTS = ("tensor", "request", "head")
+SINK_LAYOUTS = ("head", "row")
 
 
 def _consumer_warps(query):
@@ -46,6 +47,10 @@ class PagedDecodeQuery:
     has_sinks: bool
     descale_layout: str
     sm_count: int
+    caller_owned_placeholders: bool = False
+    has_relative_bias: bool = False
+    sink_layout: str = "head"
+    tail_pages_per_request: int = 0
     autotune_effort: str = field(default_factory=capture_autotune_effort)
 
     @property
@@ -100,8 +105,25 @@ def validate_query(query: PagedDecodeQuery) -> None:
         raise ValueError(f"max_q_per_req must be in [1, {MAX_Q_PER_REQ}]")
     if query.max_batch <= 0 or query.sm_count <= 0:
         raise ValueError("max_batch and sm_count must be positive")
+    if (
+        type(query.tail_pages_per_request) is not int
+        or query.tail_pages_per_request < 0
+    ):
+        raise ValueError("tail_pages_per_request must be a nonnegative integer")
+    if (
+        query.tail_pages_per_request
+        and query.tail_pages_per_request * query.page_size
+        < query.page_size - 1 + query.max_q_per_req
+    ):
+        raise ValueError(
+            "private tail pages must cover a partial page and every query row"
+        )
     if query.window_left < -1:
         raise ValueError("window_left must be -1 (none) or nonnegative")
+    if query.sink_layout not in SINK_LAYOUTS:
+        raise ValueError(f"sink_layout must be one of {SINK_LAYOUTS}")
+    if query.sink_layout == "row" and not query.has_sinks:
+        raise ValueError("a per-row sink layout requires has_sinks")
     if query.descale_layout not in DESCALE_LAYOUTS:
         raise ValueError(f"descale_layout must be one of {DESCALE_LAYOUTS}")
     if not any(_rows_fit(query, hs) for hs in _head_split_choices(query)):
@@ -233,7 +255,7 @@ def _materialize(query, device, choice):
 
 TUNING = TuningContract(
     component_id="attention.paged_decode",
-    query_schema_version=23,
+    query_schema_version=26,
     config_schema_version=22,
     query_fields=frozenset(field.name for field in fields(PagedDecodeQuery)),
     config_fields=frozenset(field.name for field in fields(PagedDecodeConfig)),

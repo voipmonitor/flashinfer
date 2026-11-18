@@ -38,3 +38,25 @@ def test_nvfp4_gate_rejects_nonfinite_output(invalid):
     metrics = compare_to_reference(torch.tensor([[1.0, invalid]]), torch.ones((1, 2)))
     failures = check_oracle_metrics("test", metrics, 1)
     assert len(failures) == 1 and "non-finite metrics" in failures[0]
+
+
+@pytest.mark.parametrize(
+    "tiles", ["[128,64,64,128]", "[128,64,64]", "[128,64,64,128.0]"]
+)
+def test_json_tile_override_preserves_native_validation(tiles):
+    from benchmarks.experimental.b12x.benchmark_moe import parse_moe_config
+    from b12x.moe.fused_moe._tuning import MoeDecodeConfig
+    from b12x.preparation import FrozenMapping
+
+    config = MoeDecodeConfig(
+        **parse_moe_config(
+            '{"backend":"w4a16","route_planner":"internal",'
+            '"max_active_clusters":null,"w4a16_tile_config":' + tiles + "}"
+        )
+    )
+    if tiles == "[128,64,64,128]":
+        assert config.w4a16_tile_config == (128, 64, 64, 128)
+        assert MoeDecodeConfig.from_config(FrozenMapping(config.to_dict())) == config
+    else:
+        with pytest.raises(TypeError, match="FC1 K/N and FC2 K/N integers"):
+            MoeDecodeConfig.from_config(FrozenMapping(config.to_dict()))

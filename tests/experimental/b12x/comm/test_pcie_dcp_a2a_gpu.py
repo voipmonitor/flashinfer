@@ -1004,6 +1004,169 @@ def _worker(
         dist.destroy_process_group()
 
 
+def _check_candidate_gather_geometry(channel, session, rank, threads, block_limit):
+    device = channel.device
+    stream = torch.cuda.current_stream(device)
+    local_input = torch.zeros(128, 1, 8192, dtype=torch.bfloat16, device=device)
+    gathered = torch.empty(128, 16, 8192, dtype=torch.bfloat16, device=device)
+    call = dict(
+        local_input=local_input,
+        out=gathered,
+        threads=threads,
+        block_limit=block_limit,
+    )
+    query = preparation.query_from_runtime(
+        channel, surface="DcpAllToAll.all_gather_heads", call=call
+    )
+    assert query.call["threads"] == threads
+    assert query.call["block_limit"] == block_limit
+    plan = preparation.plan(query, runtime=channel)
+    name = f"candidate-gather-{threads}-{block_limit}"
+    session.prepare(
+        (
+            plan.request(
+                name=name,
+                collective=CollectiveRequirement(key=name, ranks=tuple(range(16))),
+                prepare_call=lambda state: preparation.prepare_call(state, **call),
+            ),
+        ),
+        coordinator=lambda state: (
+            state.ready_collectives[0].key if state.ready_collectives else None
+        ),
+    )
+    graphs = {}
+    for batch in (64, 128):
+        channel.all_gather_heads(local_input[:batch], gathered[:batch], plan=plan)
+        stream.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph, stream=stream):
+            channel.all_gather_heads(local_input[:batch], gathered[:batch], plan=plan)
+        graphs[batch] = graph
+    stream.synchronize()
+
+    # A single transport node must advance its staging slot on every replay.
+    for value in (11, 12):
+        local_input.fill_(value)
+        channel.all_gather_heads(local_input, gathered, plan=plan)
+    stream.synchronize()
+    dist.barrier()
+    snapshots = [_local_staging_words(channel, stream)]
+    dist.barrier()
+    for value in (1, 2):
+        local_input.fill_(value)
+        graphs[64].replay()
+        snapshots.append(_local_staging_words(channel, stream))
+        dist.barrier()
+        torch.testing.assert_close(
+            gathered[:64], torch.full_like(gathered[:64], value), rtol=0, atol=0
+        )
+    changed_slots = [
+        {
+            slot
+            for slot, (before, after) in enumerate(zip(left, right, strict=True))
+            if before != after
+        }
+        for left, right in zip(snapshots[:-1], snapshots[1:], strict=True)
+    ]
+    assert all(len(changed) == 1 for changed in changed_slots)
+    assert changed_slots[0] != changed_slots[1]
+
+    batches = (64, 64, 128, 128, 64, 128)
+    payloads = [
+        _rank_query(step + 5000, rank, 16, batch, torch.bfloat16, device)
+        for step, batch in enumerate(batches)
+    ]
+    outputs = [torch.empty_like(gathered[:batch]) for batch in batches]
+    stream.synchronize()
+    dist.barrier()
+    for index, (batch, payload, output) in enumerate(
+        zip(batches, payloads, outputs, strict=True)
+    ):
+        local_input[:batch].copy_(payload)
+        graphs[batch].replay()
+        output.copy_(gathered[:batch])
+        if index == 0 and rank == 0:
+            time.sleep(0.02)
+    stream.synchronize()
+    dist.barrier()
+    for step, (batch, output) in enumerate(zip(batches, outputs, strict=True)):
+        expected = torch.cat(
+            [
+                _rank_query(step + 5000, source, 16, batch, torch.bfloat16, device)
+                for source in range(16)
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+def _candidate_gather_worker(rank, world_size, port):
+    global TOTAL_HEADS, QUERY_HEAD_DIM
+    TOTAL_HEADS, QUERY_HEAD_DIM = 16, 8192
+    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    channel = PCIeDCPA2A.from_process_group(
+        process_group=dist.group.WORLD,
+        device=device,
+        max_batch_size=128,
+        total_heads=16,
+        head_dim=HEAD_DIM,
+        query_head_dim=8192,
+    )
+
+    def barrier(key, ranks):
+        assert tuple(ranks) == tuple(range(world_size))
+        dist.barrier(device_ids=[rank])
+
+    session = PreparationSession(
+        device=device, autotune=False, compile_workers=1, collective_barrier=barrier
+    )
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    try:
+        for threads in (128, 256, 512):
+            for block_limit in (8, 16, 32, 64):
+                if rank == 0:
+                    print(
+                        f"BF16 candidate gather TP16: {threads=} {block_limit=}",
+                        flush=True,
+                    )
+                with torch.cuda.stream(stream):
+                    _check_candidate_gather_geometry(
+                        channel, session, rank, threads, block_limit
+                    )
+                dist.barrier()
+    finally:
+        session.close()
+        channel.close()
+        dist.destroy_process_group()
+
+
+def test_pcie_dcp_a2a_tp16_bf16_candidate_gather_geometries():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    world_size = int(os.getenv("B12X_PCIE_DCP_A2A_WORLD_SIZE", "2"))
+    if world_size != 16:
+        pytest.skip("candidate gather geometry coverage requires TP16")
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(
+            f"need {world_size} CUDA devices, found {torch.cuda.device_count()}"
+        )
+    mp.spawn(
+        _candidate_gather_worker,
+        args=(world_size, _free_port()),
+        nprocs=world_size,
+        join=True,
+    )
+
+
 def _residency_rejection_worker(rank: int, world_size: int, port: int) -> None:
     if rank != 0:
         # Simulate one constrained/MIG-like rank in an otherwise full device

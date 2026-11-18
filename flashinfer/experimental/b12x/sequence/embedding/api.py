@@ -34,6 +34,23 @@ def _check_weight(weight):
         raise ValueError("embedding weight must have contiguous nonoverlapping rows")
 
 
+def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
+    if left.device != right.device or not left.numel() or not right.numel():
+        return False
+
+    def interval(tensor):
+        start = tensor.data_ptr()
+        span = 1 + sum(
+            (size - 1) * stride
+            for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+        )
+        return start, start + span * tensor.element_size()
+
+    left_start, left_end = interval(left)
+    right_start, right_end = interval(right)
+    return left_start < right_end and right_start < left_end
+
+
 def _check_tensors(
     weight: torch.Tensor,
     ids: torch.Tensor,
@@ -55,7 +72,7 @@ def _check_tensors(
         raise ValueError(
             "embedding requires contiguous output and an Int32 launch count"
         )
-    if torch._C._overlaps(out, weight) or torch._C._overlaps(out, ids):
+    if _overlaps(out, weight) or _overlaps(out, ids):
         raise ValueError("embedding output must not alias inputs")
     if num_rows is not None:
         if (
@@ -69,7 +86,7 @@ def _check_tensors(
             )
         if ids.numel() == 0:
             raise ValueError("device-count lookup requires positive output capacity")
-        if torch._C._overlaps(out, num_rows):
+        if _overlaps(out, num_rows):
             raise ValueError("embedding output must not alias num_rows")
 
 

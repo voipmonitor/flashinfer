@@ -316,8 +316,10 @@ def test_tuning_space_offers_micro_only_to_nondeterministic_queries(
         collect_activation_amax=False,
         deterministic_output=deterministic_output,
         swiglu_limit=10.0,
-        swiglu_alpha=1.702,
-        swiglu_beta=1.0,
+        # SiLU carries no alpha/beta (binding rejects them); tiny decode is
+        # not offered to queries that do.
+        swiglu_alpha=None,
+        swiglu_beta=None,
         w13_layout="w31",
         weight_layouts=("w31",),
         w4a16_weight_layout=None,
@@ -718,8 +720,10 @@ def test_heuristic_decode_config_keeps_deterministic_queries_off_micro(
         collect_activation_amax=False,
         deterministic_output=deterministic_output,
         swiglu_limit=10.0,
-        swiglu_alpha=1.702,
-        swiglu_beta=1.0,
+        # SiLU carries no alpha/beta (binding rejects them); tiny decode is
+        # not offered to queries that do.
+        swiglu_alpha=None,
+        swiglu_beta=None,
         w13_layout="w31",
         weight_layouts=("w31",),
         w4a16_weight_layout=None,

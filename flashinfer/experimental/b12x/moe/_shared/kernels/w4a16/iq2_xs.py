@@ -16,6 +16,7 @@ def pack_iq2_xs_matrix(
     swap_halves: bool = False,
     tile_descriptors: bool = False,
     tile_scales: bool = False,
+    allocate=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack raw IQ2 blocks into encoded payload and compact metadata planes.
 
@@ -48,15 +49,15 @@ def pack_iq2_xs_matrix(
         raise ValueError(
             "tiled IQ2_XS requires N and projection halves divisible by 64"
         )
-    words = torch.empty(
+    words = (torch.empty if allocate is None else allocate)(
         (e, n // 64, k16 // 8, 8, 4, 8, 2, words_per_row)
         if tile_descriptors
         else (e, k16, n // 16, 8, 2, words_per_row),
         dtype=torch.int32,
         device=blocks.device,
     )
-    metadata = torch.empty(
-        e * kb * n * spec.metadata_bytes, dtype=torch.uint8, device=blocks.device
+    metadata = (torch.empty if allocate is None else allocate)(
+        (e * kb * n * spec.metadata_bytes,), dtype=torch.uint8, device=blocks.device
     )
     base_bytes = e * kb * n * 2
     bases = metadata[:base_bytes].view(torch.float16).reshape(e, kb, n // 16, 8, 2)
@@ -131,6 +132,7 @@ def prepare_iq2_xs_moe_weights(
     activation: str,
     w13_layout: str,
     codec: str = "iq2_xs",
+    allocate=None,
 ) -> PreparedW4A16MoeWeights:
     """Prepare compact IQ2_XS storage and device tables before execution."""
     spec = block_codec(codec)
@@ -167,13 +169,16 @@ def prepare_iq2_xs_moe_weights(
         swap_halves=gated and w13_layout == "w13",
         tile_descriptors=True,
         tile_scales=True,
+        allocate=allocate,
     )
     q2, s2 = pack_iq2_xs_matrix(
-        w2, codec=codec, tile_descriptors=True, tile_scales=True
+        w2, codec=codec, tile_descriptors=True, tile_scales=True, allocate=allocate
     )
     if codec in IQ2_CODECS:
         iq2_xs_execution_lut(w13.device, prepare=True, selectors=True, codec=codec)
-    unit = torch.ones(num_experts, dtype=torch.float32, device=w13.device)
+    unit = (torch.empty if allocate is None else allocate)(
+        (num_experts,), dtype=torch.float32, device=w13.device
+    ).fill_(1)
     return PreparedW4A16MoeWeights(
         w13=q13,
         w13_scale=s13,

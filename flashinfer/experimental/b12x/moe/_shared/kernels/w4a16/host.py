@@ -316,8 +316,13 @@ def packed_gemm_scratch_elements(
     sms: int,
     weight_layout: str = "packed",
 ) -> int:
+    scratch_n = int(size_n)
+    if weight_layout == "modelopt":
+        # Native partials include masked columns; M8 also admits the N512 FC2 tile.
+        max_tile_n = 512 if int(moe_block_size) == 8 else 256
+        scratch_n = ((scratch_n + max_tile_n - 1) // max_tile_n) * max_tile_n
     elements = min(
-        int(size_n) * int(route_slots),
+        scratch_n * int(route_slots),
         int(sms) * 4 * int(moe_block_size) * 256,
     )
     if moe_block_size == 8:

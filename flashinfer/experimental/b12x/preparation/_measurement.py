@@ -324,6 +324,7 @@ class PreparedRace:
 class RaceMeasurements:
     latencies_us: tuple[float, ...]
     overlapped_samples: int
+    scoring_start_round: int = 0
 
 
 def _l2_flush_fn(device: object, *, enabled: bool):
@@ -444,14 +445,17 @@ def measure_race_steps(
 ):
     """Balanced comparison; cancellation discards this generator's result.
 
-    A selection race sets ``eliminate``: a timer whose best round so far trails
-    the leader by more than ELIMINATION_MARGIN stops being re-timed and keeps the
-    median of the rounds it completed, survivors run at most SURVIVOR_ROUNDS
-    rounds, and ``champion`` exempts timer 0, which carries the previous batch's
-    winner. Left unset, every timer completes every round.
+    With ``eliminate`` and more than three requested rounds, candidates outside
+    the leader margin stop being timed during a three-round screen. A minimum
+    score with fewer scored rounds than its peers triggers one fresh confirmation
+    of the entire batch without elimination, within the remaining round budget.
+    Confirmation replaces screening scores. ``champion`` exempts timer 0 from
+    screening elimination. Smaller budgets and races without elimination time
+    every timer in every round.
     """
     if type(rounds) is not int or rounds <= 0:
         raise ValueError("race rounds must be positive")
+    requested_rounds = rounds
     if adaptive_collective_pair:
         if len(prepared.timers) != 2 or sample_exchange is None:
             raise ValueError(
@@ -460,6 +464,7 @@ def measure_race_steps(
         rounds = min(rounds, COLLECTIVE_MAX_ROUNDS)
         eliminate = False
     elif eliminate:
+        eliminate = rounds > SURVIVOR_ROUNDS
         rounds = min(rounds, SURVIVOR_ROUNDS)
     prepared.planned_rounds = rounds
     prepared.active_count = len(prepared.timers)
@@ -469,11 +474,14 @@ def measure_race_steps(
     active = list(range(len(prepared.timers)))
     overlaps = 0
     repeats = [1] * len(prepared.timers)
-    for turn in range(rounds):
+    scoring_start_round = 0
+    turn = 0
+    while turn < prepared.planned_rounds:
+        phase_turn = turn - scoring_start_round
         order = list(active)
-        if turn % 2:
+        if phase_turn % 2:
             order.reverse()
-        offset = (turn // 2) % len(order)
+        offset = (phase_turn // 2) % len(order)
         order = order[offset:] + order[:offset]
         totals = [0.0] * len(prepared.timers)
         repetition = 0
@@ -532,7 +540,7 @@ def measure_race_steps(
                     if not math.isfinite(latency) or latency <= 0:
                         raise RuntimeError("candidate race produced an invalid latency")
                     totals[index] += latency
-                    if adaptive_repeats and turn == 0 and repetition == 0:
+                    if adaptive_repeats and phase_turn == 0 and repetition == 0:
                         # The first scored replay also sizes the remaining work.
                         repeats[index] = max(
                             1,
@@ -572,10 +580,26 @@ def measure_race_steps(
                 or (champion and index == 0)
             ]
             prepared.active_count = len(active)
+        turn += 1
+        if eliminate and turn == prepared.planned_rounds:
+            scores = [statistics.median(series) for series in values]
+            minimum = min(scores)
+            most_rounds = max(len(series) for series in values)
+            if any(
+                score == minimum and len(series) < most_rounds
+                for score, series in zip(scores, values, strict=True)
+            ):
+                scoring_start_round = turn
+                prepared.planned_rounds += min(SURVIVOR_ROUNDS, requested_rounds - turn)
+                values = [[] for _ in prepared.timers]
+                active = list(range(len(prepared.timers)))
+                repeats = [1] * len(prepared.timers)
+                prepared.active_count = len(active)
+                eliminate = False
     latencies = tuple(statistics.median(series) for series in values)
     if any(not math.isfinite(value) or value <= 0 for value in latencies):
         raise RuntimeError("candidate race produced an invalid latency")
-    return RaceMeasurements(latencies, overlaps)
+    return RaceMeasurements(latencies, overlaps, scoring_start_round)
 
 
 def _consume(steps):

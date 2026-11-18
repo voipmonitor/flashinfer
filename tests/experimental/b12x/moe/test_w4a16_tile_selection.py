@@ -190,3 +190,35 @@ def test_small_m_occupancy_rejects_other_values(monkeypatch) -> None:
     monkeypatch.setenv("B12X_W4A16_SMALL_M_OCCUPANCY", "3")
     with pytest.raises(ValueError, match="must be 1 or 2"):
         _small_m_residency("e4m3_k16")
+
+
+def test_fc1_pipeline_override_preserves_fc2_and_compile_identity():
+    from b12x.moe._shared.kernels.w4a16.kernel.fused import W4A16FusedMoeKernel
+
+    geometry = dict(
+        size_m=8,
+        hidden_size=3584,
+        intermediate_size=192,
+        num_experts=896,
+        top_k=16,
+        activation="situ",
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        fc1_tile_n=64,
+        fc1_tile_k=128,
+        fc2_tile_n=128,
+        fc2_tile_k=64,
+        moe_block_size=16,
+        max_m_blocks=128,
+        weight_layout="modelopt",
+        scale_format="e8m0_k32",
+        w13_layout="w31",
+        pipeline_stages=3,
+    )
+    common = W4A16FusedMoeKernel(**geometry)
+    independent = W4A16FusedMoeKernel(**geometry, fc1_pipeline_stages=2)
+    assert common.fc1.stages == common.fc2.stages == 3
+    assert independent.fc1.stages == 2
+    assert independent.fc2.__cache_key__ == common.fc2.__cache_key__
+    assert independent.__cache_key__ != common.__cache_key__
+    assert independent.shared_words < common.shared_words

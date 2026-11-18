@@ -387,7 +387,7 @@ def test_collective_samples_control_repetitions_and_elimination(
 
         prepared = _race(timers)
         steps = measure_race_steps(
-            prepared, device_ordinal=0, rounds=3, eliminate=True, sample_exchange=reduce
+            prepared, device_ordinal=0, rounds=7, eliminate=True, sample_exchange=reduce
         )
         while True:
             try:
@@ -399,6 +399,34 @@ def test_collective_samples_control_repetitions_and_elimination(
         counts.append(tuple(timer.replays for timer in timers))
     assert schedules[0] == schedules[1]
     assert counts[0] == counts[1] == (8, 48)
+
+
+@pytest.mark.parametrize("rounds", (1, 2, 3))
+def test_collective_low_round_budgets_keep_equal_coverage(host_timing, rounds):
+    from b12x.preparation import _measurement
+
+    timers = (_Timer(8.0), _Timer(4.0))
+    observed = []
+
+    def exchange(indices, turn, repetition, samples):
+        observed.append((indices, turn))
+        yield "exchange"
+        return samples
+
+    result = _measurement._consume(
+        measure_race_steps(
+            _race(timers),
+            device_ordinal=0,
+            rounds=rounds,
+            eliminate=True,
+            sample_exchange=exchange,
+        )
+    )
+
+    assert result.latencies_us == (8.0, 4.0)
+    assert tuple(timer.replays for timer in timers) == (rounds, rounds)
+    assert {turn for _, turn in observed} == set(range(rounds))
+    assert all(set(indices) == {0, 1} for indices, _ in observed)
 
 
 def _adaptive_measure(timers, sample_exchange=None, *, rounds=15):

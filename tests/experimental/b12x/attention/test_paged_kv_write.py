@@ -165,3 +165,59 @@ def test_writer_rejects_invalid_metadata_and_overlapping_cache_rows():
         with pytest.raises(ValueError, match="fewer rows"):
             paged_kv_write.run(plan, **(args | {"key": rows[:1]}))
         paged_kv_write.run(plan, **(args | {"slot_mapping": slots[:0]}))
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_caller_owned_placeholder_binding(monkeypatch, fp8):
+    from contextlib import nullcontext
+    from b12x.attention.paged_kv_write import _preparation
+
+    query = PagedKVWriteQuery(
+        num_kv_heads=1,
+        head_dim_k=16,
+        head_dim_v=16,
+        page_size=64,
+        kv_dtype="float8_e4m3fn" if fp8 else "bfloat16",
+        caller_owned_placeholders=True,
+    )
+    state = _preparation.PreparedPagedKVWrite(
+        query, torch.device("cpu"), object(), None
+    )
+    seen = []
+
+    class Operand:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+        def mark_layout_dynamic(self, **kwargs):
+            return self
+
+    monkeypatch.setattr(
+        _preparation, "from_dlpack", lambda tensor, **kwargs: Operand(tensor)
+    )
+    monkeypatch.setattr(
+        _preparation, "run_compiled", lambda program, args: seen.append(args)
+    )
+    monkeypatch.setattr(_preparation, "current_cuda_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    key = torch.zeros((2, 1, 16), dtype=torch.bfloat16)
+    cache = torch.zeros((1, 64, 1, 16), dtype=dtype)
+    slots = torch.tensor([0, 1], dtype=torch.int64)
+    first, second = torch.ones(1), torch.ones(1)
+    args = dict(key=key, value=key, k_cache=cache, v_cache=cache, slot_mapping=slots)
+    if fp8:
+        state.run(**args, k_scale=first, v_scale=second)
+        assert seen[-1][5].tensor.data_ptr() == first.data_ptr()
+        assert seen[-1][6].tensor.data_ptr() == second.data_ptr()
+    else:
+        with pytest.raises(ValueError, match="requires one float32 placeholder"):
+            state.run(**args)
+        state.run(**args, dummy_scale=first)
+        assert seen[-1][5].tensor.data_ptr() == first.data_ptr()
+        assert seen[-1][6].tensor.data_ptr() == first.data_ptr()
+        legacy = _preparation.PreparedPagedKVWrite(
+            query, torch.device("cpu"), object(), second
+        )
+        legacy.run(**args)
+        assert seen[-1][5].tensor.data_ptr() == second.data_ptr()

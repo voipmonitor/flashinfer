@@ -760,9 +760,9 @@ class CompactBlockStoragePlane:
                 offsets = byte_perm(offsets, offsets >> Uint32(4), Int32(0x5140))
                 offsets &= Uint32(0x0F0F0F0F)
             else:
-                offsets &= Uint32(15)
-                offsets = (offsets | (offsets << Uint32(14))) & Uint32(0x00030003)
-                offsets = (offsets | (offsets << Uint32(7))) & Uint32(0x01010101)
+                offsets = ((offsets & Uint32(15)) * Uint32(0x00204081)) & Uint32(
+                    0x01010101
+                )
             base = byte_perm(base_word, base_word, Int32(quarter * 0x1111))
             values[quarter] = base + offsets
         return values
@@ -915,13 +915,9 @@ class CompactBlockStoragePlane:
                             0x0F0F0F0F
                         )
                     else:
-                        offsets &= Uint32(15)
-                        offsets = (offsets | (offsets << Uint32(14))) & Uint32(
-                            0x00030003
-                        )
-                        offsets = (offsets | (offsets << Uint32(7))) & Uint32(
-                            0x01010101
-                        )
+                        offsets = (
+                            (offsets & Uint32(15)) * Uint32(0x00204081)
+                        ) & Uint32(0x01010101)
                     value = base * Uint32(0x01010101) + offsets
                 else:
                     for column in cutlass.range_constexpr(4):
@@ -1024,9 +1020,9 @@ class CompactBlockStoragePlane:
                         offset = (offset | (offset << Uint32(8))) & Uint32(0x00FF00FF)
                         offset = (offset | (offset << Uint32(4))) & Uint32(0x0F0F0F0F)
                     else:
-                        offset &= Uint32(15)
-                        offset = (offset | (offset << Uint32(14))) & Uint32(0x00030003)
-                        offset = (offset | (offset << Uint32(7))) & Uint32(0x01010101)
+                        offset = ((offset & Uint32(15)) * Uint32(0x00204081)) & Uint32(
+                            0x01010101
+                        )
                     index = lane * Int32(16) + Int32(quarter * 4)
                     base = Uint32(0)
                     if cutlass.const_expr(self.destination == 1):
@@ -1247,8 +1243,11 @@ class CompactBlockStoragePlane:
         cute.make_tensor(target + destination, cute.make_layout(1))[0] = value
 
     @cute.jit
-    def patch_group_records(self, storage, group, lane, target, first, end):
-        value_offset = self.group_value_offset(storage)
+    def patch_group_records(
+        self, storage, group, lane, target, first, end, value_offset=None
+    ):
+        if cutlass.const_expr(value_offset is None):
+            value_offset = self.group_value_offset(storage)
         entry = first + lane.to(Uint32)
         while entry < end:
             position, value = self.load_group_record(storage, entry, value_offset)
@@ -1264,16 +1263,18 @@ class CompactBlockStoragePlane:
             self.patch_group_records(storage, group, lane, target, first, end)
 
     @cute.jit
-    def decode_prefetched_group(self, storage, output, expert, task, tid):
-        smem = cutlass.utils.SmemAllocator()
-        shared = smem.allocate_tensor(
-            cutlass.Uint32, cute.make_layout(self.warps * 128), byte_alignment=16
-        )
+    def decode_prefetched_group(self, storage, output, expert, task, tid, shared=None):
+        if cutlass.const_expr(shared is None):
+            smem = cutlass.utils.SmemAllocator()
+            shared = smem.allocate_tensor(
+                cutlass.Uint32, cute.make_layout(self.warps * 128), byte_alignment=16
+            )
         warp, lane = tid // Int32(32), tid % Int32(32)
         group = task * Int32(self.groups_per_task) + warp
         if warp < Int32(self.warps) and group < Int32(self.groups):
             first, end = Uint32(0), Uint32(0)
             source_group = Int32(0)
+            value_offset = Int64(0)
             position, value = Int32(0), cutlass.Uint8(0)
             values = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Uint32)
             values.fill(Uint32(0))
@@ -1301,7 +1302,13 @@ class CompactBlockStoragePlane:
             if first + lane.to(Uint32) < end:
                 self.write_group_record(source_group, target, position, value)
             self.patch_group_records(
-                storage, source_group, lane, target, first + Uint32(32), end
+                storage,
+                source_group,
+                lane,
+                target,
+                first + Uint32(32),
+                end,
+                value_offset,
             )
             cute.arch.sync_warp()
             v0, v1, v2, v3 = ld_shared_v4_u32(address)
@@ -1316,7 +1323,7 @@ class CompactBlockStoragePlane:
             )
 
     @cute.jit
-    def decode(self, tensors, expert, task, tid):
+    def decode(self, tensors, expert, task, tid, shared=None):
         if cutlass.const_expr(
             self.shared_exceptions
             and self.group_record_bytes != 0
@@ -1327,14 +1334,14 @@ class CompactBlockStoragePlane:
                 or self.storage.columns % 4
             )
         ):
-            self.decode_prefetched_group(*tensors, expert, task, tid)
+            self.decode_prefetched_group(*tensors, expert, task, tid, shared)
         else:
-            self.decode_staged(tensors, expert, task, tid)
+            self.decode_staged(tensors, expert, task, tid, shared)
 
     @cute.jit
-    def decode_staged(self, tensors, expert, task, tid):
+    def decode_staged(self, tensors, expert, task, tid, shared=None):
         storage, output = tensors
-        if cutlass.const_expr(self.shared_exceptions):
+        if cutlass.const_expr(self.shared_exceptions and shared is None):
             smem = cutlass.utils.SmemAllocator()
             shared = smem.allocate_tensor(
                 cutlass.Uint32,

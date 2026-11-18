@@ -52,6 +52,7 @@ def invocation_from_tensors(
         out=out,
     )
     alignments = {name: _alignment(value) for name, value in values.items()}
+    alignments.update(num_seqs=4, num_tokens=4)
     if scratch is not None:
         if isinstance(scratch, Mapping):
             scratch = scratch["ple_hash"]
@@ -148,8 +149,16 @@ class _HashState:
         ):
             if tensor.device != self.layout.caps.device:
                 raise ValueError(f"PLE hash {name} device differs from preparation")
-            if tensor.numel() and _alignment(tensor) != alignment:
-                raise ValueError(f"PLE hash {name} alignment differs from preparation")
+            if tensor.numel():
+                actual = _alignment(tensor)
+                if (
+                    actual < alignment
+                    if name in ("num_seqs", "num_tokens")
+                    else actual != alignment
+                ):
+                    raise ValueError(
+                        f"PLE hash {name} alignment differs from preparation"
+                    )
 
     def bind(self, **kwargs):
         binding = _bind(self.layout, _geometry=self.geometry, **kwargs)
@@ -218,7 +227,9 @@ class _HashState:
 
 
 def query_from_geometry(caps, inputs, invocation):
-    alignments = list(invocation.get("input_alignments", (16,) * len(OPERANDS)))
+    alignments = list(
+        invocation.get("input_alignments", (16, 16, 16, 4, 4, 16, 16, 16, 16, 16))
+    )
     if len(alignments) != len(OPERANDS):
         raise ValueError("invalid PLE hash alignment coordinates")
     for index, source in zip((6, 7, 5), inputs.sources):

@@ -92,7 +92,16 @@ class PreparedPagedKVWrite:
     dummy_scale: torch.Tensor
 
     def run(
-        self, *, key, value, k_cache, v_cache, slot_mapping, k_scale=None, v_scale=None
+        self,
+        *,
+        key,
+        value,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        k_scale=None,
+        v_scale=None,
+        dummy_scale=None,
     ):
         q = self.query
         fp8 = q.kv_dtype == "float8_e4m3fn"
@@ -142,7 +151,12 @@ class PreparedPagedKVWrite:
             tensors["k_cache"] = k_cache.view(torch.uint8)
             tensors["v_cache"] = v_cache.view(torch.uint8)
         else:
-            tensors["k_scale"] = tensors["v_scale"] = self.dummy_scale
+            unused = self.dummy_scale if dummy_scale is None else dummy_scale
+            if unused is None or unused.dtype != torch.float32 or unused.numel() != 1:
+                raise ValueError("BF16 cache write requires one float32 placeholder")
+            unused = unused.reshape(1)
+            _check_layout("dummy_scale", unused, device=self.device, rank=1, align=4)
+            tensors["k_scale"] = tensors["v_scale"] = unused
         if not tokens:
             return
         args = []
@@ -170,6 +184,7 @@ def make_plan(caps, *, invocation=None, override=None):
         head_dim_v=caps.head_dim_v,
         page_size=caps.page_size,
         kv_dtype=str(caps.kv_dtype).removeprefix("torch."),
+        caller_owned_placeholders=bool(caps.caller_owned_placeholders),
     )
     device = torch.device(caps.device)
     if device.type == "cuda" and device.index is None:
@@ -193,7 +208,9 @@ def make_plan(caps, *, invocation=None, override=None):
                 query,
                 device,
                 program,
-                torch.ones(1, dtype=torch.float32, device=device),
+                None
+                if query.caller_owned_placeholders
+                else torch.ones(1, dtype=torch.float32, device=device),
             ),
             program,
         )

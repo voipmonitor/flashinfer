@@ -171,6 +171,117 @@ def test_spark_compiler_budget_preserves_explicit_overrides(monkeypatch):
         assert engine.compile_workers == 6
 
 
+@pytest.mark.parametrize("autotune", [False, True])
+def test_selected_configs_replace_shared_scratch_and_preserve_handles(
+    tmp_path, autotune
+):
+    closed = []
+    tuning = contract(values=(2,))
+
+    def item(name):
+        plan = replace(
+            declaration(tuning=tuning, shared=True),
+            _memory_requirements=lambda config, device: MemoryRequirements(
+                scratch=(
+                    ScratchBufferSpec(
+                        name="workspace",
+                        shape=(config.width,),
+                        dtype=torch.uint8,
+                        device=torch.device("cpu"),
+                    ),
+                )
+            ),
+        )
+        return plan.request(
+            name=name,
+            prepare_call=lambda state: PreparedCall(
+                run=lambda: state.value, close=lambda: closed.append(state.value)
+            ),
+        )
+
+    first, alias, private = item("first"), item("alias"), request(name="private")
+    private = replace(private, plan=replace(private.plan, query=Query(4)))
+    handles = first.plan.handle, alias.plan.handle, private.plan.handle
+    with session(tmp_path) as engine:
+        engine.prepare((first, alias, private))
+        private_payload = private.plan.prepared
+        assert first.plan.prepared is alias.plan.prepared
+        assert first.plan.scratch_specs()[0].shape == (2,)
+        shared_payload = first.plan.prepared
+        engine.prepare(
+            (first, alias, private),
+            autotune=autotune,
+            selected_configs={first.plan: Config(2)},
+        )
+        assert first.plan.prepared is shared_payload
+        assert first.plan.selection.source == "fixed"
+        result = engine.prepare(
+            (first, alias, private),
+            autotune=autotune,
+            selected_configs={alias.plan: Config(3)},
+        )
+        assert first.plan.prepared is alias.plan.prepared
+        assert first.plan.scratch_specs()[0].shape == (3,)
+        assert require_prepared(first.plan, "test.arithmetic").value == 9
+        assert first.plan.selection.source == "override"
+        assert first.plan.override is alias.plan.override is None
+        assert private.plan.prepared is private_payload
+        assert (first.plan.handle, alias.plan.handle, private.plan.handle) == handles
+        assert result.benchmarked_candidates == 0
+        assert closed == [6]
+    assert closed == [6, 9]
+
+
+def test_selected_child_config_rebuilds_composite_state(tmp_path):
+    children = {count: replace(declaration(), query=Query(count)) for count in (1, 2)}
+    composite = _CompositePlan(
+        component_id="test.arithmetic",
+        capacity_metadata={},
+        variants=children,
+        _assemble=lambda states, device: dict(states),
+    )
+    req = composite.request(
+        name="composite",
+        prepare_calls={
+            count: lambda state: PreparedCall(run=lambda: state.value)
+            for count in children
+        },
+    )
+    handle = composite.handle
+    with session(tmp_path) as engine:
+        engine.prepare((req,))
+        original = composite.prepared
+        unchanged = children[2].prepared
+        engine.prepare((req,), selected_configs={children[1]: Config(3)})
+        assert composite.handle == handle
+        assert composite.prepared is not original and original.closed
+        assert composite.prepared.state[1].value == 9
+        assert composite.prepared.state[2] is unchanged.state
+        assert children[2].prepared is unchanged
+        assert composite.prepared.variants[1] is children[1]
+
+
+@pytest.mark.parametrize("invalid", ["invalid", "pinned", "unknown", "conflicting"])
+def test_selected_configs_reject_invalid_choices_before_replacing_payloads(
+    tmp_path, invalid
+):
+    first = request(name="first", pin=Config(2) if invalid == "pinned" else None)
+    second = replace(first, name="second", plan=replace(first.plan))
+    with session(tmp_path) as engine:
+        engine.prepare((first, second))
+        original = first.plan.prepared, second.plan.prepared
+        choices = {first.plan: Config(-1 if invalid == "invalid" else 3)}
+        if invalid == "unknown":
+            choices = {declaration(): Config(3)}
+        elif invalid == "conflicting":
+            choices[second.plan] = Config(4)
+        with pytest.raises(ValueError):
+            engine.begin((first, second), selected_configs=choices)
+        assert (first.plan.prepared, second.plan.prepared) == original
+        assert not any(payload.closed for payload in original)
+        assert engine._job is None
+
+
 def declaration(*, tuning=None, pin=None, shared=False):
     """Build a minimal arithmetic plan for preparation state-machine tests."""
     tuning = contract(values=(2,)) if tuning is None else tuning

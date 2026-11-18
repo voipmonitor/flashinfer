@@ -36,7 +36,7 @@ IQ2XSLinearWeight = BlockQuantLinearWeight
 
 
 def pack_iq2_xs_weight(
-    blocks: torch.Tensor, *, codec: str = "iq2_xs"
+    blocks: torch.Tensor, *, codec: str = "iq2_xs", allocate=None
 ) -> BlockQuantLinearWeight:
     """Retile raw blocks without expanding their packed numeric encoding."""
     from ._a16 import _check_tensor
@@ -62,12 +62,27 @@ def pack_iq2_xs_weight(
     bases = blocks[..., :2].contiguous()
     if not torch.isfinite(bases.view(torch.float16)).all().item():
         raise ValueError("IQ2_XS block bases must be finite")
+    return _retile_dense_blocks(blocks, bases, spec, codec=codec, allocate=allocate)
+
+
+def _retile_dense_blocks(blocks, bases, spec, *, codec, allocate=None):
+    n, kb, _ = blocks.shape
     if not spec.subscale_bytes:
         # Compact block-major bases: no N-tail padding in resident storage.
-        metadata = bases.permute(1, 0, 2).contiguous()
+        if allocate is None:
+            metadata = bases.permute(1, 0, 2).contiguous()
+        else:
+            metadata = allocate((kb, n, 2), dtype=torch.uint8, device=blocks.device)
+            metadata.copy_(bases.permute(1, 0, 2))
     else:
         nt = (n + 127) // 128
-        metadata = torch.zeros((nt, kb, 1280), dtype=torch.uint8, device=blocks.device)
+        metadata = (
+            torch.zeros((nt, kb, 1280), dtype=torch.uint8, device=blocks.device)
+            if allocate is None
+            else allocate(
+                (nt, kb, 1280), dtype=torch.uint8, device=blocks.device
+            ).zero_()
+        )
         # Row padding is confined to metadata, preserving the descriptor matrix.
         base_rows = torch.zeros(
             (nt * 128, kb, 2), dtype=torch.uint8, device=blocks.device
@@ -84,11 +99,16 @@ def pack_iq2_xs_weight(
             scale_rows.view(nt, 128, kb, 8).permute(0, 2, 3, 1).reshape(nt, kb, 1024)
         )
     tile_n = 128 if n % 128 == 0 else 8
-    values = (
+    tiles = (
         blocks[..., 2 : 2 + spec.payload_bytes]
         .reshape(n // tile_n, tile_n, kb, spec.payload_bytes)
         .permute(0, 2, 1, 3)
-        .contiguous()
-        .view(n, kb * spec.payload_bytes)
     )
+    if allocate is None:
+        values = tiles.contiguous().view(n, kb * spec.payload_bytes)
+    else:
+        values = allocate(
+            (n, kb * spec.payload_bytes), dtype=torch.uint8, device=blocks.device
+        )
+        values.view(n // tile_n, kb, tile_n, spec.payload_bytes).copy_(tiles)
     return BlockQuantLinearWeight(values, metadata, kb * spec.block_weights, n, codec)

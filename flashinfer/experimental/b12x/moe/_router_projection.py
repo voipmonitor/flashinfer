@@ -348,6 +348,7 @@ class TensorCoreRouterKernel(TensorCoreGemvKernel):
             Int64(self.k),
             Int64(self.n),
             Int32(row_tile * self.rows_per_tile),
+            BFloat16,
         )
         finish_routing(
             logits,

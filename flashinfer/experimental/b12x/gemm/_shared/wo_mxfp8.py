@@ -72,11 +72,14 @@ class MXFP8Rows:
     is the strided `[32, 4, ceil(M/128), 4, ceil(K/128), L]` view consumed by
     the CuTe kernel. `values_tiled`, when present, is an additional load-time
     packed copy for a specialized dense-GEMM RHS; `values` remains the logical
-    operand used by every fallback path.
+    operand used by every fallback path. Immutable matrix weights may omit
+    `scale_rows` when their kernels consume `scale_mma`; preparation/reference
+    consumers can recover compact bytes with `materialize_mxfp8_scale_rows`.
+    Activation quantization destinations still require both scale buffers.
     """
 
     values: torch.Tensor
-    scale_rows: torch.Tensor
+    scale_rows: torch.Tensor | None
     scale_mma: torch.Tensor
     values_tiled: torch.Tensor | None = None
 
@@ -1192,13 +1195,15 @@ def _check_dense_gemm_mnl_view(name: str, tensor: torch.Tensor) -> None:
         )
 
 
-def _scale_u8_from_max_abs(max_abs: torch.Tensor) -> torch.Tensor:
+def _scale_u8_from_max_abs(max_abs: torch.Tensor, *, out=None) -> torch.Tensor:
     safe = torch.where(
         max_abs > 0,
         max_abs.to(torch.float32) / FP8_E4M3_MAX,
         torch.ones_like(max_abs, dtype=torch.float32),
     )
     exponent = torch.ceil(torch.log2(safe)).clamp(-127, 127)
+    if out is not None:
+        return out.copy_(exponent + 127)
     return (exponent + 127).to(torch.uint8)
 
 
@@ -1228,6 +1233,7 @@ def _expand_block_scales_to_mxfp8_rows(
     k: int,
     num_groups: int,
     block_size: tuple[int, int] = (128, 128),
+    allocate=None,
 ) -> torch.Tensor:
     _check_gpu_tensor("scale", scale)
     if m <= 0 or k <= 0 or num_groups <= 0:
@@ -1264,6 +1270,14 @@ def _expand_block_scales_to_mxfp8_rows(
         )[:, :m, : k // MXFP8_SCALE_VEC_SIZE]
         .contiguous()
     )
+    if allocate is not None:
+        result = allocate(
+            tuple(scale_rows_u8.shape),
+            dtype=torch.float8_e8m0fnu,
+            device=scale_rows_u8.device,
+        )
+        result.view(torch.uint8).copy_(scale_rows_u8)
+        return result
     return scale_rows_u8.view(torch.float8_e8m0fnu)
 
 
@@ -1273,13 +1287,15 @@ def pack_mxfp8_scales_for_dense_gemm(
     m: int,
     k: int,
     num_groups: int = 1,
+    allocate=None,
 ) -> torch.Tensor:
     """Pack compact MXFP8 row/chunk scales into b12x dense-GEMM MMA layout.
 
     `scale_rows` must be UE8M0 scales in either `[M, K/32]`,
     `[num_groups, M, K/32]`, or `[num_groups * M, K/32]` form. Missing padded
     rows/chunks are filled with UE8M0 1.0, so the kernel can safely read the
-    fixed 128-row scale tile for small-M contracts.
+    fixed 128-row scale tile for small-M contracts. ``allocate`` can supply
+    the returned physical storage as ``allocate(shape, dtype=..., device=...)``.
     """
 
     _check_gpu_tensor("scale_rows", scale_rows)
@@ -1333,11 +1349,17 @@ def pack_mxfp8_scales_for_dense_gemm(
     padded = padded_u8.view(torch.float8_e8m0fnu)
     padded[:, :m, :sf_k] = grouped
 
-    physical = (
-        padded.view(num_groups, m_tiles, 4, 32, k_tiles, 4)
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
+    physical = padded.view(num_groups, m_tiles, 4, 32, k_tiles, 4).permute(
+        0, 1, 4, 3, 2, 5
     )
+    if allocate is None:
+        physical = physical.contiguous()
+    else:
+        result = allocate(
+            tuple(physical.shape), dtype=physical.dtype, device=physical.device
+        )
+        result.view(torch.uint8).copy_(physical.view(torch.uint8))
+        physical = result
     return physical.permute(3, 4, 1, 5, 2, 0)
 
 
@@ -1368,6 +1390,7 @@ def _requantize_block_fp8_to_ue8m0(
     m: int,
     k: int,
     num_groups: int,
+    allocate=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Re-quantize an FP8 checkpoint weight onto exact UE8M0 block scales.
 
@@ -1434,12 +1457,14 @@ def _requantize_block_fp8_to_ue8m0(
     safe = torch.where(amax > 0, amax / FP8_E4M3_MAX, torch.ones_like(amax))
     exponent = torch.clamp(torch.ceil(torch.log2(safe)), -127.0, 127.0)
     sf = torch.exp2(exponent)
-    new_vals = (
-        (blocks / sf)
-        .to(torch.float8_e4m3fn)
-        .view(num_groups, m_pad, k_pad)[:, :m, :k]
-        .contiguous()
-    )
+    normalized = (blocks / sf).view(num_groups, m_pad, k_pad)[:, :m, :k]
+    if allocate is None:
+        new_vals = normalized.to(torch.float8_e4m3fn).contiguous()
+    else:
+        new_vals = allocate(
+            (num_groups, m, k), dtype=torch.float8_e4m3fn, device=weight.device
+        )
+        new_vals.copy_(normalized)
     new_scale_u8 = (exponent.view(num_groups, m_tiles, k_tiles) + 127).to(torch.uint8)
 
     if num_groups == 1:
@@ -1457,6 +1482,7 @@ def pack_fp8_block_scaled_weight_mxfp8(
     k: int,
     num_groups: int = 1,
     block_size: tuple[int, int] = (128, 128),
+    allocate=None,
 ) -> MXFP8Rows:
     """Pack checkpoint FP8 block-scaled weights for native MXFP8 dense GEMM.
 
@@ -1491,7 +1517,7 @@ def pack_fp8_block_scaled_weight_mxfp8(
     if block_size == (128, 128) and not _scale_is_exact_ue8m0(scale):
         _check_gpu_tensor("scale", scale)
         weight, scale = _requantize_block_fp8_to_ue8m0(
-            weight, scale, m=m, k=k, num_groups=num_groups
+            weight, scale, m=m, k=k, num_groups=num_groups, allocate=allocate
         )
 
     if num_groups == 1:
@@ -1499,10 +1525,23 @@ def pack_fp8_block_scaled_weight_mxfp8(
             raise ValueError(
                 f"weight must have shape {(m, k)}, got {tuple(weight.shape)}"
             )
-        values = weight.contiguous()
+        if allocate is not None and not weight.is_contiguous():
+            values = allocate(
+                tuple(weight.shape), dtype=weight.dtype, device=weight.device
+            )
+            values.copy_(weight)
+        else:
+            values = weight.contiguous()
     else:
         if weight.shape == (num_groups * m, k):
-            values = weight.contiguous().view(num_groups, m, k).permute(1, 2, 0)
+            if allocate is not None and not weight.is_contiguous():
+                storage = allocate(
+                    tuple(weight.shape), dtype=weight.dtype, device=weight.device
+                )
+                storage.copy_(weight)
+            else:
+                storage = weight.contiguous()
+            values = storage.view(num_groups, m, k).permute(1, 2, 0)
         elif weight.shape == (m, k, num_groups):
             values = weight
             _check_dense_gemm_mnl_view("weight", values)
@@ -1518,12 +1557,14 @@ def pack_fp8_block_scaled_weight_mxfp8(
         k=k,
         num_groups=num_groups,
         block_size=block_size,
+        allocate=allocate,
     )
     scale_mma = pack_mxfp8_scales_for_dense_gemm(
         scale_rows,
         m=m,
         k=k,
         num_groups=num_groups,
+        allocate=allocate,
     )
     values_tiled = None
     tile_n = 0
@@ -1536,11 +1577,16 @@ def pack_fp8_block_scaled_weight_mxfp8(
         # production decode WO Ntile/BK128 GEMMs. Keep `values` in its logical
         # layout for all other schedules and callers.
         values_lnk = values.permute(2, 0, 1) if num_groups > 1 else values.unsqueeze(0)
-        values_tiled = (
-            values_lnk.reshape(num_groups, m // tile_n, tile_n, k // 128, 128)
-            .permute(0, 1, 3, 2, 4)
-            .contiguous()
-        )
+        tiled = values_lnk.reshape(
+            num_groups, m // tile_n, tile_n, k // 128, 128
+        ).permute(0, 1, 3, 2, 4)
+        if allocate is None:
+            values_tiled = tiled.contiguous()
+        else:
+            values_tiled = allocate(
+                tuple(tiled.shape), dtype=values.dtype, device=values.device
+            )
+            values_tiled.copy_(tiled)
     return MXFP8Rows(
         values=values,
         scale_rows=scale_rows,
@@ -1560,6 +1606,7 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
     rank: int,
     hidden: int,
     block_size: tuple[int, int] = (128, 128),
+    allocate=None,
 ) -> WOProjectionMXFP8Weights:
     """Pack WO-A/WO-B weights with 128x128 or native 32x32 block scales."""
 
@@ -1570,6 +1617,7 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
         k=group_width,
         num_groups=groups,
         block_size=block_size,
+        allocate=allocate,
     )
     wo_b = pack_fp8_block_scaled_weight_mxfp8(
         wo_b_weight,
@@ -1578,6 +1626,7 @@ def pack_wo_projection_fp8_block_scaled_weights_mxfp8(
         k=groups * rank,
         num_groups=1,
         block_size=block_size,
+        allocate=allocate,
     )
     return WOProjectionMXFP8Weights(
         wo_a=wo_a,
@@ -1597,6 +1646,8 @@ def _check_mxfp8_rows_storage(
     k: int,
     num_groups: int,
 ) -> None:
+    if out.scale_rows is None:
+        raise ValueError("MXFP8 quantization destinations require compact row scales")
     _check_gpu_tensor("out.values", out.values)
     _check_gpu_tensor("out.scale_rows", out.scale_rows)
     _check_gpu_tensor("out.scale_mma", out.scale_mma)
@@ -2246,13 +2297,20 @@ def quantize_wo_b_input_mxfp8(
     return out
 
 
-def quantize_mxfp8_rows_torch(source: torch.Tensor) -> MXFP8Rows:
+def quantize_mxfp8_rows_torch(
+    source: torch.Tensor, *, retain_scale_rows: bool = True, allocate=None
+) -> MXFP8Rows:
     """Quantize `[M,K]` or `[M,K,L]` rows to MXFP8 on GPU.
 
     This is a graph-capturable GPU Torch prep/reference helper. It is not the
-    final production activation-quant kernel for WO-A/WO-B.
+    final production activation-quant kernel for WO-A/WO-B. Immutable weights
+    may set `retain_scale_rows=False` to retain only the MMA scale layout.
+    ``allocate`` can supply the returned storage planes as
+    ``allocate(shape, dtype=..., device=...)``.
     """
 
+    if type(retain_scale_rows) is not bool:
+        raise TypeError("retain_scale_rows must be a boolean")
     grouped, m, k, num_groups = _as_grouped_mkl(source)
     _check_mxfp8_k(k)
 
@@ -2260,16 +2318,25 @@ def quantize_mxfp8_rows_torch(source: torch.Tensor) -> MXFP8Rows:
     grouped_f32 = grouped.to(torch.float32)
     blocked = grouped_f32.reshape(num_groups, m, chunks, MXFP8_SCALE_VEC_SIZE)
     max_abs = blocked.abs().amax(dim=-1)
-    scale_u8 = _scale_u8_from_max_abs(max_abs)
-    scale_rows = scale_u8.view(torch.float8_e8m0fnu)
+    if allocate is None:
+        scale_u8 = _scale_u8_from_max_abs(max_abs)
+        scale_rows = scale_u8.view(torch.float8_e8m0fnu)
+    else:
+        scale_rows = allocate(
+            (num_groups, m, chunks), dtype=torch.float8_e8m0fnu, device=source.device
+        )
+        _scale_u8_from_max_abs(max_abs, out=scale_rows.view(torch.uint8))
     scale = scale_rows.to(torch.float32)
-    quant_grouped = (
-        (blocked / scale[..., None])
-        .clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-        .to(torch.float8_e4m3fn)
-        .reshape(num_groups, m, k)
-        .contiguous()
-    )
+    quant = (blocked / scale[..., None]).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+    if allocate is None:
+        quant_grouped = (
+            quant.to(torch.float8_e4m3fn).reshape(num_groups, m, k).contiguous()
+        )
+    else:
+        quant_grouped = allocate(
+            (num_groups, m, k), dtype=torch.float8_e4m3fn, device=source.device
+        )
+        quant_grouped.copy_(quant.reshape(num_groups, m, k))
     if source.ndim == 2:
         values = quant_grouped.reshape(m, k).contiguous()
     else:
@@ -2279,8 +2346,42 @@ def quantize_mxfp8_rows_torch(source: torch.Tensor) -> MXFP8Rows:
         m=m,
         k=k,
         num_groups=num_groups,
+        allocate=allocate,
     )
-    return MXFP8Rows(values=values, scale_rows=scale_rows, scale_mma=scale_mma)
+    return MXFP8Rows(
+        values=values,
+        scale_rows=scale_rows if retain_scale_rows else None,
+        scale_mma=scale_mma,
+    )
+
+
+def materialize_mxfp8_scale_rows(rows: MXFP8Rows) -> torch.Tensor:
+    """Recover compact UE8M0 bytes without changing any represented scale.
+
+    This preparation/reference helper allocates only when the compact layout
+    was omitted. Serving kernels continue to consume the retained MMA layout.
+    """
+    if rows.scale_rows is not None:
+        return rows.scale_rows
+    if rows.values.ndim not in (2, 3):
+        raise ValueError("MXFP8 values must have two or three logical dimensions")
+    m, k = rows.values.shape[:2]
+    groups = 1 if rows.values.ndim == 2 else rows.values.shape[2]
+    if k % MXFP8_SCALE_VEC_SIZE or rows.scale_mma.shape != (
+        32,
+        4,
+        math.ceil(m / 128),
+        4,
+        math.ceil(k / 128),
+        groups,
+    ):
+        raise ValueError("MXFP8 MMA scales do not match the logical operand geometry")
+    padded = (
+        rows.scale_mma.permute(5, 2, 1, 0, 4, 3)
+        .contiguous()
+        .view(groups, math.ceil(m / 128) * 128, math.ceil(k / 128) * 4)
+    )
+    return padded[:, :m, : k // MXFP8_SCALE_VEC_SIZE].contiguous()
 
 
 def dequantize_mxfp8_rows_torch(

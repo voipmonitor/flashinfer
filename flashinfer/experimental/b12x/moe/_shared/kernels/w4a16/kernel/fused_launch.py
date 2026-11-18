@@ -93,6 +93,7 @@ def compile_w4a16_fused_moe(
     collect_activation_amax: bool = False,
     force_tile_config: tuple[int, int, int, int] | None = None,
     pipeline_stages: int | None = None,
+    fc1_pipeline_stages: int | None = None,
     skip_empty_m_blocks: bool | None = None,
     intermediate_rotation: bool = False,
     full_rotation: bool = False,
@@ -464,7 +465,11 @@ def compile_w4a16_fused_moe(
                 allow_qualified_fc2_tile=name == "fc2",
                 allow_k32_tile=name == "fc2",
                 uses_m_block_8=moe_block_size == 8,
-                pipeline_stages=pipeline_stages,
+                pipeline_stages=(
+                    fc1_pipeline_stages
+                    if name == "fc1" and fc1_pipeline_stages is not None
+                    else pipeline_stages
+                ),
                 small_m_occupancy=small_m_occupancy,
             ):
                 raise ValueError(
@@ -512,6 +517,7 @@ def compile_w4a16_fused_moe(
         rotation_input_dtype=rotation_input_dtype,
         broadcast_suh=broadcast_suh,
         pipeline_stages=pipeline_stages,
+        fc1_pipeline_stages=fc1_pipeline_stages,
         skip_empty_m_blocks=skip_empty_m_blocks,
         trellis_decode_table=trellis_decode_table,
         small_m_occupancy=small_m_occupancy,

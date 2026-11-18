@@ -797,22 +797,31 @@ def test_prefill_router_topk_agrees_with_fp64_and_scalar_projection():
 
 @cuda_required
 @pytest.mark.parametrize("n", [384, 512])
-def test_prefill_projection_retains_small_terms_between_cancelling_large_terms(n):
-    """Compensated carry preserves exact representable BF16 products in FP32."""
+@pytest.mark.parametrize("backend,rows", [(None, 256), ("tc", 8)])
+def test_bf16_projection_retains_small_terms_between_cancelling_large_terms(
+    n, backend, rows
+):
+    """FP32 accumulation preserves small products between cancelling terms."""
     from b12x.gemm import bf16_gemv
 
-    source = torch.ones(256, 5120, device="cuda", dtype=torch.bfloat16)
+    source = torch.ones(rows, 5120, device="cuda", dtype=torch.bfloat16)
     weight = torch.zeros(n, 5120, device="cuda", dtype=torch.bfloat16)
     weight[:, ::32] = 1024
     weight[:, 1::32] = 0.015625
     weight[:, 31::32] = -1024
-    result = _mm(source, weight, output_dtype=torch.float32)
+    result = _mm(
+        source,
+        weight,
+        output_dtype=torch.float32,
+        override=bf16_gemv.GemvConfig(backend=backend) if backend else None,
+    )
     expected = source.double() @ weight.double().T
     torch.testing.assert_close(result.double(), expected, atol=0, rtol=0)
 
 
 @cuda_required
 @pytest.mark.parametrize("m", [1, 2, 3, 8])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "n,k",
     [
@@ -825,37 +834,72 @@ def test_prefill_projection_retains_small_terms_between_cancelling_large_terms(n
         (31, 192),
         (513, 448),
         (257, 576),
+        (240, 4096),
+        (304, 4096),
+        (368, 4096),
+        (432, 4096),
+        (496, 4096),
+        (32, 5120),
+        (384, 5120),
+        (512, 5120),
+        (288, 4096),
+        (336, 10240),
     ],
 )
-def test_tensor_core_gemv_matches_fp64_reference(m, n, k):
-    """Wide decode projections: one FP32 accumulation and one BF16 rounding."""
+def test_tensor_core_gemv_matches_fp64_reference(m, n, k, output_dtype):
+    """Small-row projections preserve the declared BF16 or FP32 output precision."""
     torch.manual_seed(m * 131 + n + k)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
     override = bf16_gemv.GemvConfig(backend="tc")
-    first = _mm(x, weight, override=override)
-    again = _mm(x, weight, override=override)
+    first = _mm(x, weight, output_dtype=output_dtype, override=override)
+    again = _mm(x, weight, output_dtype=output_dtype, override=override)
     expected = x.double() @ weight.double().T
-    ulp = expected.abs().clamp_min(1e-30) * 2.0**-7
-    err = (first.double() - expected).abs()
-    assert bool((err <= ulp + 1e-6 * expected.abs().max()).all())
+    if output_dtype == torch.float32:
+        torch.testing.assert_close(first.double(), expected, rtol=2e-5, atol=2e-5)
+    else:
+        ulp = expected.abs().clamp_min(1e-30) * 2.0**-7
+        err = (first.double() - expected).abs()
+        assert bool((err <= ulp + 1e-6 * expected.abs().max()).all())
     assert torch.equal(first, again), "tensor-core GEMV must be deterministic"
 
 
 @cuda_required
-@pytest.mark.parametrize("k", [320, 576, 2048])
-def test_tensor_core_gemv_replays_live_rows(k):
-    """One tc plan prepared at eight rows serves CUDA-graph replays with fewer live
-    rows: each replay matches FP64, leaves rows past the live count untouched and
-    allocates nothing."""
+@pytest.mark.parametrize("n", [31, 240, 496])
+def test_tensor_core_gemv_fp32_output_retains_sub_bf16_terms(n):
+    source = torch.zeros(8, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.zeros(n, 4096, device="cuda", dtype=torch.bfloat16)
+    source[:, 0] = 1
+    source[:, 1] = 2**-8
+    source[:, -1] = 2**-12
+    weight[:, 0] = weight[:, 1] = weight[:, -1] = 1
+    expected = source.double() @ weight.double().T
+    assert not torch.equal(expected, expected.bfloat16().double())
+    actual = _mm(
+        source,
+        weight,
+        output_dtype=torch.float32,
+        override=bf16_gemv.GemvConfig(backend="tc"),
+    )
+    torch.testing.assert_close(actual.double(), expected, rtol=2e-5, atol=2e-5)
+
+
+@cuda_required
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "n,k",
+    [(4096, 320), (4096, 576), (4096, 2048), (240, 4096), (496, 4096), (257, 4096)],
+)
+def test_tensor_core_gemv_replays_live_rows(n, k, output_dtype):
+    """Frozen projections replay mutable inputs without allocations or tail writes."""
     from b12x._lib.runtime_control import kernel_resolution_guard
     from b12x.preparation import require_prepared
 
     torch.manual_seed(7)
-    n = 4096
     weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.05
     x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
-    out = torch.full((8, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    storage = torch.full((9, n), float("nan"), device="cuda", dtype=output_dtype)
+    out = storage[:8]
     with PreparationSession(
         device=x.device, autotune=False, compile_workers=0
     ) as session:
@@ -866,20 +910,55 @@ def test_tensor_core_gemv_replays_live_rows(k):
         state = require_prepared(plan, "gemm.bf16_gemv", x.device)
         launcher = state.launcher
         with kernel_resolution_guard("prepared tc GEMV"):
-            for rows in (1, 3, 8):
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    bf16_gemv.mm(x[:rows], weight, out=out[:rows], plan=plan)
-                x.neg_()
-                out.fill_(float("nan"))
-                allocated = torch.cuda.memory_allocated()
-                graph.replay()
+            for rows in (0, 1, 3, 7, 8):
+                storage.fill_(float("nan"))
+                allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+                actual = bf16_gemv.mm(x[:rows], weight, out=out[:rows], plan=plan)
                 torch.cuda.synchronize()
-                assert torch.cuda.memory_allocated() == allocated
+                assert (
+                    torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+                )
+                assert actual.data_ptr() == out[:rows].data_ptr()
                 expected = x[:rows].double() @ weight.double().T
                 torch.testing.assert_close(
-                    out[:rows].double(), expected, rtol=1e-2, atol=1e-2
+                    actual.double(),
+                    expected,
+                    rtol=2e-5 if output_dtype == torch.float32 else 1e-2,
+                    atol=2e-5 if output_dtype == torch.float32 else 1e-2,
                 )
-                assert torch.isnan(out[rows:]).all()
-                assert state.launcher is launcher
-                graph.reset()
+                assert torch.isnan(storage[rows:]).all()
+                if rows == 0:
+                    continue
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(graph):
+                        bf16_gemv.mm(
+                            x[:rows],
+                            weight,
+                            out=out[:rows],
+                            plan=plan,
+                        )
+                    for factor in (0.5, 2.0, -1.0):
+                        x.neg_()
+                        weight.mul_(factor)
+                        storage.fill_(float("nan"))
+                        allocated = torch.cuda.memory_stats()[
+                            "allocation.all.allocated"
+                        ]
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        assert (
+                            torch.cuda.memory_stats()["allocation.all.allocated"]
+                            == allocated
+                        )
+                        expected = x[:rows].double() @ weight.double().T
+                        torch.testing.assert_close(
+                            out[:rows].double(),
+                            expected,
+                            rtol=2e-5 if output_dtype == torch.float32 else 1e-2,
+                            atol=2e-5 if output_dtype == torch.float32 else 1e-2,
+                        )
+                        assert torch.isnan(storage[rows:]).all()
+                        assert state.launcher is launcher
+                finally:
+                    graph.reset()

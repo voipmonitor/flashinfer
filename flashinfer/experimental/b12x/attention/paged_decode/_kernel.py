@@ -13,6 +13,15 @@ groups through shared memory.
   context length and any mix of per-request query lengths (ragged verify).
 * Split partials are FP32 (normalized output + base-2 LSE); the merge kernel
   folds them, and the attention sink, into the BF16 output with one rounding.
+* A relative-distance bias variant adds ``bias[row, head, d]`` to the logit of
+  each key at distance ``d = row position - key position`` when
+  ``0 <= d < extent``; keys at other distances get no bias.  The bias is BF16
+  ``[rows, q_heads, extent]`` and is read only for 16-key sub-tiles that
+  intersect some row's biased range, so long contexts pay for it only on
+  their last ``extent`` keys.
+* The attention sink is one extra logit with a zero value in each row's
+  softmax denominator: one per head (``[Hq]``) or one per row and head
+  (``[rows, Hq]``, indexed by the same row as ``mQ``).
 * Variants (constexpr): QK/VO head dims 256/256, 192/128, 128/128 or 64/64; causal, or
   non-causal (every row sees the whole sequence, bounded on the left by the
   window); BF16 or FP8-E4M3 KV (FP8 fragments are widened exactly to BF16 in
@@ -29,7 +38,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, const_expr
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int64, dsl_user_op
 from cutlass.cute.nvgpu import cpasync
 
 from b12x.attention._shared.cute import copy as cute_copy
@@ -39,12 +48,14 @@ from b12x._lib.intrinsics.packed import (
 )
 from b12x._lib.intrinsics.memory import (
     get_ptr_as_int64,
+    ld_global_b16,
     ld_global_nc_u32,
     ld_global_v4_f32,
     ldmatrix_m8n8x4_b16,
     ldmatrix_m16n16x1_trans_b8,
     shared_ptr_to_u32,
     st_global_v2_f32,
+    u32_as_f32,
 )
 from b12x.attention.paged.forward_paged import (
     _assume_tensor_aligned,
@@ -91,6 +102,41 @@ def _mask_subtile(
 
 
 @cute.jit
+def _add_relative_bias_subtile(
+    frag_S: cute.Tensor,
+    bias_bytes: cute.Tensor,
+    bias_row_byte: cute.Tensor,
+    row_pos: cute.Tensor,
+    row_valid: cute.Tensor,
+    key_abs_base,
+    lane_pair_base,
+    extent,
+    inv_sm_scale,
+):
+    """S += bias[row, head, row position - key position] / softmax scale.
+
+    ``frag_S`` holds raw q.k products, so the bias is divided by the scale
+    that later turns them into logits.  A BF16 value is the high half of the
+    FP32 with the same value, so the widening is exact.
+    """
+    for reg_id in cutlass.range_constexpr(8):
+        row_slot = (reg_id % 4) // 2
+        key_abs = key_abs_base + lane_pair_base + 8 * (reg_id // 4) + (reg_id % 2)
+        distance = row_pos[row_slot] - key_abs
+        if (
+            row_valid[row_slot] != Int32(0)
+            and distance >= Int32(0)
+            and distance < extent
+        ):
+            bits = ld_global_b16(
+                get_ptr_as_int64(
+                    bias_bytes, bias_row_byte[row_slot] + Int64(distance) * Int64(2)
+                )
+            )
+            frag_S[0, 0, reg_id] += u32_as_f32(bits << Uint32(16)) * inv_sm_scale
+
+
+@cute.jit
 def _issue_kv_stage_at(
     load0,
     load1,
@@ -118,6 +164,43 @@ def _issue_kv_stage_at(
         load2(src_idx=src_idx, dst_idx=buf_idx, tma_bar_ptr=full_mbar_ptr)
     if const_expr(num_planes == 4):
         load3(src_idx=src_idx, dst_idx=buf_idx, tma_bar_ptr=full_mbar_ptr)
+
+
+@dsl_user_op
+def _kv_stage_loads(
+    cache,
+    atom,
+    payload,
+    head,
+    byte_offset,
+    planes,
+    stage_rows,
+    stages,
+    plane_bytes,
+    kv_fp8,
+    *,
+    loc=None,
+    ip=None,
+):
+    columns = 2 * PLANE_DIM if kv_fp8 else PLANE_DIM
+    dtype = cutlass.Uint8 if kv_fp8 else cutlass.BFloat16
+    layout = _paged_kv_tma_plane_stage_layout(stage_rows, columns, stages)
+    elements = stages * stage_rows * columns
+    source = cache[None, None, head, None]
+    loads = []
+    for plane in range(planes):
+        destination = _get_memrange_tensor(
+            _make_payload_memrange(
+                payload, dtype, byte_offset + plane * plane_bytes, elements
+            ),
+            layout,
+        )
+        tile = cute.local_tile(source, (stage_rows, columns), (0, plane, None))
+        load, _, _ = cute_copy.tma_get_copy_fn(
+            atom, 0, cute.make_layout(1), tile, destination
+        )
+        loads.append(load)
+    return tuple(loads + [loads[0]] * (4 - planes))
 
 
 @cute.jit
@@ -265,7 +348,14 @@ class PagedDecodeKernel:
         causal: bool = True,
         kv_fp8: bool = False,
         descale_layout: str = "tensor",
+        has_relative_bias: bool = False,
+        sink_layout: str = "head",
+        tail_pages_per_request: int = 0,
     ):
+        if sink_layout not in ("head", "row"):
+            raise ValueError(f"unsupported sink layout {sink_layout!r}")
+        self.sink_per_row = sink_layout == "row"
+        self.tail_pages_per_request = int(tail_pages_per_request)
         if (head_dim_qk, head_dim_vo) not in (
             (256, 256),
             (192, 128),
@@ -292,6 +382,7 @@ class PagedDecodeKernel:
         self.max_q_per_req = int(max_q_per_req)
         self.window_left = int(window_left)
         self.has_sinks = bool(has_sinks)
+        self.has_relative_bias = bool(has_relative_bias)
         self.split_kv = bool(split_kv)
         # Split partials exclude the sink logit; the merge adds it once.
         self.sinks_in_kernel = self.has_sinks and not self.split_kv
@@ -370,13 +461,19 @@ class PagedDecodeKernel:
         mSinks: cute.Tensor,
         mKDescale: cute.Tensor,
         mVDescale: cute.Tensor,
+        mRelBias: cute.Tensor,
+        mTailK: cute.Tensor,
+        mTailV: cute.Tensor,
         sm_scale: Float32,
         stream: cuda.CUstream,
     ):
         """FP8 caches arrive as uint8 views with fp32 dequant scales: one value
         (``[1]``), per request (``[B]``) or per request and KV head
         (``[B, Hkv]``); the K scale joins the softmax scale and the V scale
-        multiplies the output.  BF16 caches ignore both scale tensors."""
+        multiplies the output.  BF16 caches ignore both scale tensors.
+
+        ``mRelBias`` is BF16 ``[rows, Hq, extent]``, indexed by the same row
+        as ``mQ``; kernels built without the relative bias never read it."""
         mQ = _assume_tensor_aligned(mQ)
         mKCache = _assume_tensor_aligned(mKCache)
         mVCache = _assume_tensor_aligned(mVCache)
@@ -392,6 +489,26 @@ class PagedDecodeKernel:
         tma_atom_V, tma_tensor_V = cpasync.make_tiled_tma_atom(
             tma_op, mVCacheT, plane_layout, (self.stage_rows, tma_cols), 1
         )
+        tail_atom_K, tail_atom_V = tma_atom_K, tma_atom_V
+        tail_tensor_K, tail_tensor_V = tma_tensor_K, tma_tensor_V
+        tail_k_tiles_per_entry, tail_v_tiles_per_entry = Int32(1), Int32(1)
+        if const_expr(self.tail_pages_per_request > 0):
+            mTailK = _assume_tensor_aligned(mTailK)
+            mTailV = _assume_tensor_aligned(mTailV)
+            tail_source_K = _make_paged_kv_tma_source_tensor(mTailK, self.stage_rows)
+            tail_source_V = _make_paged_kv_tma_source_tensor(mTailV, self.stage_rows)
+            tail_atom_K, tail_tensor_K = cpasync.make_tiled_tma_atom(
+                tma_op, tail_source_K, plane_layout, (self.stage_rows, tma_cols), 1
+            )
+            tail_atom_V, tail_tensor_V = cpasync.make_tiled_tma_atom(
+                tma_op, tail_source_V, plane_layout, (self.stage_rows, tma_cols), 1
+            )
+            tail_k_tiles_per_entry = mTailK.stride[0] // (
+                self.stage_rows * mTailK.stride[1]
+            )
+            tail_v_tiles_per_entry = mTailV.stride[0] // (
+                self.stage_rows * mTailV.stride[1]
+            )
         k_tiles_per_entry = mKCache.stride[0] // (self.stage_rows * mKCache.stride[1])
         v_tiles_per_entry = mVCache.stride[0] // (self.stage_rows * mVCache.stride[1])
         num_splits = (
@@ -412,6 +529,13 @@ class PagedDecodeKernel:
             mSinks,
             mKDescale,
             mVDescale,
+            mRelBias,
+            tail_tensor_K,
+            tail_tensor_V,
+            tail_atom_K,
+            tail_atom_V,
+            tail_k_tiles_per_entry,
+            tail_v_tiles_per_entry,
             tma_atom_K,
             tma_atom_V,
             k_tiles_per_entry,
@@ -440,6 +564,13 @@ class PagedDecodeKernel:
         mSinks: cute.Tensor,
         mKDescale: cute.Tensor,
         mVDescale: cute.Tensor,
+        mRelBias: cute.Tensor,
+        mTailK: cute.Tensor,
+        mTailV: cute.Tensor,
+        tail_atom_K: cute.CopyAtom,
+        tail_atom_V: cute.CopyAtom,
+        tail_k_tiles_per_entry: Int32,
+        tail_v_tiles_per_entry: Int32,
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         k_tiles_per_entry: Int32,
@@ -577,151 +708,74 @@ class PagedDecodeKernel:
         warp_row_base = row_group * Int32(16)
 
         if is_producer:
-            # 128-byte TMA planes: BF16 caches use 64-column planes (2 or 3 for
-            # K, 2 for V); FP8 caches one 128-column plane each.
-            tma_cols = PLANE_DIM
-            plane_dtype = cutlass.BFloat16
-            if const_expr(self.kv_fp8):
-                tma_cols = 2 * PLANE_DIM
-                plane_dtype = cutlass.Uint8
-            plane_stage_layout = _paged_kv_tma_plane_stage_layout(STAGE, tma_cols, S)
-            plane_elems = S * STAGE * tma_cols
-            mKHead = mKCacheT[None, None, kv_head_idx, None]
-            mVHead = mVCacheT[None, None, kv_head_idx, None]
-            sK0 = _get_memrange_tensor(
-                _make_payload_memrange(payload_u8, plane_dtype, 0, plane_elems),
-                plane_stage_layout,
+            load_K0, load_K1, load_K2, load_K3 = _kv_stage_loads(
+                mKCacheT,
+                tma_atom_K,
+                payload_u8,
+                kv_head_idx,
+                0,
+                self.num_k_planes,
+                STAGE,
+                S,
+                self.kv_plane_total_bytes,
+                self.kv_fp8,
             )
-            sV0 = _get_memrange_tensor(
-                _make_payload_memrange(
-                    payload_u8, plane_dtype, self.k_bytes, plane_elems
-                ),
-                plane_stage_layout,
+            load_V0, load_V1, load_V2, load_V3 = _kv_stage_loads(
+                mVCacheT,
+                tma_atom_V,
+                payload_u8,
+                kv_head_idx,
+                self.k_bytes,
+                self.num_v_planes,
+                STAGE,
+                S,
+                self.kv_plane_total_bytes,
+                self.kv_fp8,
             )
-            gK0 = cute.local_tile(mKHead, (STAGE, tma_cols), (0, 0, None))
-            gV0 = cute.local_tile(mVHead, (STAGE, tma_cols), (0, 0, None))
-            load_K0, _, _ = cute_copy.tma_get_copy_fn(
-                tma_atom_K, 0, cute.make_layout(1), gK0, sK0
+            tail_load_K0, tail_load_K1, tail_load_K2, tail_load_K3 = (
+                load_K0,
+                load_K1,
+                load_K2,
+                load_K3,
             )
-            load_V0, _, _ = cute_copy.tma_get_copy_fn(
-                tma_atom_V, 0, cute.make_layout(1), gV0, sV0
+            tail_load_V0, tail_load_V1, tail_load_V2, tail_load_V3 = (
+                load_V0,
+                load_V1,
+                load_V2,
+                load_V3,
             )
-            load_K1 = load_K0
-            load_K2 = load_K0
-            load_K3 = load_K0
-            load_V1 = load_V0
-            load_V2 = load_V0
-            load_V3 = load_V0
-            if const_expr(self.kv_fp8 and self.num_k_planes == 2):
-                sK1 = _get_memrange_tensor(
-                    _make_payload_memrange(
+            tail_start_page = context_len // Int32(self.page_size)
+            if const_expr(self.tail_pages_per_request > 0):
+                tail_load_K0, tail_load_K1, tail_load_K2, tail_load_K3 = (
+                    _kv_stage_loads(
+                        mTailK,
+                        tail_atom_K,
                         payload_u8,
-                        cutlass.Uint8,
+                        kv_head_idx,
+                        0,
+                        self.num_k_planes,
+                        STAGE,
+                        S,
                         self.kv_plane_total_bytes,
-                        plane_elems,
-                    ),
-                    plane_stage_layout,
+                        self.kv_fp8,
+                    )
                 )
-                gK1 = cute.local_tile(mKHead, (STAGE, tma_cols), (0, 1, None))
-                load_K1, _, _ = cute_copy.tma_get_copy_fn(
-                    tma_atom_K, 0, cute.make_layout(1), gK1, sK1
-                )
-            if const_expr(self.kv_fp8 and self.num_v_planes == 2):
-                sV1 = _get_memrange_tensor(
-                    _make_payload_memrange(
+                tail_load_V0, tail_load_V1, tail_load_V2, tail_load_V3 = (
+                    _kv_stage_loads(
+                        mTailV,
+                        tail_atom_V,
                         payload_u8,
-                        cutlass.Uint8,
-                        self.k_bytes + self.kv_plane_total_bytes,
-                        plane_elems,
-                    ),
-                    plane_stage_layout,
-                )
-                gV1 = cute.local_tile(mVHead, (STAGE, tma_cols), (0, 1, None))
-                load_V1, _, _ = cute_copy.tma_get_copy_fn(
-                    tma_atom_V, 0, cute.make_layout(1), gV1, sV1
-                )
-            if const_expr(not self.kv_fp8):
-                sK1 = _get_memrange_tensor(
-                    _make_payload_memrange(
-                        payload_u8,
-                        cutlass.BFloat16,
+                        kv_head_idx,
+                        self.k_bytes,
+                        self.num_v_planes,
+                        STAGE,
+                        S,
                         self.kv_plane_total_bytes,
-                        plane_elems,
-                    ),
-                    plane_stage_layout,
+                        self.kv_fp8,
+                    )
                 )
-                sV1 = _get_memrange_tensor(
-                    _make_payload_memrange(
-                        payload_u8,
-                        cutlass.BFloat16,
-                        self.k_bytes + self.kv_plane_total_bytes,
-                        plane_elems,
-                    ),
-                    plane_stage_layout,
-                )
-                gK1 = cute.local_tile(mKHead, (STAGE, PLANE_DIM), (0, 1, None))
-                gV1 = cute.local_tile(mVHead, (STAGE, PLANE_DIM), (0, 1, None))
-                load_K1, _, _ = cute_copy.tma_get_copy_fn(
-                    tma_atom_K, 0, cute.make_layout(1), gK1, sK1
-                )
-                load_V1, _, _ = cute_copy.tma_get_copy_fn(
-                    tma_atom_V, 0, cute.make_layout(1), gV1, sV1
-                )
-                if const_expr(self.num_k_planes >= 3):
-                    sK2 = _get_memrange_tensor(
-                        _make_payload_memrange(
-                            payload_u8,
-                            cutlass.BFloat16,
-                            2 * self.kv_plane_total_bytes,
-                            plane_elems,
-                        ),
-                        plane_stage_layout,
-                    )
-                    gK2 = cute.local_tile(mKHead, (STAGE, PLANE_DIM), (0, 2, None))
-                    load_K2, _, _ = cute_copy.tma_get_copy_fn(
-                        tma_atom_K, 0, cute.make_layout(1), gK2, sK2
-                    )
-                if const_expr(self.num_k_planes == 4):
-                    sK3 = _get_memrange_tensor(
-                        _make_payload_memrange(
-                            payload_u8,
-                            cutlass.BFloat16,
-                            3 * self.kv_plane_total_bytes,
-                            plane_elems,
-                        ),
-                        plane_stage_layout,
-                    )
-                    gK3 = cute.local_tile(mKHead, (STAGE, PLANE_DIM), (0, 3, None))
-                    load_K3, _, _ = cute_copy.tma_get_copy_fn(
-                        tma_atom_K, 0, cute.make_layout(1), gK3, sK3
-                    )
-                if const_expr(self.num_v_planes == 4):
-                    sV2 = _get_memrange_tensor(
-                        _make_payload_memrange(
-                            payload_u8,
-                            cutlass.BFloat16,
-                            self.k_bytes + 2 * self.kv_plane_total_bytes,
-                            plane_elems,
-                        ),
-                        plane_stage_layout,
-                    )
-                    sV3 = _get_memrange_tensor(
-                        _make_payload_memrange(
-                            payload_u8,
-                            cutlass.BFloat16,
-                            self.k_bytes + 3 * self.kv_plane_total_bytes,
-                            plane_elems,
-                        ),
-                        plane_stage_layout,
-                    )
-                    gV2 = cute.local_tile(mVHead, (STAGE, PLANE_DIM), (0, 2, None))
-                    gV3 = cute.local_tile(mVHead, (STAGE, PLANE_DIM), (0, 3, None))
-                    load_V2, _, _ = cute_copy.tma_get_copy_fn(
-                        tma_atom_V, 0, cute.make_layout(1), gV2, sV2
-                    )
-                    load_V3, _, _ = cute_copy.tma_get_copy_fn(
-                        tma_atom_V, 0, cute.make_layout(1), gV3, sV3
-                    )
+                cpasync.prefetch_descriptor(tail_atom_K)
+                cpasync.prefetch_descriptor(tail_atom_V)
             cpasync.prefetch_descriptor(tma_atom_K)
             cpasync.prefetch_descriptor(tma_atom_V)
             # Fetch page ids 32 at a time, one per lane, so the TMA issue loop
@@ -730,7 +784,10 @@ class PagedDecodeKernel:
             pt_base = chunk_start // Int32(self.page_size)
             pt_idx = pt_base + lane
             pid_lane = Int32(0)
-            if pt_idx < page_table_width:
+            if pt_idx < page_table_width and (
+                Int32(self.tail_pages_per_request) == Int32(0)
+                or pt_idx < tail_start_page
+            ):
                 pid_lane = mPageTable[request_idx, pt_idx]
             t = Int32(0)
             while t < ntiles:
@@ -751,39 +808,111 @@ class PagedDecodeKernel:
                     pt_base = pt_base + Int32(32)
                     pt_idx = pt_base + lane
                     pid_lane = Int32(0)
-                    if pt_idx < page_table_width:
+                    if pt_idx < page_table_width and (
+                        Int32(self.tail_pages_per_request) == Int32(0)
+                        or pt_idx < tail_start_page
+                    ):
                         pid_lane = mPageTable[request_idx, pt_idx]
                 page_id = cute.arch.shuffle_sync(pid_lane, page_idx - pt_base)
-                _issue_kv_stage_at(
-                    load_K0,
-                    load_K1,
-                    load_K2,
-                    load_K3,
-                    self.num_k_planes,
-                    STAGE,
-                    buf,
-                    full_K + buf,
-                    self.kv_copy_bytes_k,
-                    page_id,
-                    token_base,
-                    Int32(self.page_size),
-                    k_tiles_per_entry,
-                )
-                _issue_kv_stage_at(
-                    load_V0,
-                    load_V1,
-                    load_V2,
-                    load_V3,
-                    self.num_v_planes,
-                    STAGE,
-                    buf,
-                    full_V + buf,
-                    self.kv_copy_bytes_v,
-                    page_id,
-                    token_base,
-                    Int32(self.page_size),
-                    v_tiles_per_entry,
-                )
+                if const_expr(self.tail_pages_per_request > 0):
+                    if page_idx >= tail_start_page:
+                        tail_page = (
+                            request_idx * Int32(self.tail_pages_per_request)
+                            + page_idx
+                            - tail_start_page
+                        )
+                        _issue_kv_stage_at(
+                            tail_load_K0,
+                            tail_load_K1,
+                            tail_load_K2,
+                            tail_load_K3,
+                            self.num_k_planes,
+                            STAGE,
+                            buf,
+                            full_K + buf,
+                            self.kv_copy_bytes_k,
+                            tail_page,
+                            token_base,
+                            Int32(self.page_size),
+                            tail_k_tiles_per_entry,
+                        )
+                        _issue_kv_stage_at(
+                            tail_load_V0,
+                            tail_load_V1,
+                            tail_load_V2,
+                            tail_load_V3,
+                            self.num_v_planes,
+                            STAGE,
+                            buf,
+                            full_V + buf,
+                            self.kv_copy_bytes_v,
+                            tail_page,
+                            token_base,
+                            Int32(self.page_size),
+                            tail_v_tiles_per_entry,
+                        )
+                    else:
+                        _issue_kv_stage_at(
+                            load_K0,
+                            load_K1,
+                            load_K2,
+                            load_K3,
+                            self.num_k_planes,
+                            STAGE,
+                            buf,
+                            full_K + buf,
+                            self.kv_copy_bytes_k,
+                            page_id,
+                            token_base,
+                            Int32(self.page_size),
+                            k_tiles_per_entry,
+                        )
+                        _issue_kv_stage_at(
+                            load_V0,
+                            load_V1,
+                            load_V2,
+                            load_V3,
+                            self.num_v_planes,
+                            STAGE,
+                            buf,
+                            full_V + buf,
+                            self.kv_copy_bytes_v,
+                            page_id,
+                            token_base,
+                            Int32(self.page_size),
+                            v_tiles_per_entry,
+                        )
+                else:
+                    _issue_kv_stage_at(
+                        load_K0,
+                        load_K1,
+                        load_K2,
+                        load_K3,
+                        self.num_k_planes,
+                        STAGE,
+                        buf,
+                        full_K + buf,
+                        self.kv_copy_bytes_k,
+                        page_id,
+                        token_base,
+                        Int32(self.page_size),
+                        k_tiles_per_entry,
+                    )
+                    _issue_kv_stage_at(
+                        load_V0,
+                        load_V1,
+                        load_V2,
+                        load_V3,
+                        self.num_v_planes,
+                        STAGE,
+                        buf,
+                        full_V + buf,
+                        self.kv_copy_bytes_v,
+                        page_id,
+                        token_base,
+                        Int32(self.page_size),
+                        v_tiles_per_entry,
+                    )
                 t += Int32(1)
         elif is_consumer:
             causal_hi = cute.make_rmem_tensor(
@@ -820,6 +949,27 @@ class PagedDecodeKernel:
             else:
                 warp_window_lo = Int32(0)
 
+            # Relative bias: each row's byte offset and position, and the key
+            # range inside which some valid row of the request has a bias.
+            row_pos = cute.make_rmem_tensor(cute.make_layout((2,), stride=(1,)), Int32)
+            bias_row_byte = cute.make_rmem_tensor(
+                cute.make_layout((2,), stride=(1,)), Int64
+            )
+            bias_extent = Int32(0)
+            bias_key_lo = Int32(0)
+            bias_key_hi = Int32(-1)
+            if const_expr(self.has_relative_bias):
+                bias_extent = Int32(mRelBias.shape[2])
+                bias_key_lo = context_len - bias_extent + Int32(1)
+                bias_key_hi = context_len + qo_len - Int32(1)
+                for row_slot in cutlass.range_constexpr(2):
+                    row_pos[row_slot] = context_len + q_token[row_slot]
+                    bias_row_byte[row_slot] = (
+                        Int64(q_start + q_token[row_slot]) * Int64(mRelBias.stride[0])
+                        + Int64(q_head[row_slot]) * Int64(mRelBias.stride[1])
+                    ) * Int64(2)
+            mRelBiasBytes = cute.flatten(cute.recast_tensor(mRelBias, cutlass.Uint8))
+
             q_regs = cute.make_rmem_tensor(
                 cute.make_layout((self.num_mma_d_qk, 1, 4), stride=(4, 4, 1)), Uint32
             )
@@ -854,8 +1004,20 @@ class PagedDecodeKernel:
                 if const_expr(self.sinks_in_kernel):
                     # The sink logit is counted once, by key group 0.
                     if row_valid[row_slot] != Int32(0) and key_group == Int32(0):
-                        m_frag[0, row_slot] = Float32(
-                            mSinks[q_head[row_slot]] * inv_sm_scale
+                        if const_expr(self.sink_per_row):
+                            m_frag[0, row_slot] = Float32(
+                                mSinks[q_start + q_token[row_slot], q_head[row_slot]]
+                                * inv_sm_scale
+                            )
+                        else:
+                            m_frag[0, row_slot] = Float32(
+                                mSinks[q_head[row_slot]] * inv_sm_scale
+                            )
+                        # Infinite sinks zero the final output after the finite-key reduction.
+                        m_frag[0, row_slot] = cutlass.select_(
+                            m_frag[0, row_slot] == Float32.inf,
+                            -Float32.inf,
+                            m_frag[0, row_slot],
                         )
 
             frag_s_layout = cute.make_layout((1, 1, 8), stride=(8, 8, 1))
@@ -945,6 +1107,22 @@ class PagedDecodeKernel:
                                 q_in_regs=True,
                             )
                         sub_base = tile_base + Int32(sub * 16)
+                        if const_expr(self.has_relative_bias):
+                            if (
+                                sub_base <= bias_key_hi
+                                and sub_base + Int32(15) >= bias_key_lo
+                            ):
+                                _add_relative_bias_subtile(
+                                    frag_S,
+                                    mRelBiasBytes,
+                                    bias_row_byte,
+                                    row_pos,
+                                    row_valid,
+                                    sub_base,
+                                    lane_pair_base,
+                                    bias_extent,
+                                    inv_sm_scale,
+                                )
                         interior = (tile_tokens >= Int32(sub * 16 + 16)) and (
                             sub_base + Int32(15) <= causal_hi_min
                         )
@@ -1073,6 +1251,14 @@ class PagedDecodeKernel:
                         inv_d = inv_d * v_scale
                     q_row = q_start + q_token[row_slot]
                     head = q_head[row_slot]
+                    positive_sink = Int32(0)
+                    if const_expr(self.sinks_in_kernel):
+                        sink = (
+                            mSinks[q_row, head]
+                            if const_expr(self.sink_per_row)
+                            else mSinks[head]
+                        )
+                        positive_sink = Int32(sink == Float32.inf)
                     part_base = Int64(0)
                     if const_expr(self.split_kv):
                         part_base = (
@@ -1111,6 +1297,13 @@ class PagedDecodeKernel:
                             o1 = a1 * inv_d
                             o2 = a2 * inv_d
                             o3 = a3 * inv_d
+                            if positive_sink != Int32(0):
+                                o0, o1, o2, o3 = (
+                                    Float32(0),
+                                    Float32(0),
+                                    Float32(0),
+                                    Float32(0),
+                                )
                             if const_expr(self.split_kv):
                                 st_global_v2_f32(
                                     get_ptr_as_int64(
@@ -1164,7 +1357,11 @@ class PagedDecodeMergeKernel:
         heads_per_cta: int = 4,
         warps_per_row: int = 4,
         has_sinks: bool = False,
+        sink_layout: str = "head",
     ):
+        if sink_layout not in ("head", "row"):
+            raise ValueError(f"unsupported sink layout {sink_layout!r}")
+        self.sink_per_row = sink_layout == "row"
         if head_dim_vo not in (64, 128, 256):
             raise ValueError("merge kernel requires V64, V128 or V256")
         if num_q_heads % heads_per_cta != 0:
@@ -1267,8 +1464,16 @@ class PagedDecodeMergeKernel:
                 m_row, cute.arch.shuffle_sync_bfly(m_row, offset=1 << offset)
             )
         sink_log2 = Float32(-Float32.inf)
+        positive_sink = Int32(0)
         if const_expr(self.has_sinks):
-            sink_log2 = Float32(mSinks[head] * LOG2_E)
+            if const_expr(self.sink_per_row):
+                sink_log2 = Float32(mSinks[q_row, head] * LOG2_E)
+            else:
+                sink_log2 = Float32(mSinks[head] * LOG2_E)
+            positive_sink = Int32(sink_log2 == Float32.inf)
+            sink_log2 = cutlass.select_(
+                positive_sink != Int32(0), -Float32.inf, sink_log2
+            )
             m_row = _max_nan_f32(m_row, sink_log2)
         s_local = Float32(0.0)
         if m_row != -Float32.inf:
@@ -1280,7 +1485,8 @@ class PagedDecodeMergeKernel:
                 sp += Int32(32)
         s_row = cute.arch.warp_reduction_sum(s_local)
         if const_expr(self.has_sinks):
-            s_row = s_row + cute.math.exp2(sink_log2 - m_row, fastmath=True)
+            if sink_log2 != -Float32.inf:
+                s_row = s_row + cute.math.exp2(sink_log2 - m_row, fastmath=True)
 
         SharedStorage = self._get_shared_storage_cls()
         smem = cutlass.utils.SmemAllocator()
@@ -1378,7 +1584,12 @@ class PagedDecodeMergeKernel:
                     total = Float32(0.0)
                     for wr in cutlass.range_constexpr(WPR):
                         total += sAcc[head_local, wr, column_offset + lane * 4 + c]
-                    mO[q_row, head, column_offset + lane * 4 + c] = (total * inv).to(
+                    value = Float32(
+                        cutlass.select_(
+                            positive_sink != Int32(0), Float32(0), total * inv
+                        )
+                    )
+                    mO[q_row, head, column_offset + lane * 4 + c] = value.to(
                         cutlass.BFloat16
                     )
 

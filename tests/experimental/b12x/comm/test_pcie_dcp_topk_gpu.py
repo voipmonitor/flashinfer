@@ -63,7 +63,133 @@ def _inputs(
         + global_rank * 4096
         + step * 64
     )
+    score_bits.view(-1)[:4] = torch.tensor(
+        [0x7FC01234, -2147483648, -8388608, 0x7F800000], dtype=torch.int32
+    )
     return indices, score_bits.to(device).view(torch.float32)
+
+
+def _counts(
+    step: int, global_rank: int, rows: int, device: torch.device
+) -> torch.Tensor:
+    values = torch.tensor([0, 1, 3, 7, 31, 2047, 2048, -4, 4096], dtype=torch.int32)
+    indices = (torch.arange(rows) + step + global_rank).remainder(values.numel())
+    return values[indices].to(device)
+
+
+def _graph_inputs(step, rank, rows, device, pattern):
+    indices, scores = _inputs(step, rank, rows, device)
+    if pattern is None:
+        return indices, scores
+    if pattern == "short":
+        counts = (torch.arange(rows, dtype=torch.int32, device=device) + rank) % 7 + 1
+    else:
+        length = -(rank % 2) if pattern == "zero" else TOPK + rank % 2
+        counts = torch.full((rows,), length, dtype=torch.int32, device=device)
+    if pattern == "exceptional":
+        indices[:, 0] = -1
+        scores[:, 0] = -torch.inf
+        scores.view(torch.int32)[:, -1] = (
+            0x7FC01234,
+            0x7F800000,
+            -8388608,
+            -2147483648,
+        )[rank % 4]
+        if rank % 4 == 2:
+            indices[:, -1] = -2
+    return indices, scores, counts
+
+
+def _assert_staged(staged, peers, owner_rank):
+    expected_indices, expected_scores = owner_stage_reference(
+        torch.stack([item[0] for item in peers]),
+        torch.stack([item[1] for item in peers]),
+        owner_rank,
+    )
+    indices, scores, *counts = staged
+    if counts:
+        expected_counts = torch.zeros_like(counts[0])
+        owner_rows = expected_counts.shape[0]
+        start = owner_rank * owner_rows
+        local_counts = torch.stack(
+            [item[2][start : start + owner_rows] for item in peers]
+        )
+        expected_counts[: local_counts.shape[1]].copy_(local_counts.T.clamp(0, TOPK))
+        assert torch.equal(counts[0], expected_counts)
+        # A vectorized copy can also write extra words in the final pack.
+        # Only the words addressed by the received counts have defined values.
+        columns = torch.arange(TOPK, device=indices.device)
+        live = (columns < expected_counts[..., None]).flatten(1)
+        assert torch.equal(indices[live], expected_indices[live])
+        assert torch.equal(
+            scores.view(torch.int32)[live], expected_scores.view(torch.int32)[live]
+        )
+    else:
+        assert torch.equal(indices, expected_indices)
+        assert torch.equal(scores.view(torch.int32), expected_scores.view(torch.int32))
+
+
+def _check_graph_replay(runtime, plans, session, schedule, rank, group_ranks):
+    device = runtime.device
+    cases = {}
+    try:
+        for rows, pattern in dict(schedule).items():
+            plan = plans[rows]
+            inputs = _graph_inputs(10, rank, rows, device, pattern)
+            reserved = runtime.graph_candidate_views(rows)
+            if pattern is not None:
+                reserved += (runtime.graph_count_views(rows),)
+            consumed = tuple(torch.empty_like(view) for view in reserved)
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            cases[rows] = graph, inputs, consumed
+            dist.barrier()
+            with session.capture(), runtime.capture(plan=plan), torch.cuda.graph(graph):
+                staged = runtime.stage_candidates(*inputs, plan=plan)
+                if runtime.rank == 0:
+                    torch.cuda._sleep(20_000_000)
+                for target, source in zip(consumed, staged, strict=True):
+                    target.copy_(source)
+            assert _cuda_graph_kernel_count(graph) == 1 + int(runtime.rank == 0)
+            assert tuple(t.data_ptr() for t in staged) == tuple(
+                t.data_ptr() for t in reserved
+            )
+
+        # Queue graphs with changing capacities and counts. The shared slot
+        # cannot be reused until the slow owner's preceding consumer retires.
+        replay_inputs = [
+            _graph_inputs(20 + step, rank, rows, device, pattern)
+            for step, (rows, pattern) in enumerate(schedule)
+        ]
+        snapshots = [
+            tuple(torch.empty_like(view) for view in cases[rows][2])
+            for rows, _ in schedule
+        ]
+        torch.cuda.synchronize(device)
+        before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
+        for (rows, _), sources, saved in zip(
+            schedule, replay_inputs, snapshots, strict=True
+        ):
+            graph, inputs, consumed = cases[rows]
+            for target, source in zip(inputs, sources, strict=True):
+                target.copy_(source)
+            for target in consumed:
+                target.view(torch.int32).fill_(0x12345678)
+            graph.replay()
+            for target, source in zip(saved, consumed, strict=True):
+                target.copy_(source)
+        torch.cuda.synchronize(device)
+        assert torch.cuda.memory_stats(device)["allocation.all.allocated"] == before
+        for step, ((rows, pattern), saved) in enumerate(
+            zip(schedule, snapshots, strict=True)
+        ):
+            peers = [
+                _graph_inputs(20 + step, source, rows, device, pattern)
+                for source in group_ranks
+            ]
+            _assert_staged(saved, peers, runtime.rank)
+    finally:
+        for graph, *_ in cases.values():
+            graph.reset()
 
 
 def _dcp_groups(tp_world_size: int, dcp_world_size: int):
@@ -101,12 +227,16 @@ def _worker(
         )
     )
 
-    max_rows = (MAX_ROWS // dcp_world_size) * dcp_world_size
+    max_rows = MAX_ROWS
     test_rows = sorted(
         {
-            dcp_world_size,
-            2 * dcp_world_size,
-            4 * dcp_world_size,
+            1,
+            3,
+            4,
+            6,
+            8,
+            17,
+            max_rows - 1,
             max_rows,
         }
     )
@@ -135,9 +265,9 @@ def _worker(
         collective_barrier=barrier,
     )
 
-    def prepare(runtime, rows, name):
+    def prepare(runtime, rows, name, counts=None):
         indices, scores = _inputs(0, rank, rows, device)
-        call = dict(local_indices=indices, local_scores=scores)
+        call = dict(local_indices=indices, local_scores=scores, local_counts=counts)
         query = preparation.query_from_runtime(runtime, call=call)
         plan = preparation.plan(query, runtime=runtime)
         session.prepare(
@@ -158,7 +288,24 @@ def _worker(
         eager_plans = {
             rows: prepare(owner, rows, f"topk-eager-{rows}") for rows in test_rows
         }
-        graph_plan = prepare(graph_owner, max_rows, "topk-graph")
+        graph_plans = {
+            rows: prepare(graph_owner, rows, f"topk-graph-{rows}") for rows in test_rows
+        }
+        counted_plans = {
+            rows: prepare(
+                owner, rows, f"topk-counted-{rows}", _counts(0, rank, rows, device)
+            )
+            for rows in test_rows
+        }
+        counted_graph_plans = {
+            rows: prepare(
+                graph_owner,
+                rows,
+                f"topk-counted-graph-{rows}",
+                _counts(0, rank, rows, device),
+            )
+            for rows in test_rows
+        }
         session.freeze()
         eager_output_ptrs = []
         for step, rows in enumerate(test_rows):
@@ -206,90 +353,52 @@ def _worker(
         assert eager_output_ptrs[0] != eager_output_ptrs[1]
         assert eager_output_ptrs[0] == eager_output_ptrs[2]
         assert eager_output_ptrs[1] == eager_output_ptrs[3]
-        graph_rows = max_rows
-        graph_indices, graph_scores = _inputs(10, rank, graph_rows, device)
-        graph_owner_rows = graph_rows // dcp_world_size
-        graph_candidate_width = dcp_world_size * TOPK
-        consumed_indices = torch.empty(
-            (graph_owner_rows, graph_candidate_width),
-            dtype=torch.int32,
-            device=device,
-        )
-        consumed_scores = torch.empty(
-            (graph_owner_rows, graph_candidate_width),
-            dtype=torch.float32,
-            device=device,
-        )
-        graph = torch.cuda.CUDAGraph(keep_graph=True)
-        dist.barrier()
-        with (
-            session.capture(),
-            graph_owner.capture(plan=graph_plan),
-            torch.cuda.graph(graph),
-        ):
-            graph_candidate_indices, graph_candidate_scores = (
-                graph_owner.stage_candidates(
-                    graph_indices, graph_scores, plan=graph_plan
-                )
+        for step, rows in enumerate(test_rows, start=40):
+            local_indices, local_scores = _inputs(step, rank, rows, device)
+            local_counts = _counts(step, rank, rows, device)
+            staged = owner.stage_candidates(
+                local_indices, local_scores, local_counts, plan=counted_plans[rows]
             )
-            # Force one owner per DCP group to remain in its consumer while
-            # faster peers are ready to replay and write its staging slab.
-            if dcp_rank == 0:
-                torch.cuda._sleep(20_000_000)
-            consumed_indices.copy_(graph_candidate_indices)
-            consumed_scores.copy_(graph_candidate_scores)
-
-        # The transport remains one kernel node. Rank zero's deliberate skew
-        # contributes the only additional kernel; the two consumers are memcpy
-        # nodes. The fixed-slot safety barrier is part of the transport kernel.
-        assert _cuda_graph_kernel_count(graph) == 1 + int(dcp_rank == 0)
-        assert graph_owner._graph_slot is not None
-        graph_views = graph_owner._candidate_views[graph_owner._graph_slot]
-        assert graph_candidate_indices.data_ptr() == graph_views[0].data_ptr()
-        assert graph_candidate_scores.data_ptr() == graph_views[1].data_ptr()
-        assert (
-            graph_candidate_indices.data_ptr()
-            == graph_owner._staging_ptrs[graph_owner._graph_slot][dcp_rank]
-        )
-
-        # Queue several replays without host/device synchronization. Every
-        # replay writes the capture-stable slab, then consumes it on the same
-        # stream. The next replay's in-kernel peer barrier prevents any rank
-        # from overwriting it until all prior consumers have retired.
-        replay_steps = tuple(range(20, 27))
-        replay_inputs = [
-            _inputs(replay_step, rank, graph_rows, device)
-            for replay_step in replay_steps
-        ]
-        replayed_indices = [torch.empty_like(consumed_indices) for _ in replay_steps]
-        replayed_scores = [torch.empty_like(consumed_scores) for _ in replay_steps]
-        torch.cuda.synchronize(device)
-        for replay_idx in range(len(replay_steps)):
-            next_indices, next_scores = replay_inputs[replay_idx]
-            graph_indices.copy_(next_indices)
-            graph_scores.copy_(next_scores)
-            graph.replay()
-            replayed_indices[replay_idx].copy_(consumed_indices)
-            replayed_scores[replay_idx].copy_(consumed_scores)
-        torch.cuda.synchronize(device)
-
-        for replay_idx, replay_step in enumerate(replay_steps):
-            expected_rank_inputs = [
-                _inputs(replay_step, source, graph_rows, device)
+            peers = [
+                (
+                    *_inputs(step, source, rows, device),
+                    _counts(step, source, rows, device),
+                )
                 for source in dcp_global_ranks
             ]
-            expected_indices, expected_scores = owner_stage_reference(
-                torch.stack([item[0] for item in expected_rank_inputs]),
-                torch.stack([item[1] for item in expected_rank_inputs]),
-                dcp_rank,
-            )
-            torch.testing.assert_close(
-                replayed_indices[replay_idx], expected_indices, rtol=0, atol=0
-            )
-            assert torch.equal(
-                replayed_scores[replay_idx].view(torch.int32),
-                expected_scores.view(torch.int32),
-            )
+            _assert_staged(staged, peers, dcp_rank)
+
+        row_schedule = (max_rows, 1, 8, 3, 17, 4, 6, max_rows - 1, max_rows, 3, 8, 1)
+        _check_graph_replay(
+            graph_owner,
+            graph_plans,
+            session,
+            tuple((rows, None) for rows in row_schedule),
+            rank,
+            dcp_global_ranks,
+        )
+        counted_schedule = (
+            (max_rows, "long"),
+            (1, "short"),
+            (max_rows, "zero"),
+            (3, "exceptional"),
+            (8, "long"),
+            (8, "short"),
+            (8, "zero"),
+            (8, "exceptional"),
+            (17, "short"),
+            (max_rows - 1, "long"),
+            (4, "zero"),
+            (6, "exceptional"),
+        )
+        _check_graph_replay(
+            graph_owner,
+            counted_graph_plans,
+            session,
+            counted_schedule,
+            rank,
+            dcp_global_ranks,
+        )
         dist.barrier()
         torch.cuda.synchronize(device)
     finally:
@@ -305,8 +414,8 @@ def test_pcie_dcp_topk_exact_owner_exchange():
     tp_world_size = int(os.getenv("B12X_PCIE_DCP_TOPK_TP", "8"))
     dcp_world_size = int(os.getenv("B12X_PCIE_DCP_TOPK_DCP", "4"))
     if (
-        tp_world_size not in (2, 3, 4, 6, 8)
-        or dcp_world_size not in (2, 3, 4, 6, 8)
+        tp_world_size not in (2, 3, 4, 6, 8, 16)
+        or dcp_world_size not in (2, 3, 4, 6, 8, 16)
         or tp_world_size % dcp_world_size != 0
     ):
         pytest.skip("unsupported TP/DCP top-k geometry")

@@ -55,6 +55,7 @@ _TRITON_HOOK = None
 _RESIDENT_PROGRAMS = weakref.WeakValueDictionary()
 _LIVE_RETAINED_PROGRAMS = weakref.WeakSet()
 _NATIVE_JITS = weakref.WeakSet()
+_PLANNED_TRITON_JITS = weakref.WeakSet()
 
 
 def retained_program_keys():
@@ -126,7 +127,7 @@ def evict_planning_artifacts(programs: Iterable[ProgramKey] | None = None) -> in
                 for mirror in mirrors:
                     mirror.pop(key, None)
             removed += len(obsolete)
-    for jit in tuple(_NATIVE_JITS):
+    for jit in tuple(_PLANNED_TRITON_JITS):
         for kernel_cache, key_cache, *_ in jit.device_caches.values():
             obsolete = {key for key, kernel in kernel_cache.items() if stale(kernel)}
             for key in obsolete:
@@ -578,6 +579,8 @@ def _ensure_triton_hook():
 
     def run_observed(self, *args, **kwargs):
         result = original_run(self, *args, **kwargs)
+        if isinstance(result, DeferredTritonKernel):
+            _PLANNED_TRITON_JITS.add(self)
         module = getattr(self.fn, "__module__", "")
         if module == "b12x" or module.startswith("b12x."):
             _NATIVE_JITS.add(self)

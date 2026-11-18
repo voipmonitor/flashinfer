@@ -28,6 +28,10 @@ class Caps:
     (``descale_layout="tensor"``), per request (``"request"``) or per request
     and KV head (``"head"``).  ``causal=False`` lets every query row see the whole
     sequence (speculative drafters that attend across their query block).
+    ``has_relative_bias`` adds a per-row, per-head bias to the logit of each key
+    by its distance from the row (see ``bind``).  ``sink_layout`` selects one
+    attention-sink logit per head (``"head"``) or per query row and head
+    (``"row"``).
     """
 
     device: torch.device | str
@@ -43,6 +47,10 @@ class Caps:
     causal: bool = True
     has_sinks: bool = False
     descale_layout: str = "tensor"
+    caller_owned_placeholders: bool = False
+    has_relative_bias: bool = False
+    sink_layout: str = "head"
+    tail_pages_per_request: int = 0
 
 
 def plan(
@@ -66,6 +74,9 @@ def bind(
     attention_sink_bias: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
+    relative_attention_bias: torch.Tensor | None = None,
+    tail_k_cache: torch.Tensor | None = None,
+    tail_v_cache: torch.Tensor | None = None,
     softmax_scale: float | None = None,
 ) -> Binding:
     """Bind caller tensors to a prepared plan (capture-safe: no allocation).
@@ -77,6 +88,27 @@ def bind(
     [B + 1]``; FP8 caches take float32 ``k_descale``/``v_descale`` of shape
     ``[1]``, ``[B]`` or ``[B, Hkv]`` per ``Caps.descale_layout``.  ``scratch`` is the
     caller-owned buffers of ``plan.scratch_specs()``.
+
+    A plan with ``Caps.has_relative_bias`` takes BF16 ``relative_attention_bias
+    [T, Hq, extent]`` (more rows allowed).  Query row ``t`` of a request sits at
+    position ``cache_seqlen - q_len + (t - first row)``; the key at position ``p``
+    gets ``softmax_scale * q.k + bias[t, h, position - p]`` when the distance is
+    in ``[0, extent)`` and no bias otherwise.  Masked keys stay masked.
+
+    A plan with ``Caps.has_sinks`` takes float32 ``attention_sink_bias``: ``[Hq]``,
+    or ``[T, Hq]`` (more rows allowed) with ``Caps.sink_layout="row"``.  The sink
+    is one more logit in the row's softmax denominator with a zero value, so
+    the output is ``o * sigmoid(lse - sink)`` for the sink-free output ``o`` and
+    natural-log ``lse`` of the row's key logits.  A ``+inf`` sink gives a zero
+    output and a ``-inf`` sink the sink-free output, with or without split-KV.
+
+    With ``tail_pages_per_request=P``, the tail K and V caches have shapes
+    ``[B*P, page_size, Hkv, Dqk]`` and ``[B*P, page_size, Hkv, Dvo]`` and the
+    persistent caches' dtype. The page
+    containing position ``cache_seqlen - q_len`` and every following page come
+    from the request's private tail pages. Earlier pages use ``page_table``.
+    The caller stages the committed partial page and all query K/V in the tail;
+    attention reads both sources without modifying either cache.
 
     All tensors must be on the plan's device with unit inner strides.  Q and
     cache addresses and outer strides must be 16-byte aligned.  Cache outer
@@ -99,6 +131,9 @@ def bind(
         attention_sink_bias=attention_sink_bias,
         k_descale=k_descale,
         v_descale=v_descale,
+        relative_attention_bias=relative_attention_bias,
+        tail_k_cache=tail_k_cache,
+        tail_v_cache=tail_v_cache,
         softmax_scale=softmax_scale,
     )
 
@@ -120,6 +155,7 @@ def write_kv(
     slot_mapping: torch.Tensor,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    dummy_scale: torch.Tensor | None = None,
 ) -> None:
     """Append new K/V rows to the layer family's paged caches.
 
@@ -137,6 +173,7 @@ def write_kv(
         slot_mapping=slot_mapping,
         k_scale=k_scale,
         v_scale=v_scale,
+        dummy_scale=dummy_scale,
     )
 
 
@@ -157,6 +194,9 @@ def supports(
     causal: bool = True,
     has_sinks: bool = False,
     descale_layout: str = "tensor",
+    has_relative_bias: bool = False,
+    sink_layout: str = "head",
+    tail_pages_per_request: int = 0,
 ) -> bool:
     """Whether a layer family's geometry is within this op's contract."""
     try:
@@ -175,6 +215,9 @@ def supports(
                 has_sinks=bool(has_sinks),
                 descale_layout=str(descale_layout),
                 sm_count=1,
+                has_relative_bias=bool(has_relative_bias),
+                sink_layout=str(sink_layout),
+                tail_pages_per_request=int(tail_pages_per_request),
             )
         )
     except (TypeError, ValueError):

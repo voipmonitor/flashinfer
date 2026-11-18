@@ -32,7 +32,7 @@ from b12x._lib.intrinsics.packed import fp8x4_e4m3_to_half2x2
 from b12x._lib.intrinsics.memory import get_ptr_as_int64
 from b12x._lib.intrinsics.packed import half2_mul
 from b12x._lib.intrinsics.packed import half2_to_float2_scaled
-from b12x._lib.intrinsics.trellis import iq2_xxs_descriptor_pair
+from b12x._lib.intrinsics.trellis import packed_decode_iq2_xxs_to_bfloat2x4
 from b12x._lib.intrinsics.sync import ld_global_acquire_i32
 from b12x._lib.intrinsics.memory import ld_global_nc_u32
 from b12x._lib.intrinsics.memory import ld_global_v4_f32
@@ -147,6 +147,7 @@ class W4A16GemmKernel:
         dynamic_num_experts: bool = False,
         schedule_route_block_factor: int = 1,
         pipeline_stages: int | None = None,
+        preload_all_tiles: bool = False,
         skip_empty_m_blocks: bool | None = None,
         small_m_occupancy: int | None = None,
         csf_inline_scales: bool = False,
@@ -379,7 +380,6 @@ class W4A16GemmKernel:
         self.b_region_variable = (
             self.weight_layout_trellis256 or self.weight_layout_block
         )
-        self.b_bundle_rows = 2
         self.scale_format = scale_format
         self.csf_block_inline = bool(csf_inline_scales)
         if self.csf_block_inline:
@@ -482,6 +482,12 @@ class W4A16GemmKernel:
             scale_format=scale_format,
             small_m_occupancy=small_m_occupancy,
         )
+        self.preload_all_tiles = bool(preload_all_tiles and self.k_tiles <= self.stages)
+        if self.preload_all_tiles:
+            if self.k_tiles > 4 or self.csf_block_inline or self.weight_layout_block:
+                raise ValueError(
+                    "whole-K preload requires at most four native weight tiles"
+                )
         self.max_m_blocks = int(max_m_blocks)
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -531,6 +537,13 @@ class W4A16GemmKernel:
         self.b_sh_stride_threads = self.b_sh_stride
         self.b_sh_stage = self.b_sh_stride * self.cta_k_blocks
         self.b_sh_wr_iters = self.b_sh_stage // self.cta_threads
+        self.paired_native_weights = (
+            weight_layout == "modelopt"
+            and self.scale_format_e8m0_k32
+            and not self.is_fp16
+            and self.b_sh_wr_iters % 2 == 0
+        )
+        self.b_bundle_rows = 3 if self.paired_native_weights else 2
         # Native t256 uses 4*bits bytes per 32 codes;
         # packed/modelopt use 16 bytes for the same logical unit.
         self.b_unit_bytes = 16
@@ -650,6 +663,7 @@ class W4A16GemmKernel:
             self.tile_n,
             self.tile_k,
             self.stages,
+            self.preload_all_tiles,
             self.cta_threads,
             self.moe_block_size,
             self.element_dtype,
@@ -970,6 +984,123 @@ class W4A16GemmKernel:
         active_size_m: Int32,
         emit_tile: cutlass.Constexpr = None,
     ):
+        handled_whole_k = Int32(0)
+        if cutlass.const_expr(
+            self.weight_layout == "modelopt"
+            and self.scale_format == "e8m0_k32"
+            and self.k_tiles <= 3
+            and emit_tile is None
+        ):
+            n_tiles = Int32(self.n_tiles)
+            route_blocks = active_size_m * Int32(self.top_k)
+            if cutlass.const_expr(self.dense_route_fast_path):
+                route_blocks = (
+                    active_size_m + Int32(self.moe_block_size) - Int32(1)
+                ) // Int32(self.moe_block_size)
+            elif cutlass.const_expr(not self.direct_topk_routes):
+                route_blocks = packed_route_count[Int32(0)].to(Int32) // Int32(
+                    self.moe_block_size * self.schedule_route_block_factor
+                )
+            global_mn_tiles = route_blocks * n_tiles
+            if global_mn_tiles >= grid_x:
+                handled_whole_k = Int32(1)
+                work_mn_tile = cta
+                work_mn_end = global_mn_tiles
+                work_mn_stride = grid_x
+                if cutlass.const_expr(
+                    self.mul_topk_weights and not self.fused_topk_sum
+                ):
+                    tiles_per_cta = global_mn_tiles // grid_x
+                    extra_ctas = global_mn_tiles - tiles_per_cta * grid_x
+                    extra_before = cta
+                    if extra_before > extra_ctas:
+                        extra_before = extra_ctas
+                    work_mn_tile = cta * tiles_per_cta + extra_before
+                    work_mn_end = work_mn_tile + tiles_per_cta
+                    if cta < extra_ctas:
+                        work_mn_end += Int32(1)
+                    work_mn_stride = Int32(1)
+                while work_mn_tile < work_mn_end:
+                    route_block_idx = work_mn_tile // n_tiles
+                    output_n_tile = work_mn_tile - route_block_idx * n_tiles
+                    if cutlass.const_expr(self.dense_route_fast_path):
+                        expert_idx = Int32(0)
+                    elif cutlass.const_expr(self.direct_topk_routes):
+                        expert_idx = packed_route_indices[route_block_idx].to(Int32)
+                    else:
+                        expert_idx = block_expert_ids[route_block_idx].to(Int32)
+                    if expert_idx >= Int32(0):
+                        self._run_tile(
+                            a_bf16_flat,
+                            a_alt_bf16_flat,
+                            b_i32_flat,
+                            c_bf16_flat,
+                            scales_i32_flat,
+                            global_scale,
+                            packed_route_indices,
+                            topk_weights_flat,
+                            c_tmp_f32_flat,
+                            locks_i32_flat,
+                            trellis_lut_addr,
+                            smem_base,
+                            tid,
+                            route_block_idx,
+                            expert_idx,
+                            output_n_tile,
+                            Int32(0),
+                            Int32(self.k_tiles),
+                            Int32(1),
+                            Int32(0),
+                            Int32(0),
+                            active_size_m,
+                        )
+                    work_mn_tile += work_mn_stride
+        if handled_whole_k == Int32(0):
+            self._run_persistent_gemm_general(
+                a_bf16_flat,
+                a_alt_bf16_flat,
+                b_i32_flat,
+                c_bf16_flat,
+                scales_i32_flat,
+                global_scale,
+                packed_route_indices,
+                block_expert_ids,
+                packed_route_count,
+                topk_weights_flat,
+                c_tmp_f32_flat,
+                locks_i32_flat,
+                trellis_lut_addr,
+                smem_base,
+                tid,
+                cta,
+                grid_x,
+                active_size_m,
+                emit_tile,
+            )
+
+    @cute.jit
+    def _run_persistent_gemm_general(
+        self,
+        a_bf16_flat: cute.Tensor,
+        a_alt_bf16_flat: cute.Tensor,
+        b_i32_flat: cute.Tensor,
+        c_bf16_flat: cute.Tensor,
+        scales_i32_flat: cute.Tensor,
+        global_scale: cute.Tensor,
+        packed_route_indices: cute.Tensor,
+        block_expert_ids: cute.Tensor,
+        packed_route_count: cute.Tensor,
+        topk_weights_flat: cute.Tensor,
+        c_tmp_f32_flat: cute.Tensor,
+        locks_i32_flat: cute.Tensor,
+        trellis_lut_addr: Int64,
+        smem_base: Int32,
+        tid: Int32,
+        cta: Int32,
+        grid_x: Int32,
+        active_size_m: Int32,
+        emit_tile: cutlass.Constexpr = None,
+    ):
         n_tiles = Int32(self.n_tiles)
         route_blocks = active_size_m * Int32(self.top_k)
         if cutlass.const_expr(self.dense_route_fast_path):
@@ -1012,6 +1143,14 @@ class W4A16GemmKernel:
                     force_one_tile_per_cta = Int32(1)
             whole_k_waves = Int32(0)
             if cutlass.const_expr(self.weight_layout_block and self.direct_topk_routes):
+                if global_mn_tiles >= grid_x:
+                    whole_k_waves = Int32(1)
+            if cutlass.const_expr(
+                self.weight_layout == "modelopt"
+                and self.scale_format == "e8m0_k32"
+                and self.k_tiles <= 3
+            ):
+                # Keep K parallelism when output tiles cannot fill the grid.
                 if global_mn_tiles >= grid_x:
                     whole_k_waves = Int32(1)
             if whole_k_waves != Int32(0):
@@ -2066,6 +2205,7 @@ class W4A16GemmKernel:
                         ):
                             self._load_next_fragment_bundle(
                                 b_scale_next,
+                                b_scale_cur,
                                 a_regs_next,
                                 smem_base,
                                 tid,
@@ -2174,6 +2314,7 @@ class W4A16GemmKernel:
                             cute.arch.sync_threads()
                             self._load_next_fragment_bundle(
                                 b_scale_next,
+                                b_scale_cur,
                                 a_regs_next,
                                 smem_base,
                                 tid,
@@ -2302,8 +2443,8 @@ class W4A16GemmKernel:
 
         for jj in cutlass.range_constexpr(4):
             if cutlass.const_expr(self.weight_layout_block):
-                q0, q1, base_pair, subscale_pair = self._load_iq2_xs_fragment(
-                    smem_base, tid, pipe, Int32(kk), jj
+                q0, q1, base_pair, subscale_pair, signs_row1, half = (
+                    self._load_iq2_xs_fragment(smem_base, tid, pipe, Int32(kk), jj)
                 )
                 self._scaled_dequant_b_fragment_iq2_xs(
                     b_frag,
@@ -2311,6 +2452,8 @@ class W4A16GemmKernel:
                     q1,
                     base_pair,
                     subscale_pair,
+                    signs_row1,
+                    half,
                     trellis_lut_addr,
                     tid,
                 )
@@ -2982,6 +3125,7 @@ class W4A16GemmKernel:
             + tc_col
         ) * Int32(4)
         base_pair = ld_shared_u32(base_addr)
+        signs_row1, half = Uint32(0), Int32(0)
         if cutlass.const_expr(self.q8):
             tile_base = (kt_local * Int32(self.cta_n_blocks) + local_n16) * Int32(16)
             addr = (
@@ -3005,9 +3149,9 @@ class W4A16GemmKernel:
             signs0, signs1 = ld_shared_v2_u32(
                 record_addr + Int32(self.cta_n_blocks * self.block_tile_bytes)
             )
-            q0 = iq2_xxs_descriptor_pair(grid0, signs0, kt_local % Int32(2))
-            q1 = iq2_xxs_descriptor_pair(grid1, signs1, kt_local % Int32(2))
-            subscale_pair = (signs0 >> 28) | ((signs1 >> 28) << 8)
+            q0, q1 = grid0, grid1
+            subscale_pair, signs_row1 = signs0, signs1
+            half = kt_local % Int32(2)
         else:
             scale_addr = scale_region + (
                 (kt_local // Int32(2) * Int32(self.cta_n_blocks) + local_n16)
@@ -3021,7 +3165,34 @@ class W4A16GemmKernel:
                 b_region + (tile_base + tc_col * Int32(2)) * Int32(4)
             )
             subscale_pair = scale_pair >> shift
-        return q0, q1, base_pair, subscale_pair
+        return q0, q1, base_pair, subscale_pair, signs_row1, half
+
+    @cute.jit
+    def _load_b_weight_registers(
+        self,
+        smem_base: Int32,
+        b_sh_rd: Int32,
+        pipe: Int32,
+        kk: Int32,
+    ):
+        if cutlass.const_expr(self.weight_layout == "modelopt"):
+            q0, q1, q2, q3 = self._load_b_registers_modelopt_shared(
+                smem_base,
+                b_sh_rd,
+                pipe,
+                kk,
+            )
+        else:
+            b_addr = self._int4_addr(
+                smem_base,
+                Int32(self.sh_b_off)
+                + pipe * Int32(self.b_sh_stage)
+                + Int32(self.b_sh_stride) * kk
+                + b_sh_rd,
+            )
+            q0, q1, q2, q3 = ld_shared_v4_u32(b_addr)
+
+        return q0, q1, q2, q3
 
     @cute.jit
     def _load_b_scale_registers(
@@ -3041,23 +3212,19 @@ class W4A16GemmKernel:
             return self._load_b_registers_trellis256(
                 smem_base, tid, pipe, kk, tile_idx, dynamic_pair_override
             )
-        if cutlass.const_expr(self.weight_layout == "modelopt"):
-            q0, q1, q2, q3 = self._load_b_registers_modelopt_shared(
-                smem_base,
-                b_sh_rd,
-                pipe,
-                kk,
-            )
-        else:
-            b_addr = self._int4_addr(
-                smem_base,
-                Int32(self.sh_b_off)
-                + pipe * Int32(self.b_sh_stage)
-                + Int32(self.b_sh_stride) * kk
-                + b_sh_rd,
-            )
-            q0, q1, q2, q3 = ld_shared_v4_u32(b_addr)
+        q0, q1, q2, q3 = self._load_b_weight_registers(smem_base, b_sh_rd, pipe, kk)
+        s0, s1, s2, s3 = self._load_scale_registers(smem_base, tid, s_sh_rd, pipe, kk)
+        return q0, q1, q2, q3, s0, s1, s2, s3
 
+    @cute.jit
+    def _load_scale_registers(
+        self,
+        smem_base: Int32,
+        tid: Int32,
+        s_sh_rd: Int32,
+        pipe: Int32,
+        kk: Int32,
+    ):
         warp_id = tid // Int32(32)
         warp_row = warp_id // Int32(self.tb_n_warps)
         cur_group_id = Int32(self.b_sh_wr_iters) * warp_row + kk
@@ -3112,7 +3279,7 @@ class W4A16GemmKernel:
             s_pack0, s_pack1 = ld_shared_v2_u32(s_addr)
         s0, s1 = self._dequant_scale_x4_to_elem2x2(s_pack0)
         s2, s3 = self._dequant_scale_x4_to_elem2x2(s_pack1)
-        return q0, q1, q2, q3, s0, s1, s2, s3
+        return s0, s1, s2, s3
 
     @cute.jit
     def _load_b_scale_register_bundle(
@@ -3129,20 +3296,28 @@ class W4A16GemmKernel:
     ):
         if cutlass.const_expr(self.weight_layout_block):
             return
-        q0, q1, q2, q3, s0, s1, s2, s3 = self._load_b_scale_registers(
-            smem_base,
-            tid,
-            b_sh_rd,
-            s_sh_rd,
-            pipe,
-            kk,
-            tile_idx,
-            dynamic_pair_override,
-        )
-        regs[0, 0] = q0
-        regs[0, 1] = q1
-        regs[0, 2] = q2
-        regs[0, 3] = q3
+        if cutlass.const_expr(self.paired_native_weights):
+            self._load_b_registers_modelopt_shared_pair(
+                regs, smem_base, b_sh_rd, pipe, kk
+            )
+            s0, s1, s2, s3 = self._load_scale_registers(
+                smem_base, tid, s_sh_rd, pipe, kk
+            )
+        else:
+            q0, q1, q2, q3, s0, s1, s2, s3 = self._load_b_scale_registers(
+                smem_base,
+                tid,
+                b_sh_rd,
+                s_sh_rd,
+                pipe,
+                kk,
+                tile_idx,
+                dynamic_pair_override,
+            )
+            regs[0, 0] = q0
+            regs[0, 1] = q1
+            regs[0, 2] = q2
+            regs[0, 3] = q3
         regs[1, 0] = s0
         regs[1, 1] = s1
         regs[1, 2] = s2
@@ -3168,6 +3343,7 @@ class W4A16GemmKernel:
     def _load_next_fragment_bundle(
         self,
         b_scale_next: cute.Tensor,
+        b_scale_cur: cute.Tensor,
         a_regs_next: cute.Tensor,
         smem_base: Int32,
         tid: Int32,
@@ -3187,17 +3363,37 @@ class W4A16GemmKernel:
 
         if cutlass.const_expr(kk + 1 < self.b_sh_wr_iters):
             if tile_idx < k_tiles:
-                self._load_b_scale_register_bundle(
-                    b_scale_next,
-                    smem_base,
-                    tid,
-                    b_sh_rd,
-                    s_sh_rd,
-                    Int32(pipe),
-                    Int32(kk + 1),
-                    reduce_k_tile + tile_idx,
-                    dynamic_pair_override,
-                )
+                if cutlass.const_expr(
+                    self.scale_format_e8m0_k32
+                    and not self.is_fp16
+                    and self.b_sh_wr_iters % 2 == 0
+                    and kk % 2 == 0
+                ):
+                    if cutlass.const_expr(self.paired_native_weights):
+                        for jj in cutlass.range_constexpr(4):
+                            b_scale_next[0, jj] = b_scale_cur[2, jj]
+                    else:
+                        q0, q1, q2, q3 = self._load_b_weight_registers(
+                            smem_base, b_sh_rd, Int32(pipe), Int32(kk + 1)
+                        )
+                        b_scale_next[0, 0] = q0
+                        b_scale_next[0, 1] = q1
+                        b_scale_next[0, 2] = q2
+                        b_scale_next[0, 3] = q3
+                    for jj in cutlass.range_constexpr(4):
+                        b_scale_next[1, jj] = b_scale_cur[1, jj]
+                else:
+                    self._load_b_scale_register_bundle(
+                        b_scale_next,
+                        smem_base,
+                        tid,
+                        b_sh_rd,
+                        s_sh_rd,
+                        Int32(pipe),
+                        Int32(kk + 1),
+                        reduce_k_tile + tile_idx,
+                        dynamic_pair_override,
+                    )
                 self._load_a_register_bundle(
                     a_regs_next,
                     smem_base,
@@ -3257,6 +3453,8 @@ class W4A16GemmKernel:
         q_row1: Uint32,
         base_pair: Uint32,
         subscale_pair: Uint32,
+        signs_row1: Uint32,
+        half: Int32,
         execution_lut_addr: Int64,
         tid: Int32,
     ):
@@ -3265,6 +3463,20 @@ class W4A16GemmKernel:
             b0_1 = q8_0_pair_to_bf16x2(q_row0 >> 16, base_pair)
             b1_0 = q8_0_pair_to_bf16x2(q_row1, base_pair >> 16)
             b1_1 = q8_0_pair_to_bf16x2(q_row1 >> 16, base_pair >> 16)
+        elif cutlass.const_expr(self.iq2_xxs):
+            pair_byte_offset = (tid & Int32(3)) * Int32(2)
+            b0_0, b0_1, b1_0, b1_1 = packed_decode_iq2_xxs_to_bfloat2x4(
+                q_row0,
+                q_row1,
+                base_pair,
+                subscale_pair,
+                signs_row1,
+                half,
+                execution_lut_addr,
+                pair_byte_offset,
+                shared_lut=self.iq2_xs_smem_lut,
+                selector_lut=True,
+            )
         else:
             pair_byte_offset = (tid & Int32(3)) * Int32(2)
             b0_0, b0_1, b1_0, b1_1 = packed_decode_iq2_xs_to_bfloat2x4(
@@ -3968,6 +4180,46 @@ class W4A16GemmKernel:
         return _pack_modelopt_words(a0, a1, b0, b1, Uint32(tc_row // Int32(2)))
 
     @cute.jit
+    def _load_b_registers_modelopt_shared_pair(
+        self,
+        regs: cute.Tensor,
+        smem_base: Int32,
+        b_sh_rd: Int32,
+        pipe: Int32,
+        kk: Int32,
+    ):
+        # Native tile offsets are nonnegative and below 8 KiB.
+        packed_word_index = (
+            Uint32(self.b_sh_stride) * Uint32(kk) + Uint32(b_sh_rd)
+        ) * Uint32(4)
+        words_per_k_tile = Uint32((self.tile_n // 64) * 128)
+        k_tile = packed_word_index // words_per_k_tile
+        pos_in_k_tile = packed_word_index - k_tile * words_per_k_tile
+        n_tile = pos_in_k_tile // Uint32(128)
+        pos = pos_in_k_tile - n_tile * Uint32(128)
+        th_id = pos // Uint32(4)
+        tc_col = th_id // Uint32(4)
+        byte_index = Uint32(th_id % Uint32(4))
+        stage_base = (
+            smem_base + Int32(self.sh_b_off * 16) + pipe * Int32(self.b_sh_stage * 16)
+        )
+        local_n = n_tile * Uint32(64) + tc_col
+        byte_offset = local_n * Uint32(self.tile_k // 2) + k_tile * Uint32(8)
+        permuted_base = self._modelopt_smem_permuted_offset(Int32(byte_offset))
+        # The XOR swizzle is linear over these disjoint row offsets.
+        for jj in cutlass.range_constexpr(4):
+            row0 = self._modelopt_smem_permuted_offset(
+                Int32(jj * 16 * (self.tile_k // 2))
+            )
+            row8 = self._modelopt_smem_permuted_offset(
+                Int32((jj * 16 + 8) * (self.tile_k // 2))
+            )
+            a0, a1, a2, a3 = ld_shared_v4_u32(stage_base + (permuted_base ^ row0))
+            b0, b1, b2, b3 = ld_shared_v4_u32(stage_base + (permuted_base ^ row8))
+            regs[0, jj] = _pack_modelopt_words(a0, a1, b0, b1, byte_index)
+            regs[2, jj] = _pack_modelopt_words(a2, a3, b2, b3, byte_index)
+
+    @cute.jit
     def _load_b_registers_modelopt_shared(
         self,
         smem_base: Int32,
@@ -4054,13 +4306,16 @@ class W4A16GemmKernel:
                     a_src = get_ptr_as_int64(a_alt_bf16_flat, a_int4 * Int32(8))
             if cutlass.const_expr(self.has_k_tile_tail):
                 a_k_int4 = tile_idx * Int32(self.a_gl_rd_delta_o) + a_gl_rd_col0
-                if row < block_valid_rows and a_k_int4 < a_gl_stride:
-                    cp_async4_shared_global(
-                        a_dst,
-                        a_src,
-                    )
-                else:
-                    st_shared_v4_u32(a_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
+                if row < Int32(self.a_sh_stage // self.a_sh_stride):
+                    if row < block_valid_rows and a_k_int4 < a_gl_stride:
+                        cp_async4_shared_global(
+                            a_dst,
+                            a_src,
+                        )
+                    else:
+                        st_shared_v4_u32(
+                            a_dst, Uint32(0), Uint32(0), Uint32(0), Uint32(0)
+                        )
             else:
                 cp_async4_shared_global_pred(
                     a_dst,
@@ -4459,7 +4714,8 @@ class W4A16GemmKernel:
                         s_dst,
                         get_ptr_as_int64(scales_i32_flat, s_src_int4 * Int32(4)),
                     )
-        cute.arch.cp_async_commit_group()
+        if cutlass.const_expr(not self.preload_all_tiles):
+            cute.arch.cp_async_commit_group()
 
     @cute.jit
     def _csf_block_stage(
@@ -4593,6 +4849,8 @@ class W4A16GemmKernel:
         expert_idx: Int32,
         dynamic_pair_override: cutlass.Constexpr[int],
     ):
+        if cutlass.const_expr(self.preload_all_tiles):
+            return
         if cutlass.const_expr(kk == self.b_sh_wr_iters - 2):
             self._prefetch_lookahead_tile(
                 a_bf16_flat,
@@ -4668,7 +4926,9 @@ class W4A16GemmKernel:
                     st_shared_u32(addr, first)
                     st_shared_u32(addr + Int32(4), end)
             cute.arch.sync_threads()
-        for pipe in cutlass.range_constexpr(self.stages - 1):
+        for pipe in cutlass.range_constexpr(
+            self.k_tiles if self.preload_all_tiles else self.stages - 1
+        ):
             if Int32(pipe) < k_tiles:
                 self._stage_k_tile_async(
                     a_bf16_flat,
@@ -4693,9 +4953,11 @@ class W4A16GemmKernel:
                     expert_idx,
                     dynamic_pair_override,
                 )
-            else:
+            elif cutlass.const_expr(not self.preload_all_tiles):
                 cute.arch.cp_async_commit_group()
-        cute.arch.cp_async_wait_group(self.stages - 2)
+        if cutlass.const_expr(self.preload_all_tiles):
+            cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0 if self.preload_all_tiles else self.stages - 2)
         cute.arch.sync_threads()
         if cutlass.const_expr(self.csf_block_inline):
             if k_tiles > Int32(0):

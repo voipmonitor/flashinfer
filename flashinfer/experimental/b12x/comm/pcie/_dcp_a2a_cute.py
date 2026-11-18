@@ -1212,9 +1212,21 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         threads: int,
         device_slot_selection: bool,
         kimi_topk: bool,
+        row_blocks: int = 1,
+        load_batch: int = 1,
     ) -> None:
         super().__init__(world_size, rank, threads, device_slot_selection)
         self._kimi_topk = bool(kimi_topk)
+        if type(row_blocks) is not int or not 1 <= row_blocks <= _MAX_BLOCKS:
+            raise ValueError("paired gather row blocks must fit the signal plane")
+        if kimi_topk and row_blocks != 1:
+            raise ValueError("fused single-row expert selection requires one CTA")
+        if load_batch not in (1, 2):
+            raise ValueError("paired gather load batch must be one or two")
+        if load_batch != 1 and (kimi_topk or row_blocks == 1):
+            raise ValueError("batched paired loads require disjoint multi-CTA rows")
+        self._row_blocks = row_blocks
+        self._load_batch = load_batch
 
     @cute.jit
     def __call__(
@@ -1261,6 +1273,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         first_packs: Int32,
         second_packs: Int32,
         slot_delta_256b: Int32,
+        grid_x: Int32,
         stream: cuda.CUstream,
     ) -> None:
         self.kernel(
@@ -1307,7 +1320,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             second_packs,
             slot_delta_256b,
         ).launch(
-            grid=(1, 1, 1),
+            grid=(grid_x, 1, 1),
             block=(self._threads, 1, 1),
             max_number_threads=(512, 1, 1),
             min_blocks_per_mp=1,
@@ -1398,6 +1411,14 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             signal15,
         )
         tidx, _, _ = cute.arch.thread_idx()
+        row_group, grid = Int32(0), Int32(1)
+        if cutlass.const_expr(self._row_blocks != 1):
+            row_group, _, _ = cute.arch.block_idx()
+            grid, _, _ = cute.arch.grid_dim()
+        # Matching CTAs on every rank publish the same complete rows. A CTA
+        # never reads a row staged by a different CTA, so its peer barrier
+        # establishes all input dependencies without a local grid barrier.
+        owned_rows = (batch - row_group + grid - 1) // grid
         slot_offset = Int64(0)
         if cutlass.const_expr(self._device_slot_selection):
             generation = ld_relaxed_gpu_u32(
@@ -1409,21 +1430,29 @@ class _AllGatherPairLaunch(_DCPA2ABase):
         local_stage = self._staging_words(staging[self._rank] + slot_offset)
 
         linear = Int32(tidx)
-        while linear < batch * first_packs:
-            batch_index = linear // first_packs
-            pack = linear - batch_index * first_packs
+        while linear < owned_rows * first_packs:
+            local_row = linear // first_packs
+            batch_index = local_row * grid + row_group
+            pack = linear - local_row * first_packs
+            source_pack = Int64(linear)
+            if cutlass.const_expr(self._row_blocks != 1):
+                source_pack = Int64(batch_index) * Int64(first_packs) + Int64(pack)
             _copy_16b(
-                local_first + Int64(linear) * Int64(4),
+                local_first + source_pack * Int64(4),
                 local_stage
                 + (Int64(batch_index) * Int64(combined_packs) + Int64(pack)) * Int64(4),
             )
             linear += Int32(self._threads)
         linear = Int32(tidx)
-        while linear < batch * second_packs:
-            batch_index = linear // second_packs
-            pack = linear - batch_index * second_packs
+        while linear < owned_rows * second_packs:
+            local_row = linear // second_packs
+            batch_index = local_row * grid + row_group
+            pack = linear - local_row * second_packs
+            source_pack = Int64(linear)
+            if cutlass.const_expr(self._row_blocks != 1):
+                source_pack = Int64(batch_index) * Int64(second_packs) + Int64(pack)
             _copy_16b(
-                local_second + Int64(linear) * Int64(4),
+                local_second + source_pack * Int64(4),
                 local_stage
                 + (
                     Int64(batch_index) * Int64(combined_packs)
@@ -1442,11 +1471,59 @@ class _AllGatherPairLaunch(_DCPA2ABase):
             max_blocks=_MAX_BLOCKS,
         )
 
-        first_output_packs = batch * Int32(self._world_size) * first_packs
+        first_output_packs = owned_rows * Int32(self._world_size) * first_packs
         linear = Int32(tidx)
+        if cutlass.const_expr(self._load_batch == 2):
+            while linear + Int32(self._threads) < first_output_packs:
+                addresses, destinations = (), ()
+                for item in cutlass.range_constexpr(2):
+                    current = linear + Int32(item) * Int32(self._threads)
+                    batch_index = current // (Int32(self._world_size) * first_packs)
+                    row_pack = current - (
+                        batch_index * Int32(self._world_size) * first_packs
+                    )
+                    batch_index = batch_index * grid + row_group
+                    source_rank = row_pack // first_packs
+                    pack = row_pack - source_rank * first_packs
+                    source_address = Int64(
+                        (
+                            local_first
+                            + (Int64(batch_index) * Int64(first_packs) + Int64(pack))
+                            * Int64(4)
+                        ).toint()
+                    )
+                    for source in cutlass.range_constexpr(self._world_size):
+                        if source_rank == Int32(source):
+                            if cutlass.const_expr(source == self._rank):
+                                source_words = local_first
+                                source_base = Int64(batch_index) * Int64(first_packs)
+                            else:
+                                source_words = self._staging_words(
+                                    staging[source] + slot_offset
+                                )
+                                source_base = Int64(batch_index) * Int64(combined_packs)
+                            source_address = Int64(
+                                (
+                                    source_words
+                                    + (source_base + Int64(pack)) * Int64(4)
+                                ).toint()
+                            )
+                    output_pack = Int64(batch_index) * Int64(self._world_size) * Int64(
+                        first_packs
+                    ) + Int64(row_pack)
+                    addresses += (source_address,)
+                    destinations += (
+                        Int64((output_first + output_pack * Int64(4)).toint()),
+                    )
+                words0 = ld_global_v4_u32(addresses[0])
+                words1 = ld_global_v4_u32(addresses[1])
+                st_global_v4_u32(destinations[0], *words0)
+                st_global_v4_u32(destinations[1], *words1)
+                linear += Int32(2) * Int32(self._threads)
         while linear < first_output_packs:
             batch_index = linear // (Int32(self._world_size) * first_packs)
             row_pack = linear - (batch_index * Int32(self._world_size) * first_packs)
+            batch_index = batch_index * grid + row_group
             source_rank = row_pack // first_packs
             pack = row_pack - source_rank * first_packs
             # Default to this rank's own slice so the address is always
@@ -1471,20 +1548,82 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                     source_address = Int64(
                         (source_words + (source_base + Int64(pack)) * Int64(4)).toint()
                     )
+            output_pack = Int64(linear)
+            if cutlass.const_expr(self._row_blocks != 1):
+                output_pack = Int64(batch_index) * Int64(self._world_size) * Int64(
+                    first_packs
+                ) + Int64(row_pack)
             _copy_16b_addr(
                 source_address,
-                Int64((output_first + Int64(linear) * Int64(4)).toint()),
+                Int64((output_first + output_pack * Int64(4)).toint()),
             )
             linear += Int32(self._threads)
 
         if cutlass.const_expr(not self._kimi_topk):
-            second_output_packs = batch * Int32(self._world_size) * second_packs
+            second_output_packs = owned_rows * Int32(self._world_size) * second_packs
             linear = Int32(tidx)
+            if cutlass.const_expr(self._load_batch == 2):
+                while linear + Int32(self._threads) < second_output_packs:
+                    addresses, destinations = (), ()
+                    for item in cutlass.range_constexpr(2):
+                        current = linear + Int32(item) * Int32(self._threads)
+                        batch_index = current // (
+                            Int32(self._world_size) * second_packs
+                        )
+                        row_pack = current - (
+                            batch_index * Int32(self._world_size) * second_packs
+                        )
+                        batch_index = batch_index * grid + row_group
+                        source_rank = row_pack // second_packs
+                        pack = row_pack - source_rank * second_packs
+                        source_address = Int64(
+                            (
+                                local_second
+                                + (
+                                    Int64(batch_index) * Int64(second_packs)
+                                    + Int64(pack)
+                                )
+                                * Int64(4)
+                            ).toint()
+                        )
+                        for source in cutlass.range_constexpr(self._world_size):
+                            if source_rank == Int32(source):
+                                if cutlass.const_expr(source == self._rank):
+                                    source_words = local_second
+                                    source_base = Int64(batch_index) * Int64(
+                                        second_packs
+                                    )
+                                else:
+                                    source_words = self._staging_words(
+                                        staging[source] + slot_offset
+                                    )
+                                    source_base = Int64(batch_index) * Int64(
+                                        combined_packs
+                                    ) + Int64(first_packs)
+                                source_address = Int64(
+                                    (
+                                        source_words
+                                        + (source_base + Int64(pack)) * Int64(4)
+                                    ).toint()
+                                )
+                        output_pack = Int64(batch_index) * Int64(
+                            self._world_size
+                        ) * Int64(second_packs) + Int64(row_pack)
+                        addresses += (source_address,)
+                        destinations += (
+                            Int64((output_second + output_pack * Int64(4)).toint()),
+                        )
+                    words0 = ld_global_v4_u32(addresses[0])
+                    words1 = ld_global_v4_u32(addresses[1])
+                    st_global_v4_u32(destinations[0], *words0)
+                    st_global_v4_u32(destinations[1], *words1)
+                    linear += Int32(2) * Int32(self._threads)
             while linear < second_output_packs:
                 batch_index = linear // (Int32(self._world_size) * second_packs)
                 row_pack = linear - (
                     batch_index * Int32(self._world_size) * second_packs
                 )
+                batch_index = batch_index * grid + row_group
                 source_rank = row_pack // second_packs
                 pack = row_pack - source_rank * second_packs
                 source_address = Int64(
@@ -1511,9 +1650,14 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                                 source_words + (source_base + Int64(pack)) * Int64(4)
                             ).toint()
                         )
+                output_pack = Int64(linear)
+                if cutlass.const_expr(self._row_blocks != 1):
+                    output_pack = Int64(batch_index) * Int64(self._world_size) * Int64(
+                        second_packs
+                    ) + Int64(row_pack)
                 _copy_16b_addr(
                     source_address,
-                    Int64((output_second + Int64(linear) * Int64(4)).toint()),
+                    Int64((output_second + output_pack * Int64(4)).toint()),
                 )
                 linear += Int32(self._threads)
         else:
@@ -1694,7 +1838,7 @@ class _AllGatherPairLaunch(_DCPA2ABase):
                 _a2a_graph_epoch_arrive(
                     (self_signal + Int64(_GRAPH_EPOCH_INDEX)).toint(),
                     (self_signal + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
-                    Uint32(1),
+                    Uint32(grid),
                 )
 
 
@@ -1744,8 +1888,7 @@ class _KimiTopK16Launch:
         class SharedStorage:
             selection_scores: cute.struct.Align[cute.struct.MemRange[Float32, 896], 16]
             unbiased_scores: cute.struct.Align[cute.struct.MemRange[Float32, 896], 16]
-            active_experts: cute.struct.Align[cute.struct.MemRange[Int32, 896], 16]
-            warp_keys: cute.struct.Align[cute.struct.MemRange[cutlass.Uint64, 16], 16]
+            reduce_keys: cute.struct.Align[cute.struct.MemRange[cutlass.Uint64, 64], 16]
 
         storage = smem_alloc.allocate(SharedStorage)
         selection_scores = storage.selection_scores.get_tensor(
@@ -1754,10 +1897,9 @@ class _KimiTopK16Launch:
         unbiased_scores = storage.unbiased_scores.get_tensor(
             cute.make_layout((896,), stride=(1,))
         )
-        active_experts = storage.active_experts.get_tensor(
-            cute.make_layout((896,), stride=(1,))
+        reduce_keys = storage.reduce_keys.get_tensor(
+            cute.make_layout((64,), stride=(1,))
         )
-        warp_keys = storage.warp_keys.get_tensor(cute.make_layout((16,), stride=(1,)))
 
         row_offset = Int64(bidx) * Int64(896)
         expert = Int32(tidx)
@@ -1783,41 +1925,68 @@ class _KimiTopK16Launch:
                 selection = Float32(0.0)
             selection_scores[expert] = selection
             unbiased_scores[expert] = unbiased
-            active_experts[expert] = Int32(1)
             expert += Int32(self._threads)
         cute.arch.sync_threads()
 
-        # Each round reduces one candidate per thread, then merges the warp
-        # winners. The selected key is invalidated in shared memory before the
-        # following round. Packed keys preserve lower-ID tie-breaking.
+        # Two-level top-16 over packed (score, expert) keys. Four warps each
+        # reduce 256 experts held in registers (8 per lane); warp 0 then merges
+        # the 64 survivors. The original sigmoid and sequential renormalization
+        # below are unchanged, and packed keys preserve lower-ID tie-breaking.
         lane = Int32(tidx) % Int32(32)
         warp = Int32(tidx) // Int32(32)
+        lane_key = cutlass.Uint64(0)
+        keys = cute.make_rmem_tensor((8,), cutlass.Uint64)
+        if warp < Int32(4):
+            for item in cutlass.range_constexpr(8):
+                expert_id = warp * Int32(256) + Int32(item * 32) + lane
+                # Zero is below every valid packed key, including -infinity.
+                # Reusing an exhausted expert's key would select it again.
+                keys[item] = cutlass.Uint64(0)
+                if expert_id < Int32(896):
+                    keys[item] = _kimi_pack_key(selection_scores[expert_id], expert_id)
+            _kimi_sort_desc(keys, 8)
+            previous = cutlass.Uint64(0)
+            for selected in cutlass.range_constexpr(16):
+                if cutlass.const_expr(selected > 0):
+                    head = keys[0]
+                    tail_key = cutlass.Uint64(0)
+                    for item in cutlass.range_constexpr(7):
+                        keys[item] = _select_if_eq_u64(
+                            previous, head, keys[item + 1], keys[item]
+                        )
+                    keys[7] = _select_if_eq_u64(previous, head, tail_key, keys[7])
+                previous = _kimi_warp_max_key(keys[0])
+                lane_key = _select_if_eq_u64(
+                    cutlass.Uint64(lane),
+                    cutlass.Uint64(selected),
+                    previous,
+                    lane_key,
+                )
+            if lane < Int32(16):
+                reduce_keys[warp * Int32(16) + lane] = lane_key
+        cute.arch.sync_threads()
         selected_ids = cute.make_rmem_tensor((16,), Int32)
         selected_weights = cute.make_rmem_tensor((16,), Float32)
-        for selected in cutlass.range_constexpr(16):
-            thread_key = cutlass.Uint64(0)
-            candidate = Int32(tidx)
-            while candidate < Int32(896):
-                candidate_key = cutlass.Uint64(0)
-                if active_experts[candidate] != Int32(0):
-                    candidate_key = _kimi_pack_key(
-                        selection_scores[candidate], candidate
+        if warp == Int32(0):
+            merge_keys = cute.make_rmem_tensor((2,), cutlass.Uint64)
+            for item in cutlass.range_constexpr(2):
+                merge_keys[item] = reduce_keys[Int32(item * 32) + lane]
+            _kimi_sort_desc(merge_keys, 2)
+            previous = cutlass.Uint64(0)
+            for selected in cutlass.range_constexpr(16):
+                if cutlass.const_expr(selected > 0):
+                    head = merge_keys[0]
+                    tail_key = cutlass.Uint64(0)
+                    merge_keys[0] = _select_if_eq_u64(
+                        previous, head, merge_keys[1], merge_keys[0]
                     )
-                thread_key = cutlass.max(thread_key, candidate_key)
-                candidate += Int32(self._threads)
-            warp_key = _kimi_warp_max_key(thread_key)
-            if lane == Int32(0):
-                warp_keys[warp] = warp_key
-            cute.arch.sync_threads()
-            if Int32(tidx) == Int32(0):
-                selected_key = warp_keys[0]
-                for source_warp in cutlass.range_constexpr(1, self._threads // 32):
-                    selected_key = cutlass.max(selected_key, warp_keys[source_warp])
-                final_expert = _kimi_key_expert(selected_key)
+                    merge_keys[1] = _select_if_eq_u64(
+                        previous, head, tail_key, merge_keys[1]
+                    )
+                previous = _kimi_warp_max_key(merge_keys[0])
+                final_expert = _kimi_key_expert(previous)
                 selected_ids[selected] = final_expert
                 selected_weights[selected] = unbiased_scores[final_expert]
-                active_experts[final_expert] = Int32(0)
-            cute.arch.sync_threads()
 
         weight_sum = Float32(0.0)
         if Int32(tidx) == Int32(0):
@@ -2139,6 +2308,8 @@ def _pair_launcher_key(
     threads: int,
     device_slot_selection: bool,
     kimi_topk: bool,
+    row_blocks: int = 1,
+    load_batch: int = 1,
 ) -> tuple[object, ...]:
     """Return the cache key for a paired all-gather launcher."""
     return (
@@ -2147,6 +2318,8 @@ def _pair_launcher_key(
         int(threads),
         bool(device_slot_selection),
         bool(kimi_topk),
+        int(row_blocks),
+        int(load_batch),
     )
 
 
@@ -2156,6 +2329,8 @@ def is_all_gather_pair_prepared(
     threads: int,
     device_slot_selection: bool,
     kimi_topk: bool = False,
+    row_blocks: int = 1,
+    load_batch: int = 1,
 ) -> bool:
     return (
         _pair_launcher_key(
@@ -2164,6 +2339,8 @@ def is_all_gather_pair_prepared(
             threads,
             device_slot_selection,
             kimi_topk,
+            row_blocks,
+            load_batch,
         )
         in _PREPARED_PAIR_LAUNCHERS
     )
@@ -2176,6 +2353,8 @@ def _get_compiled_all_gather_pair(
     threads: int,
     device_slot_selection: bool,
     kimi_topk: bool = False,
+    row_blocks: int = 1,
+    load_batch: int = 1,
 ) -> Callable:
     """Compile and retain one paired all-gather launcher specialization."""
     launch = _AllGatherPairLaunch(
@@ -2184,6 +2363,8 @@ def _get_compiled_all_gather_pair(
         threads,
         device_slot_selection,
         kimi_topk,
+        row_blocks,
+        load_batch,
     )
     key = _pair_launcher_key(
         world_size,
@@ -2191,6 +2372,8 @@ def _get_compiled_all_gather_pair(
         threads,
         device_slot_selection,
         kimi_topk,
+        row_blocks,
+        load_batch,
     )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     p_u32 = _u32_ptr(16, align=4)
@@ -2211,6 +2394,7 @@ def _get_compiled_all_gather_pair(
         1,
         1,
         1,
+        1,
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             (
@@ -2226,6 +2410,8 @@ def _get_compiled_all_gather_pair(
                 "threads",
                 "device_slot_selection",
                 "kimi_topk",
+                "row_blocks",
+                "load_batch",
             ),
         ),
     )
@@ -2260,6 +2446,7 @@ def _get_compiled_all_gather_pair(
             int(first_packs),
             int(second_packs),
             int(slot_delta_256b),
+            min(int(batch), row_blocks),
             current_cuda_stream(),
         )
 
@@ -2296,7 +2483,7 @@ def _get_compiled_kimi_topk16(threads: int = 256) -> Callable:
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "comm.pcie.dcp_a2a.kimi_topk16",
-            1,
+            2,
             (normalized_threads,),
             labels=("threads",),
         ),

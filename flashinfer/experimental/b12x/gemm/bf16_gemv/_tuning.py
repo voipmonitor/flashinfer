@@ -82,7 +82,8 @@ def _tc_eligible(query):
     from ._tensor_core import TC_K_MULTIPLE, TC_MAX_ROWS
 
     return (
-        query.source_dtype == query.weight_dtype == query.output_dtype == "bfloat16"
+        query.source_dtype == query.weight_dtype == "bfloat16"
+        and query.output_dtype in ("bfloat16", "float32")
         and query.bias_dtype is None
         and query.max_rows <= TC_MAX_ROWS
         and query.in_features % TC_K_MULTIPLE == 0
@@ -245,7 +246,7 @@ TUNING = TuningContract(
         ),
         Knob(name="block_threads", values=(128, 256), binding=ParameterBinding.COMPILE),
     ),
-    candidate_contract_version=12,
+    candidate_contract_version=13,
     parameters=_parameters,
     materialize=lambda query, device, choice: GemvConfig(**dict(choice)),
 )

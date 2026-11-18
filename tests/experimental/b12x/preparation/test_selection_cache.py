@@ -217,21 +217,38 @@ def test_decisions_track_silicon_rather_than_product_label(cache_device):
     assert cache_identity({"model": "a"}, 0) != cache_identity({"model": "a"}, 3)
 
 
-@pytest.mark.parametrize("previous_method", (None, "stream_gated_events_v1"))
+@pytest.mark.parametrize("cache_policy", ("cold", "warm"))
+@pytest.mark.parametrize(
+    "previous_method", (None, "stream_gated_events_v1", "stream_gated_events_v2")
+)
 def test_stream_gated_measurement_keeps_prior_choices_in_a_separate_cache(
-    cache_device, tmp_path, previous_method
+    cache_device, tmp_path, previous_method, cache_policy
 ):
-    identity = cache_identity({}, 0)
-    assert identity["measurement"] == "stream_gated_events_v2"
+    from b12x.preparation._race_cache import RaceCheckpoint
+
+    identity = cache_identity({}, 0, cache_policy=cache_policy)
+    suffix = "_warm" if cache_policy == "warm" else ""
+    assert identity["measurement"] == "stream_gated_events_v3" + suffix
     previous = {key: value for key, value in identity.items() if key != "measurement"}
     if previous_method is not None:
-        previous["measurement"] = previous_method
+        previous["measurement"] = previous_method + suffix
     original = SelectionCache(tmp_path, previous)
     _save_choice(original)
     measured = SelectionCache(tmp_path, identity)
     assert measured.path != original.path
     assert measured.get("shape") is None
     assert original.path.is_file()
+    with session(tmp_path) as engine:
+        engine._cache = original
+        progress = engine._race_progress_cache()
+        progress.save("shape", RaceCheckpoint({0: 29.2256}, 0))
+        original_progress_path = progress.path
+    with session(tmp_path) as engine:
+        engine._cache = measured
+        progress = engine._race_progress_cache()
+        assert progress.path != original_progress_path
+        assert progress.load("shape") is None
+    assert original_progress_path.is_file()
 
 
 def test_cached_choices_survive_uuid_and_ordinal_changes(

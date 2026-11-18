@@ -33,6 +33,7 @@ from b12x.moe._shared.kernels.reference import (
     moe_reference_w4a16_fp4_e8m0_k32,
 )
 from b12x.moe._shared.kernels.w4a16.host import (
+    make_w4a16_packed_buffers,
     max_packed_route_slots,
     route_pack_capacity,
     select_route_block_size_m,
@@ -2034,14 +2035,22 @@ def test_w4a16_e8m0_native_large_m_uses_main_gemm(
         ("situ", 192),
     ],
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("grid_delta", [None, -1, 0, 1])
+@pytest.mark.parametrize(("m", "block_size_m"), [(24, None), (64, 8)])
 def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
     activation: str,
     intermediate_size: int,
+    dtype: torch.dtype,
+    grid_delta: int | None,
+    m: int,
+    block_size_m: int | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Native E8M0 supports compact FC2 K tails without padding I to 32."""
     experts, hidden_size = 4, 128
     rows = intermediate_size * (2 if activation in {"silu", "situ"} else 1)
-    topk, m = 2, 24
+    topk = 2
     assert intermediate_size % 8 == 0
     assert intermediate_size % 128 != 0
     torch.manual_seed(20260610)
@@ -2086,7 +2095,7 @@ def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
         w2_scale,
         w2_global_scale,
         activation=activation,
-        params_dtype=torch.bfloat16,
+        params_dtype=dtype,
         w13_layout="w31",
     )
     assert prepared.weight_layout == "modelopt"
@@ -2099,50 +2108,108 @@ def test_w4a16_e8m0_native_compact_tail_uses_ceil_scale_grid(
     )
     assert tuple(prepared.w2_scale.shape) == (experts, w2_scale_cols, hidden_size)
 
-    buffers = make_w4a16_buffers(
-        prepared, m=m, topk=topk, dtype=torch.bfloat16, device=torch.device("cuda")
+    buffers = make_w4a16_packed_buffers(
+        prepared,
+        m=m,
+        topk=topk,
+        dtype=dtype,
+        device=torch.device("cuda"),
+        block_size_m=block_size_m,
     )
-    x = torch.randn(m, hidden_size, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(m, hidden_size, dtype=dtype, device="cuda")
     topk_ids = torch.randint(0, experts, (m, topk), dtype=torch.int32, device="cuda")
     topk_weights = torch.rand(m, topk, dtype=torch.float32, device="cuda")
 
-    actual = run_w4a16_moe(
-        x,
-        prepared,
-        topk_weights,
-        topk_ids,
-        activation=activation,
-        intermediate_cache13=buffers.intermediate_cache13,
-        intermediate_cache2=buffers.intermediate_cache2,
-        output=buffers.output,
-        fc1_c_tmp=buffers.fc1_c_tmp,
-        fc2_c_tmp=buffers.fc2_c_tmp,
-        packed_route_indices=buffers.packed_route_indices,
-        block_expert_ids=buffers.block_expert_ids,
-        packed_route_count=buffers.packed_route_count,
-        expert_offsets=buffers.expert_offsets,
-    )
-    expected = moe_reference_w4a16_fp4_e8m0_k32(
-        x,
-        w13,
-        w13_scale,
-        w13_global_scale,
-        w2,
-        w2_scale,
-        w2_global_scale,
-        topk_ids,
-        topk_weights,
-        experts,
-        hidden_size,
-        intermediate_size,
-        activation=activation,
-        swiglu_limit=None,
-        w13_layout="w31",
-    )
+    if grid_delta is not None:
+        route_counts = torch.bincount(
+            topk_ids.flatten().long(), minlength=experts
+        ).tolist()
+
+        def boundary_grid(*, fused, sms, **kwargs):
+            block = fused.moe_block_size
+            route_blocks = sum((count + block - 1) // block for count in route_counts)
+            output_tiles = route_blocks * (
+                (hidden_size + fused.fc2_tile_n - 1) // fused.fc2_tile_n
+            )
+            grid = output_tiles + grid_delta
+            assert 0 < grid <= sms * fused.blocks_per_sm
+            return grid
+
+        monkeypatch.setattr(
+            w4a16_fused_launch, "_w4a16_fused_persistent_grid_x", boundary_grid
+        )
+
+    def launch():
+        return run_w4a16_moe(
+            x,
+            prepared,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            route_block_size_m=block_size_m,
+        )
+
+    actual = launch()
+
+    def reference():
+        return moe_reference_w4a16_fp4_e8m0_k32(
+            x,
+            w13,
+            w13_scale,
+            w13_global_scale,
+            w2,
+            w2_scale,
+            w2_global_scale,
+            topk_ids,
+            topk_weights,
+            experts,
+            hidden_size,
+            intermediate_size,
+            activation=activation,
+            swiglu_limit=None,
+            w13_layout="w31",
+        )
+
+    expected = reference()
     torch.cuda.synchronize()
     assert bool(torch.isfinite(actual).all().item())
     assert bool((actual != 0).any().item())
     _assert_matches_oracle(actual, expected, activation=activation)
+
+    eager = actual.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    buffers.output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(buffers.output, eager)
+
+    if block_size_m == 8:
+        x.mul_(-0.5)
+        topk_ids.random_(0, experts)
+        for scratch in (
+            buffers.fc1_c_tmp,
+            buffers.fc2_c_tmp,
+            buffers.intermediate_cache13,
+            buffers.intermediate_cache2,
+            buffers.output,
+        ):
+            scratch.fill_(float("nan"))
+        allocated = torch.cuda.memory_allocated()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+        _assert_matches_oracle(buffers.output, reference(), activation=activation)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

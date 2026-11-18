@@ -33,7 +33,7 @@ class PleHashQuery:
     dense_layer_ordinal: int = 0
     table_alignment: int = 128
     geometry: tuple | None = None
-    input_alignments: tuple[int, ...] = (16,) * len(OPERANDS)
+    input_alignments: tuple[int, ...] = (16, 16, 16, 4, 4, 16, 16, 16, 16, 16)
 
     def __post_init__(self):
         if self.geometry is not None:

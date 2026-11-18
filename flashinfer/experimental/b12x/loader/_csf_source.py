@@ -142,6 +142,7 @@ def stage_csf_sources(
     device,
     encoding="csf_32x2_v1",
     copy=None,
+    allocate=None,
     **selection,
 ):
     """Copy checkpoint components verbatim, optionally through a direct-load session.
@@ -156,11 +157,15 @@ def stage_csf_sources(
     for plane in components:
         starts.append(starts[-1] + plane[-1].numel())
     tensors = [
-        torch.empty((len(components), *t.shape), dtype=t.dtype, device=device)
+        (torch.empty if allocate is None else allocate)(
+            (len(components), *t.shape), dtype=t.dtype, device=device
+        )
         for t in components[0][:-1]
     ]
     tensors.append(
-        torch.empty(starts[-1], dtype=components[0][-1].dtype, device=device)
+        (torch.empty if allocate is None else allocate)(
+            (starts[-1],), dtype=components[0][-1].dtype, device=device
+        )
     )
     for plane in components:
         if len(plane) != len(tensors):
@@ -185,9 +190,13 @@ def stage_csf_sources(
                     else tensors[field][index]
                 )
                 dst.copy_(src)
+    starts_tensor = torch.tensor(starts, dtype=torch.int64)
+    starts_device = (torch.empty if allocate is None else allocate)(
+        starts_tensor.shape, dtype=starts_tensor.dtype, device=device
+    ).copy_(starts_tensor)
     result = CsfSource(
         tuple(tensors),
-        torch.tensor(starts, dtype=torch.int64, device=device),
+        starts_device,
         rows,
         columns,
         quantization,

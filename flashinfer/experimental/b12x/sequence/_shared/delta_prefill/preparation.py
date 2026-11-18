@@ -237,12 +237,6 @@ def make_plan(caps, impl, tuning, *, invocation, override):
         raise ValueError("unknown delta-prefill invocation metadata")
     query = impl._query(caps, invocation)
     component = caps.op_name
-    layouts = {}
-
-    def layout(config):
-        if config not in layouts:
-            layouts[config] = impl._materialize_layout(caps, config)
-        return layouts[config]
 
     def compile_jobs(config, device):
         return (
@@ -256,15 +250,15 @@ def make_plan(caps, impl, tuning, *, invocation, override):
         )
 
     def memory(config, device):
-        native = MemoryRequirements(scratch=layout(config).scratch_specs())
+        native_layout = impl._materialize_layout(caps, config)
         staging = impl.staging_memory(caps)
         return MemoryRequirements(
-            scratch=native.scratch,
+            scratch=native_layout.scratch_specs(),
             persistent=staging.persistent,
         )
 
     def materialize(selection, device):
-        native_layout = layout(selection.config)
+        native_layout = impl._materialize_layout(caps, selection.config)
         programs = compile_prefill(
             component,
             replace(query, autotune_effort="default").to_dict(),

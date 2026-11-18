@@ -42,6 +42,9 @@ META = OpMeta(
         "Caps",
         "Plan",
         "Binding",
+        "ReplayMetadata",
+        "replay_metadata",
+        "release_replay_metadata",
         "Workspace",
         "Budget",
         "DecodeGraphCapacity",
@@ -87,6 +90,9 @@ META = OpMeta(
 if TYPE_CHECKING:  # static analysis only; runtime resolution is lazy
     from .api import (  # noqa: F401
         Binding,
+        ReplayMetadata,
+        replay_metadata,
+        release_replay_metadata,
         Budget,
         Caps,
         DecodeGraphCapacity,

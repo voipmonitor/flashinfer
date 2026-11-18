@@ -865,7 +865,7 @@ def iq2_xs_pair_to_bf16x2(
 def iq2_xs_descriptor_pair_to_bf16x2x2(
     descriptors, base, subscale, lut_addr, pair_offset, *, loc=None, ip=None
 ):
-    """Decode matching pairs from two adjacent descriptors using one FP32 scale."""
+    """Decode adjacent descriptor pairs from three exactly rounded magnitudes."""
     decode = []
     for i in range(2):
         decode.append(f"""
@@ -875,14 +875,10 @@ def iq2_xs_descriptor_pair_to_bf16x2x2(
             mad.lo.u32 signs, parity, 128, signs;
             shr.u32 signs, signs, pair_start;
             and.b32 grid, descriptor, 0x1ff;
-            mad.lo.u32 address, grid, 16, table;
+            mad.lo.u32 address, grid, 8, table;
             add.u32 address, address, offset;
-            ld.shared.u32 word, [address];
-            shl.b32 lo, word, 16;
-            and.b32 hi, word, 0xffff0000;
-            mul.f32 lo, lo, scale;
-            mul.f32 hi, hi, scale;
-            cvt.rn.satfinite.bf16x2.f32 ${i}, hi, lo;
+            ld.shared.u16 word, [address];
+            prmt.b32 ${i}, palette0, palette1, word;
             mul.lo.u32 sign_pair, signs, 0x40008000;
             lop3.b32 ${i}, ${i}, sign_pair, 0x80008000, 0x78;
         """)
@@ -890,7 +886,8 @@ def iq2_xs_descriptor_pair_to_bf16x2x2(
         """{
         .reg .b16 dh;
         .reg .u32 descriptor, descriptor_word, grid, signs, parity, word, sign_pair, offset, address, table, pair_start;
-        .reg .f32 scale, nibble, lo, hi;
+        .reg .f32 scale, nibble, mag0, mag1, mag2;
+        .reg .b32 palette0, palette1;
         mov.u32 descriptor_word, $2;
         mov.u32 pair_start, $6;
         cvt.u16.u32 dh, $3;
@@ -899,8 +896,13 @@ def iq2_xs_descriptor_pair_to_bf16x2x2(
         add.f32 nibble, nibble, 0f3f000000;
         mul.f32 scale, scale, nibble;
         mul.f32 scale, scale, 0f3e800000;
+        mul.f32 mag0, scale, 0f41000000;
+        mul.f32 mag1, scale, 0f41c80000;
+        mul.f32 mag2, scale, 0f422c0000;
+        cvt.rn.satfinite.bf16x2.f32 palette0, mag1, mag0;
+        cvt.rn.satfinite.bf16x2.f32 palette1, mag2, mag2;
         cvt.u32.u64 table, $5;
-        shl.b32 offset, $6, 1;
+        mov.u32 offset, $6;
     """
         + "".join(decode)
         + "\n}"
@@ -938,6 +940,8 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
     *,
     shared_lut=False,
     selector_lut=False,
+    raw_signs_row1=None,
+    half=0,
     loc=None,
     ip=None,
 ):
@@ -949,6 +953,14 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
         "and.b32 d2, $5, 0xffff;",
         "shr.u32 d3, $5, 16;",
     )
+    native_xxs = raw_signs_row1 is not None
+    if native_xxs:
+        extracts = (
+            "bfe.u32 d0, $4, half_grid, 8; bfe.u32 signs0, $7, half_sign, 7;",
+            "bfe.u32 d1, $4, half_grid_hi, 8; bfe.u32 signs1, $7, half_sign_hi, 7;",
+            "bfe.u32 d2, $5, half_grid, 8; bfe.u32 signs2, $10, half_sign, 7;",
+            "bfe.u32 d3, $5, half_grid_hi, 8; bfe.u32 signs3, $10, half_sign_hi, 7;",
+        )
     rows = (0, 0, 1, 1)
     table_stride = 8 if selector_lut else 16
     load_type = "u16" if selector_lut else "u32"
@@ -979,14 +991,16 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             cvt.rn.satfinite.bf16x2.f32 ${index}, fh{index}, fl{index};
             """
         )
+        sign_extract = "" if native_xxs else f"shr.u32 signs{index}, d{index}, 9;"
+        grid_mask = "" if native_xxs else f"and.b32 d{index}, d{index}, 0x1ff;"
         decode.append(
             f"""
             {extract}
-            shr.u32 signs{index}, d{index}, 9;
+            {sign_extract}
             popc.b32 parity{index}, signs{index};
             mad.lo.u32 signs{index}, parity{index}, 128, signs{index};
             shr.u32 signs{index}, signs{index}, $9;
-            and.b32 d{index}, d{index}, 0x1ff;
+            {grid_mask}
             {load}
             {conversion}
             mul.lo.u32 sign_pair{index}, signs{index}, 0x40008000;
@@ -1008,6 +1022,22 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             cvt.rn.satfinite.bf16x2.f32 t{row}1, m{row}2, m{row}2;
             """
     pair_shift = 0 if selector_lut else 1
+    scale_extract = (
+        "bfe.u32 n0, $7, 28, 4; bfe.u32 n1, $10, 28, 4;"
+        if native_xxs
+        else "bfe.u32 n0, $7, 0, 4; bfe.u32 n1, $7, 8, 4;"
+    )
+    half_setup = (
+        """
+        .reg .u32 half_grid, half_sign, half_grid_hi, half_sign_hi;
+        shl.b32 half_grid, $11, 4;
+        mul.lo.u32 half_sign, $11, 14;
+        add.u32 half_grid_hi, half_grid, 8;
+        add.u32 half_sign_hi, half_sign, 7;
+    """
+        if native_xxs
+        else ""
+    )
     asm = (
         """
         {
@@ -1025,8 +1055,9 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             mov.b32 {dh0, dh1}, $6;
             cvt.f32.f16 s0, dh0;
             cvt.f32.f16 s1, dh1;
-            bfe.u32 n0, $7, 0, 4;
-            bfe.u32 n1, $7, 8, 4;
+        """
+        + scale_extract
+        + """
             cvt.rn.f32.u32 fl0, n0;
             cvt.rn.f32.u32 fl1, n1;
             add.f32 fl0, fl0, 0f3f000000;
@@ -1037,6 +1068,7 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             mul.f32 s1, s1, 0f3e800000;
         """
         + f"shl.b32 so, $9, {pair_shift};\n            cvt.u64.u32 po, so;\n"
+        + half_setup
         + selector_setup
         + "".join(decode)
         + "\n}"
@@ -1050,9 +1082,17 @@ def _packed_decode_iq2_xs_to_bfloat2x4(
             Uint32(subscale_pair).ir_value(loc=loc, ip=ip),
             Int64(execution_lut_addr).ir_value(loc=loc, ip=ip),
             Int32(pair_byte_offset).ir_value(loc=loc, ip=ip),
+            *(
+                [
+                    Uint32(raw_signs_row1).ir_value(loc=loc, ip=ip),
+                    Int32(half).ir_value(loc=loc, ip=ip),
+                ]
+                if native_xxs
+                else []
+            ),
         ],
         asm,
-        "=r,=r,=r,=r,r,r,r,r,l,r",
+        "=r,=r,=r,=r,r,r,r,r,l,r" + (",r,r" if native_xxs else ""),
         has_side_effects=bool(shared_lut),
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -1156,3 +1196,36 @@ def packed_dequant_trellis_stream_to_bfloat2x4(
 def packed_dequant_trellis3_to_bfloat2x4(win_a, win_b, *, loc=None, ip=None):
     """Compatibility wrapper for the former 3-bpw bf16 primitive."""
     return packed_dequant_trellis_to_bfloat2x4(win_a, win_b, 3, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def packed_decode_iq2_xxs_to_bfloat2x4(
+    grids_row0,
+    grids_row1,
+    base_pair,
+    signs_row0,
+    signs_row1,
+    half,
+    execution_lut_addr,
+    pair_byte_offset,
+    *,
+    shared_lut=False,
+    selector_lut=False,
+    loc=None,
+    ip=None,
+):
+    """Decode native IQ2_XXS K32 records without an intermediate descriptor."""
+    return _packed_decode_iq2_xs_to_bfloat2x4(
+        grids_row0,
+        grids_row1,
+        base_pair,
+        signs_row0,
+        execution_lut_addr,
+        pair_byte_offset,
+        shared_lut=shared_lut,
+        selector_lut=selector_lut,
+        raw_signs_row1=signs_row1,
+        half=half,
+        loc=loc,
+        ip=ip,
+    )

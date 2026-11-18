@@ -199,10 +199,31 @@ def _attention_sink_placeholder(device_index: int) -> torch.Tensor:
     return placeholder
 
 
+def _validate_input_layout(tensor: torch.Tensor, *, allow_row_padding: bool) -> None:
+    if tensor.is_contiguous():
+        return
+    if not allow_row_padding:
+        raise ValueError("attention inputs must be contiguous")
+    if (
+        tensor.ndim != 3
+        or tensor.stride(2) != 1
+        or tensor.stride(1) != tensor.shape[2]
+        or tensor.stride(0) < tensor.shape[1] * tensor.shape[2]
+        or tensor.stride(0) * tensor.element_size() % 16
+        or tensor.storage_offset() * tensor.element_size() % 16
+    ):
+        raise ValueError(
+            "attention inputs require contiguous heads and nonoverlapping rows "
+            "with 16-byte-aligned strides"
+        )
+
+
 def _validate_forward_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    allow_row_padding: bool = False,
 ) -> tuple[
     tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.device, torch.dtype
 ]:
@@ -218,8 +239,8 @@ def _validate_forward_inputs(
         raise TypeError(
             f"unsupported dtype {q.dtype}; expected torch.bfloat16 or torch.float16"
         )
-    if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-        raise ValueError("q, k, and v must all be contiguous")
+    for tensor in (q, k, v):
+        _validate_input_layout(tensor, allow_row_padding=allow_row_padding)
 
     q_shape = _normalize_tensor_shape(q)
     k_shape = _normalize_tensor_shape(k)
@@ -322,6 +343,8 @@ def _validate_varlen_inputs(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    *,
+    allow_row_padding: bool = True,
 ) -> tuple[
     tuple[int, ...],
     tuple[int, ...],
@@ -331,7 +354,9 @@ def _validate_varlen_inputs(
     torch.device,
     torch.dtype,
 ]:
-    q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(q, k, v)
+    q_shape, k_shape, v_shape, device, dtype = _validate_forward_inputs(
+        q, k, v, allow_row_padding=allow_row_padding
+    )
     if len(q_shape) != 3:
         raise ValueError("varlen attention expects packed rank-3 q/k/v tensors")
     if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
@@ -364,6 +389,9 @@ def _validate_varlen_inputs_against_plan(
     q_shape: tuple[int, ...],
     k_shape: tuple[int, ...],
     v_shape: tuple[int, ...],
+    q_stride: tuple[int, ...],
+    k_stride: tuple[int, ...],
+    v_stride: tuple[int, ...],
     cu_seqlens_q_shape: tuple[int, ...],
     cu_seqlens_k_shape: tuple[int, ...],
     device: torch.device,
@@ -399,6 +427,13 @@ def _validate_varlen_inputs_against_plan(
             f"{expected}, got {actual}"
         )
 
+    if (q_stride, k_stride, v_stride) != (plan.q_stride, plan.k_stride, plan.v_stride):
+        raise ValueError(
+            "varlen attention input strides must match the prepared q/k/v strides "
+            f"{(plan.q_stride, plan.k_stride, plan.v_stride)}, "
+            f"got {(q_stride, k_stride, v_stride)}"
+        )
+
 
 @dataclass(frozen=True, kw_only=True)
 class AttentionPlanKey:
@@ -428,6 +463,9 @@ class VarlenAttentionPlanKey:
     q_shape: tuple[int, ...]
     k_shape: tuple[int, ...]
     v_shape: tuple[int, ...]
+    q_stride: tuple[int, ...]
+    k_stride: tuple[int, ...]
+    v_stride: tuple[int, ...]
     cu_seqlens_q_shape: tuple[int, ...]
     cu_seqlens_k_shape: tuple[int, ...]
     device_index: int
@@ -915,6 +953,9 @@ class _VarlenAttentionForwardLaunch:
         num_q_tiles: int = 0,
         total_blocks_cap: int = 0,
         per_segment_tiles: bool = False,
+        q_stride: tuple[int, ...] | None = None,
+        k_stride: tuple[int, ...] | None = None,
+        v_stride: tuple[int, ...] | None = None,
     ):
         self._block_sparse = bool(block_sparse)
         self._per_segment_tiles = bool(per_segment_tiles)
@@ -928,9 +969,9 @@ class _VarlenAttentionForwardLaunch:
         self._o_shape = _output_shape(q_shape, v_shape)
         self._lse_shape = _lse_shape(q_shape)
         self._attention_sink_bias_shape = (q_shape[-2],)
-        self._q_stride = _contiguous_stride(q_shape)
-        self._k_stride = _contiguous_stride(k_shape)
-        self._v_stride = _contiguous_stride(v_shape)
+        self._q_stride = _contiguous_stride(q_shape) if q_stride is None else q_stride
+        self._k_stride = _contiguous_stride(k_shape) if k_stride is None else k_stride
+        self._v_stride = _contiguous_stride(v_shape) if v_stride is None else v_stride
         self._cu_seqlens_q_stride = _contiguous_stride(cu_seqlens_q_shape)
         self._cu_seqlens_k_stride = _contiguous_stride(cu_seqlens_k_shape)
         self._o_stride = _contiguous_stride(self._o_shape)
@@ -1183,6 +1224,9 @@ def _compile_varlen_attention(
     num_q_tiles: int = 0,
     total_blocks_cap: int = 0,
     per_segment_tiles: bool = False,
+    q_stride: tuple[int, ...] | None = None,
+    k_stride: tuple[int, ...] | None = None,
+    v_stride: tuple[int, ...] | None = None,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _VarlenAttentionForwardLaunch(
@@ -1204,6 +1248,9 @@ def _compile_varlen_attention(
         num_q_tiles=num_q_tiles,
         total_blocks_cap=total_blocks_cap,
         per_segment_tiles=per_segment_tiles,
+        q_stride=q_stride,
+        k_stride=k_stride,
+        v_stride=v_stride,
     )
     return b12x_compile(
         launch,
@@ -1224,7 +1271,7 @@ def _compile_varlen_attention(
         current_cuda_stream(),
         compile_spec=KernelCompileSpec.from_key(
             "attention.contiguous.varlen_forward",
-            2,
+            3,
             (
                 q_shape,
                 k_shape,
@@ -1244,6 +1291,9 @@ def _compile_varlen_attention(
                 num_q_tiles,
                 total_blocks_cap,
                 per_segment_tiles,
+                q_stride,
+                k_stride,
+                v_stride,
             ),
         ),
     )
@@ -1333,7 +1383,13 @@ def _get_varlen_attention_plan(
     num_q_tiles: int = 0,
     total_blocks_cap: int = 0,
     per_segment_tiles: bool = False,
+    q_stride: tuple[int, ...] | None = None,
+    k_stride: tuple[int, ...] | None = None,
+    v_stride: tuple[int, ...] | None = None,
 ) -> VarlenAttentionPlan:
+    q_stride = _contiguous_stride(q_shape) if q_stride is None else q_stride
+    k_stride = _contiguous_stride(k_shape) if k_stride is None else k_stride
+    v_stride = _contiguous_stride(v_shape) if v_stride is None else v_stride
     (
         num_batch,
         num_q_heads,
@@ -1353,6 +1409,9 @@ def _get_varlen_attention_plan(
             q_shape=q_shape,
             k_shape=k_shape,
             v_shape=v_shape,
+            q_stride=q_stride,
+            k_stride=k_stride,
+            v_stride=v_stride,
             cu_seqlens_q_shape=cu_seqlens_q_shape,
             cu_seqlens_k_shape=cu_seqlens_k_shape,
             device_index=device_index,
@@ -1395,6 +1454,9 @@ def _get_varlen_attention_plan(
             num_q_tiles,
             total_blocks_cap,
             per_segment_tiles,
+            q_stride=q_stride,
+            k_stride=k_stride,
+            v_stride=v_stride,
         ),
         cutlass_dtype=_torch_to_cutlass_dtype(dtype),
     )
@@ -1946,6 +2008,9 @@ def build_varlen_attention_binding(
             resolved_max_seqlen_k,
             workspace.tile_m,
             workspace.tile_n,
+            q_stride=tuple(q.stride()),
+            k_stride=tuple(k.stride()),
+            v_stride=tuple(v.stride()),
         )
     if has_attention_sink_bias != plan.has_attention_sink_bias:
         raise ValueError(
@@ -1974,6 +2039,9 @@ def build_varlen_attention_binding(
                 f"got {(window_size_left, window_size_right)}"
             )
     _validate_varlen_inputs_against_plan(
+        q_stride=tuple(q.stride()),
+        k_stride=tuple(k.stride()),
+        v_stride=tuple(v.stride()),
         q_shape=q_shape,
         k_shape=k_shape,
         v_shape=v_shape,
@@ -2066,6 +2134,9 @@ def _build_varlen_attention_binding_from_views(
                 f"got {(window_size_left, window_size_right)}"
             )
     _validate_varlen_inputs_against_plan(
+        q_stride=tuple(q.stride()),
+        k_stride=tuple(k.stride()),
+        v_stride=tuple(v.stride()),
         q_shape=q_shape,
         k_shape=k_shape,
         v_shape=v_shape,
@@ -2438,6 +2509,9 @@ def b12x_varlen_attention_forward(
                 f"got {(left, right)}"
             )
     _validate_varlen_inputs_against_plan(
+        q_stride=tuple(q.stride()),
+        k_stride=tuple(k.stride()),
+        v_stride=tuple(v.stride()),
         q_shape=q_shape,
         k_shape=k_shape,
         v_shape=v_shape,

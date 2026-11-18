@@ -22,26 +22,44 @@ _LAUNCH_PROGRAMS = {}
 register_program_cache(_LAUNCH_PROGRAMS)
 
 
+@cute.jit
+def mapped_expert_id(raw: Int64, mapping, route_experts: Int32, experts: Int32):
+    expert = Int64(-1)
+    if raw >= Int64(0) and raw < route_experts.to(Int64):
+        local = mapping[raw.to(Int32)].to(Int64)
+        if local >= Int64(0) and local < experts.to(Int64):
+            expert = local
+    return expert
+
+
 class _ActiveExperts:
+    def __init__(self, mapped=False):
+        self.mapped = mapped
+
     @cute.jit
     def __call__(
         self,
         routes: cute.Pointer,
         mask: cute.Pointer,
+        map_ptr: cute.Pointer,
+        route_experts: Int32,
         count: Int32,
         experts: Int32,
         stream: cuda.CUstream,
     ):
         ids = cute.make_tensor(routes, cute.make_layout((count,)))
         active = cute.make_tensor(mask, cute.make_layout((experts,)))
-        self.kernel(ids, active, count, experts).launch(
+        mapping = cute.make_tensor(map_ptr, cute.make_layout((route_experts,)))
+        self.kernel(ids, active, mapping, route_experts, count, experts).launch(
             grid=((experts + Int32(7)) // Int32(8), 1, 1),
             block=(256, 1, 1),
             stream=stream,
         )
 
     @cute.kernel
-    def kernel(self, ids, active, count: Int32, experts: Int32):
+    def kernel(
+        self, ids, active, mapping, route_experts: Int32, count: Int32, experts: Int32
+    ):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         expert = Int32(block) * Int32(8) + Int32(tid) // Int32(32)
@@ -50,7 +68,10 @@ class _ActiveExperts:
             found = cutlass.Boolean(False)
             route = lane
             while route < count:
-                found = found | (ids[route].to(Int64) == expert.to(Int64))
+                raw = ids[route].to(Int64)
+                if cutlass.const_expr(self.mapped):
+                    raw = mapped_expert_id(raw, mapping, route_experts, experts)
+                found = found | (raw == expert.to(Int64))
                 route += Int32(32)
             present = cute.arch.vote_any_sync(found)
             if lane == Int32(0):
@@ -60,26 +81,32 @@ class _ActiveExperts:
 class _ActiveExpertBitmap:
     """Build per-warp bitmaps with work proportional to routes plus experts."""
 
-    def __init__(self, experts):
+    def __init__(self, experts, mapped=False):
         self.words = (experts + 31) // 32
+        self.mapped = mapped
 
     @cute.jit
     def __call__(
         self,
         routes: cute.Pointer,
         mask: cute.Pointer,
+        map_ptr: cute.Pointer,
+        route_experts: Int32,
         count: Int32,
         experts: Int32,
         stream: cuda.CUstream,
     ):
         ids = cute.make_tensor(routes, cute.make_layout((count,)))
         active = cute.make_tensor(mask, cute.make_layout((experts,)))
-        self.kernel(ids, active, count, experts).launch(
+        mapping = cute.make_tensor(map_ptr, cute.make_layout((route_experts,)))
+        self.kernel(ids, active, mapping, route_experts, count, experts).launch(
             grid=(1, 1, 1), block=(256, 1, 1), stream=stream
         )
 
     @cute.kernel
-    def kernel(self, ids, active, count: Int32, experts: Int32):
+    def kernel(
+        self, ids, active, mapping, route_experts: Int32, count: Int32, experts: Int32
+    ):
         tid, _, _ = cute.arch.thread_idx()
         smem = cutlass.utils.SmemAllocator()
         bitmap = smem.allocate_tensor(
@@ -93,6 +120,8 @@ class _ActiveExpertBitmap:
         route = Int32(tid)
         while route < count:
             expert = ids[route].to(Int64)
+            if cutlass.const_expr(self.mapped):
+                expert = mapped_expert_id(expert, mapping, route_experts, experts)
             if expert >= Int64(0) and expert < experts.to(Int64):
                 word = Int32(tid) // Int32(32) * Int32(self.words) + expert.to(
                     Int32
@@ -115,9 +144,9 @@ class _ActiveExpertBitmap:
 
 
 @program_cache
-def compile_csf_active_experts(ids64=False, experts=0):
-    kernel = _ActiveExpertBitmap(experts) if experts else _ActiveExperts()
-    key = (bool(ids64), int(experts))
+def compile_csf_active_experts(ids64=False, experts=0, mapped=False):
+    kernel = _ActiveExpertBitmap(experts, mapped) if experts else _ActiveExperts(mapped)
+    key = (bool(ids64), int(experts), bool(mapped))
     raise_if_kernel_resolution_frozen("cute.compile", target=kernel, cache_key=key)
     return b12x_compile(
         kernel,
@@ -128,14 +157,16 @@ def compile_csf_active_experts(ids64=False, experts=0):
             assumed_align=8 if ids64 else 4,
         ),
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        0,
         1,
         1,
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.csf_active_experts", 2, key),
+        compile_spec=KernelCompileSpec.from_key("quant.csf_active_experts", 3, key),
     )
 
 
-def mark_active_experts(ids, active, program):
+def mark_active_experts(ids, active, program, expert_map=None):
     if (
         ids.dtype not in (torch.int32, torch.int64)
         or not ids.is_contiguous()
@@ -143,14 +174,24 @@ def mark_active_experts(ids, active, program):
         or active.dtype != torch.int32
     ):
         raise ValueError("CSF presence masks require contiguous CUDA integer routes")
+    if expert_map is not None and (
+        expert_map.dtype != torch.int32
+        or expert_map.device != ids.device
+        or expert_map.ndim != 1
+        or not expert_map.is_contiguous()
+    ):
+        raise ValueError("CSF expert maps must be contiguous CUDA int32 vectors")
     handle = id(program)
     _LAUNCH_PROGRAMS[handle] = program
-    _mark_active_experts_op(ids, active, handle)
+    _mark_active_experts_op(ids, active, expert_map, handle)
 
 
 @torch.library.custom_op("b12x::csf_active_experts", mutates_args=("active",))
 def _mark_active_experts_op(
-    ids: torch.Tensor, active: torch.Tensor, program_handle: int
+    ids: torch.Tensor,
+    active: torch.Tensor,
+    expert_map: torch.Tensor | None,
+    program_handle: int,
 ) -> None:
     program = _LAUNCH_PROGRAMS[program_handle]
     program(
@@ -163,6 +204,13 @@ def _mark_active_experts_op(
         make_ptr(
             cutlass.Int32, active.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
         ),
+        make_ptr(
+            cutlass.Int32,
+            (active if expert_map is None else expert_map).data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        0 if expert_map is None else expert_map.numel(),
         ids.numel(),
         active.numel(),
         current_cuda_stream(),
@@ -170,5 +218,5 @@ def _mark_active_experts_op(
 
 
 @_mark_active_experts_op.register_fake
-def _mark_active_experts_fake(ids, active, program_handle) -> None:
+def _mark_active_experts_fake(ids, active, expert_map, program_handle) -> None:
     pass

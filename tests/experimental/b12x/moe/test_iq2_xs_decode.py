@@ -11,7 +11,9 @@ from b12x._lib.compiler import compile as b12x_compile
 from b12x._lib.intrinsics.memory import cp_async4_shared_global, shared_ptr_to_u32
 from b12x._lib.intrinsics.trellis import (
     packed_decode_iq2_xs_to_bfloat2x4,
+    packed_decode_iq2_xxs_to_bfloat2x4,
     iq2_xxs_descriptor_pair,
+    iq2_xs_descriptor_pair_to_bf16x2x2,
 )
 from b12x._lib.quant.iq2_xs import (
     IQ2_XS_MAGNITUDE_LUT_BYTES,
@@ -24,8 +26,17 @@ from b12x.testing.reference.helpers import require_b12x
 
 
 class _DecodeProbe:
-    def __init__(self, shared_lut=False, selector_lut=False, codec="iq2_xs"):
+    def __init__(
+        self,
+        shared_lut=False,
+        selector_lut=False,
+        codec="iq2_xs",
+        dense_pair=False,
+        native_xxs=False,
+    ):
         self.codec = codec
+        self.dense_pair = dense_pair
+        self.native_xxs = native_xxs
         self.count = 32768 if codec == "iq2_xxs" else 65536
         self.shared_lut = shared_lut
         self.selector_lut = selector_lut
@@ -35,7 +46,13 @@ class _DecodeProbe:
 
     @property
     def __cache_key__(self):
-        return (self.shared_lut, self.selector_lut, self.codec)
+        return (
+            self.shared_lut,
+            self.selector_lut,
+            self.codec,
+            self.dense_pair,
+            self.native_xxs,
+        )
 
     @cute.jit
     def __call__(
@@ -96,19 +113,41 @@ class _DecodeProbe:
             signs0 = signs0 | (signs0 << 14) | (nibble << 28)
             signs1 = (other >> 9) | ((descriptor >> 9) << 7)
             signs1 = signs1 | (signs1 << 14) | ((15 - nibble) << 28)
-            q0 = iq2_xxs_descriptor_pair(grids0, signs0, cutlass.Int32(row % 2))
-            q1 = iq2_xxs_descriptor_pair(grids1, signs1, cutlass.Int32(row % 2))
-            subscale_pair = (signs0 >> 28) | ((signs1 >> 28) << 8)
-        a, b, c, d = packed_decode_iq2_xs_to_bfloat2x4(
-            q0,
-            q1,
-            base_pair,
-            subscale_pair,
-            table_addr,
-            pair,
-            shared_lut=self.shared_lut,
-            selector_lut=self.selector_lut,
-        )
+            if cutlass.const_expr(not self.native_xxs):
+                q0 = iq2_xxs_descriptor_pair(grids0, signs0, cutlass.Int32(row % 2))
+                q1 = iq2_xxs_descriptor_pair(grids1, signs1, cutlass.Int32(row % 2))
+                subscale_pair = (signs0 >> 28) | ((signs1 >> 28) << 8)
+        if cutlass.const_expr(self.dense_pair):
+            a, b = iq2_xs_descriptor_pair_to_bf16x2x2(
+                q0, cutlass.Uint32(base), nibble, table_addr, pair
+            )
+            c, d = iq2_xs_descriptor_pair_to_bf16x2x2(
+                q1, cutlass.Uint32(base) ^ 0x8000, 15 - nibble, table_addr, pair
+            )
+        elif cutlass.const_expr(self.native_xxs):
+            a, b, c, d = packed_decode_iq2_xxs_to_bfloat2x4(
+                grids0,
+                grids1,
+                base_pair,
+                signs0,
+                signs1,
+                cutlass.Int32(row % 2),
+                table_addr,
+                pair,
+                shared_lut=self.shared_lut,
+                selector_lut=self.selector_lut,
+            )
+        else:
+            a, b, c, d = packed_decode_iq2_xs_to_bfloat2x4(
+                q0,
+                q1,
+                base_pair,
+                subscale_pair,
+                table_addr,
+                pair,
+                shared_lut=self.shared_lut,
+                selector_lut=self.selector_lut,
+            )
         out[row, 0], out[row, 1] = cutlass.Int32(a), cutlass.Int32(b)
         out[row, 2], out[row, 3] = cutlass.Int32(c), cutlass.Int32(d)
 
@@ -116,11 +155,18 @@ class _DecodeProbe:
 @pytest.mark.parametrize(
     "base_bits", [0, 0x8000, 1, 0x8001, 0x3FF, 0x400, 0x3C01, 0x7BFF, 0xFBFF]
 )
-@pytest.mark.parametrize("shared_lut", [False, True])
-@pytest.mark.parametrize("selector_lut", [False, True])
-@pytest.mark.parametrize("codec", ["iq2_xs", "iq2_xxs"])
+@pytest.mark.parametrize(
+    "codec,native_xxs,shared_lut,selector_lut,dense_pair",
+    [
+        (codec, native, shared, selector, False)
+        for codec, native in (("iq2_xs", False), ("iq2_xxs", False), ("iq2_xxs", True))
+        for shared in (False, True)
+        for selector in (False, True)
+    ]
+    + [(codec, False, True, True, True) for codec in ("iq2_xs", "iq2_xxs")],
+)
 def test_all_descriptors_subscales_and_rounding(
-    base_bits, shared_lut, selector_lut, codec
+    base_bits, codec, native_xxs, shared_lut, selector_lut, dense_pair
 ):
     device = require_b12x()
     table = iq2_xs_execution_lut(
@@ -133,7 +179,13 @@ def test_all_descriptors_subscales_and_rounding(
         from_dlpack(output, assumed_align=16),
     )
     compiled = b12x_compile(
-        _DecodeProbe(shared_lut, selector_lut, codec),
+        _DecodeProbe(
+            shared_lut,
+            selector_lut,
+            codec,
+            dense_pair=dense_pair,
+            native_xxs=native_xxs,
+        ),
         cutlass.Int32(base_bits),
         lut_arg,
         out_arg,

@@ -1189,6 +1189,8 @@ def per_token_group_quant_8bit(
     scale_tma_aligned: bool = False,
     scale_ue8m0: bool = False,
     backend: Literal["cutile", "cuda"] = "cutile",
+    *,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Per-token group 8-bit quantization (FP8 or INT8).
 
@@ -1222,6 +1224,9 @@ def per_token_group_quant_8bit(
         currently supports ``group_size=128`` with FP16/BF16 input. Both
         backends compute the scale with IEEE float32 division and, for
         ``dst_dtype=torch.int8``, round half up (``floor(x + 0.5)``).
+    out : Optional[Tuple[torch.Tensor, torch.Tensor]]
+        Caller-owned contiguous quantized values and FP32 row-major scales.
+        Only the cutile backend accepts caller-owned output.
 
     Returns
     -------
@@ -1245,9 +1250,14 @@ def per_token_group_quant_8bit(
             column_major_scales=column_major_scales,
             scale_tma_aligned=scale_tma_aligned,
             scale_ue8m0=scale_ue8m0,
+            out=out,
         )
 
     if backend == "cuda":
+        if out is not None:
+            raise ValueError(
+                "the CUDA quantization backend does not accept caller-owned output"
+            )
         return _per_token_group_quant_8bit_cuda(
             x,
             group_size,

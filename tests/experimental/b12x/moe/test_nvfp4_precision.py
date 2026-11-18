@@ -198,6 +198,88 @@ def test_a16_cutoff_uses_existing_precision_candidates(mode, larger_recipe):
             assert all(config.backend != "w4a16" for config in configs)
 
 
+def test_explicit_activation_mode_selects_same_row_precision_on_one_weight_owner():
+    from types import SimpleNamespace
+    from b12x.moe.fused_moe._impl import (
+        B12XFP4ExpertWeights,
+        _PreparedWeightRepresentation,
+    )
+    from b12x.moe.fused_moe._preparation import _program_query_payload
+    from b12x.preparation import DeviceIdentity
+
+    plan = weight_plan(
+        geometry=fused_moe.MoEGeometry(
+            num_experts=384, hidden_size=4608, intermediate_size=576
+        ),
+        activation=fused_moe.ActivationSpec(
+            mode="a4",
+            nonlinearity="situ",
+            io_dtype=torch.bfloat16,
+            a16_max_tokens=64,
+        ),
+    )
+    plane = torch.empty(1, dtype=torch.uint8)
+    w1 = plane.expand(384, 1152, 2304)
+    w2 = plane.expand(384, 4608, 288)
+    experts = fused_moe.PreparedExperts(
+        plan=plan,
+        _impl=B12XFP4ExpertWeights(
+            plan=plan._impl,
+            w1_fp4=w1,
+            w2_fp4=w2,
+            w1_blockscale=plane,
+            w2_blockscale=plane,
+            w1_alphas=torch.ones(384),
+            w2_alphas=torch.ones(384),
+            a1_gscale=torch.ones(384),
+            a2_gscale=torch.ones(384),
+            representation=_PreparedWeightRepresentation(
+                quant_mode="w4a16",
+                layout="source_native",
+                value=SimpleNamespace(w13=w1, w2=w2),
+            ),
+        ),
+    )
+    capacity = fused_moe.ExecutionCapacity(max_tokens=8, top_k=8)
+    declarations = {
+        mode: fused_moe.plan_execution(
+            experts=experts,
+            capacity=capacity,
+            activation_mode=mode,
+        )
+        for mode in ("a4", "a16", None)
+    }
+    assert declarations["a4"].query.quant_modes == ("nvfp4",)
+    assert declarations["a16"].query.quant_modes == ("w4a16",)
+    assert declarations[None].query.quant_modes == ("w4a16",)
+    assert _program_query_payload(declarations["a4"].query) != _program_query_payload(
+        declarations["a16"].query
+    )
+    device = DeviceIdentity("nvidia", (12, 0), 188, "SM120")
+    for mode in ("a4", "a16"):
+        child = declarations[mode]
+        assert child.query.num_tokens == 8
+        assert child.query.intermediate_size == 576
+        assert child.query.a4_prefill is False
+        assert child.contract.eligible_plan(child.query, device).candidates
+    with pytest.raises(ValueError, match="cannot be combined"):
+        fused_moe.plan_execution(
+            experts=experts,
+            capacity=capacity,
+            activation_mode="a16",
+            invocation={"a4_prefill": True},
+        )
+    with pytest.raises(ValueError, match="a4 or a16"):
+        fused_moe.plan_execution(
+            experts=experts, capacity=capacity, activation_mode="a8"
+        )
+    single = SimpleNamespace(plan=weight_plan())
+    with pytest.raises(ValueError, match="unavailable on the prepared weight owner"):
+        fused_moe.plan_execution(
+            experts=single, capacity=capacity, activation_mode="a16"
+        )
+
+
 @pytest.mark.parametrize("name", ["w13_blockscale", "w2_blockscale"])
 @pytest.mark.parametrize("invalid", ["truncated", "strided", "dtype"])
 def test_native_nvfp4_preparation_validates_scale_storage(name, invalid):

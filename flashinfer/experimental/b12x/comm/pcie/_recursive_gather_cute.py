@@ -1,4 +1,4 @@
-"""Byte-exact TP16 gather through four pairwise doubling exchanges."""
+"""Byte-exact power-of-two DCP gather through pairwise doubling exchanges."""
 
 import cutlass
 import cutlass.cute as cute
@@ -9,10 +9,13 @@ from ._cute_intrinsics import ld_relaxed_gpu_u32
 from ._dcp_a2a_cute import (
     _GRAPH_ARRIVED_INDEX,
     _GRAPH_EPOCH_INDEX,
+    _MAX_BLOCKS,
     _a2a_graph_epoch_arrive,
     _copy_16b,
 )
 from ._dcp_cute_common import (
+    _FLAG_STRIDE,
+    _MAX_RANKS,
     _load_relaxed_sys_u32,
     _membar_sys,
     _store_relaxed_sys_u32,
@@ -34,18 +37,21 @@ class RecursiveGather(SelectedGather):
     ):
         super().__init__(world, rank, row_words, threads, blocks, chunks, "barrier")
         self.acknowledge_consumption = acknowledge_consumption
-        if world != 16 or threads != 128 or blocks != 8:
+        if world not in (8, 16) or threads != 128 or blocks != 8:
             raise ValueError(
-                "recursive gather requires TP16 with eight 128-thread CTAs"
+                "recursive gather requires DCP8 or DCP16 with eight 128-thread CTAs"
             )
 
     @cute.jit
     def _flag(self, signal, sender, block, value):
         slot = Int64(value % Uint32(2))
         index = (
-            Int64(64 * 16)
-            + ((slot * Int64(64) + Int64(block)) * Int64(16 * 32))
-            + Int64(sender * 32)
+            Int64(_MAX_BLOCKS * _MAX_RANKS)
+            + (
+                (slot * Int64(_MAX_BLOCKS) + Int64(block))
+                * Int64(_MAX_RANKS * _FLAG_STRIDE)
+            )
+            + Int64(sender * _FLAG_STRIDE)
         )
         return signal + index
 
@@ -86,16 +92,29 @@ class RecursiveGather(SelectedGather):
             packs = Int32(self.row_words // 4)
             row_tiles = (packs + Int32(31)) // Int32(32)
             tiles = rows * row_tiles
-            for phase in cutlass.range_constexpr(4):
-                group = 1 << phase
-                peer = self._rank ^ group
-                own_begin = self._rank & ~(group - 1)
-                peer_begin = peer & ~(group - 1)
+            for phase in cutlass.range_constexpr(self._world_size.bit_length() - 1):
+                if cutlass.const_expr(self._world_size == 8):
+                    # Cross the two four-GPU switches first. Later exchanges
+                    # stay within each switch while forwarding both sets of shards.
+                    distance = (4, 1, 2)[phase]
+                    group = (1, 2, 4)[phase]
+                else:
+                    distance = 1 << phase
+                    group = distance
+                peer = self._rank ^ distance
                 remote = self._staging_words(stages[peer] + bank)
                 # A CTA owns the same row/column tiles in every rank segment.
                 # It only forwards bytes that it completed in an earlier phase.
                 for segment in cutlass.range_constexpr(group):
-                    sending = own_begin + segment
+                    if cutlass.const_expr(self._world_size == 8):
+                        if cutlass.const_expr(phase == 0):
+                            sending = self._rank
+                        elif cutlass.const_expr(phase == 1):
+                            sending = self._rank if segment == 0 else self._rank ^ 4
+                        else:
+                            sending = self._rank ^ (segment & 1) ^ ((segment & 2) * 2)
+                    else:
+                        sending = (self._rank & ~(distance - 1)) + segment
                     destination = sending if sending < peer else sending - 1
                     tile = first
                     while tile < tiles:
@@ -103,7 +122,7 @@ class RecursiveGather(SelectedGather):
                         pack = (tile - row * row_tiles) * Int32(32) + lane
                         if pack < packs:
                             out_pack = (
-                                Int64(row) * Int64(16) + Int64(sending)
+                                Int64(row) * Int64(self._world_size) + Int64(sending)
                             ) * Int64(packs) + Int64(pack)
                             if cutlass.const_expr(phase == 0):
                                 source_pack = Int64(row) * Int64(packs) + Int64(pack)
@@ -118,7 +137,8 @@ class RecursiveGather(SelectedGather):
                                     (output + out_pack * Int64(4)).toint()
                                 )
                             destination_pack = (
-                                Int64(row) * Int64(15) + Int64(destination)
+                                Int64(row) * Int64(self._world_size - 1)
+                                + Int64(destination)
                             ) * Int64(packs) + Int64(pack)
                             st_global_v4_u32(
                                 (remote + destination_pack * Int64(4)).toint(), *words
@@ -128,7 +148,15 @@ class RecursiveGather(SelectedGather):
                 cute.arch.sync_threads()
                 self._pair_barrier(signals, peer, block, tid)
                 for segment in cutlass.range_constexpr(group):
-                    receiving = peer_begin + segment
+                    if cutlass.const_expr(self._world_size == 8):
+                        if cutlass.const_expr(phase == 0):
+                            receiving = peer
+                        elif cutlass.const_expr(phase == 1):
+                            receiving = peer if segment == 0 else peer ^ 4
+                        else:
+                            receiving = peer ^ (segment & 1) ^ ((segment & 2) * 2)
+                    else:
+                        receiving = (peer & ~(distance - 1)) + segment
                     origin = receiving if receiving < self._rank else receiving - 1
                     tile = first
                     while tile < tiles:
@@ -136,10 +164,10 @@ class RecursiveGather(SelectedGather):
                         pack = (tile - row * row_tiles) * Int32(32) + lane
                         if pack < packs:
                             incoming_pack = (
-                                Int64(row) * Int64(15) + Int64(origin)
+                                Int64(row) * Int64(self._world_size - 1) + Int64(origin)
                             ) * Int64(packs) + Int64(pack)
                             out_pack = (
-                                Int64(row) * Int64(16) + Int64(receiving)
+                                Int64(row) * Int64(self._world_size) + Int64(receiving)
                             ) * Int64(packs) + Int64(pack)
                             _copy_16b(
                                 local + incoming_pack * Int64(4),

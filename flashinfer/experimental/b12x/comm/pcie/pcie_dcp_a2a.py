@@ -282,6 +282,28 @@ def lse_reduce_scatter_reference(
     return (outputs * weights.unsqueeze(-1)).sum(dim=0).to(partial_outputs.dtype)
 
 
+def _pair_outputs_disjoint(first, second, out_first, out_second):
+    """Check raw contiguous spans; omitted outputs are freshly allocated."""
+
+    def overlap(a, b):
+        return (
+            a is not None
+            and b is not None
+            and a.device == b.device
+            and a.data_ptr() < b.data_ptr() + b.nbytes
+            and b.data_ptr() < a.data_ptr() + a.nbytes
+        )
+
+    return not (
+        overlap(out_first, out_second)
+        or any(
+            overlap(source, out)
+            for source in (first, second)
+            for out in (out_first, out_second)
+        )
+    )
+
+
 class PCIeDCPA2A:
     """One ordered IPC channel for DCP attention collectives."""
 
@@ -1218,8 +1240,8 @@ class PCIeDCPA2A:
         )
         if any(value % 16 for value in row_bytes):
             raise ValueError("paired row widths must be multiples of 16 bytes")
-        row_blocks = bool(state.query.call.get("row_blocks", False))
-        if row_blocks and (tuple(local_first.shape) != (4, 224) or tuple(local_second.shape) != (4, 56)
+        specialized_rows = state.query.call.get("row_blocks") is True
+        if specialized_rows and (tuple(local_first.shape) != (4, 224) or tuple(local_second.shape) != (4, 56)
                            or local_first.dtype != torch.bfloat16 or local_second.dtype != torch.float32):
             raise ValueError("row-parallel paired gather inputs differ from the prepared geometry")
         combined_row_bytes = sum(row_bytes)
@@ -1256,8 +1278,15 @@ class PCIeDCPA2A:
             if not output.is_contiguous():
                 raise ValueError(f"{name} output must be contiguous")
         threads, _ = self._resolve_launch_config(threads=threads, block_limit=1)
+        row_blocks = state.query.call.get("row_blocks", 1) or 1
+        if row_blocks > 1 and not _pair_outputs_disjoint(
+            local_first, local_second, out_first, out_second
+        ):
+            raise ValueError(
+                "parallel paired gather outputs must not overlap its inputs or each other"
+            )
         capturing = _is_current_stream_capturing(self.device)
-        if capturing and not row_blocks:
+        if capturing and not specialized_rows:
             from ._dcp_a2a_cute import is_all_gather_pair_prepared
 
             if not is_all_gather_pair_prepared(
@@ -1266,6 +1295,8 @@ class PCIeDCPA2A:
                 threads,
                 True,
                 False,
+                row_blocks,
+                int(state.query.call.get("load_batch", 1)),
             ):
                 raise RuntimeError(
                     "cold PCIe DCP paired gather CUDA graph capture is not "

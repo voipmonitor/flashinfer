@@ -33,6 +33,9 @@ class VarlenAttentionQuery:
     max_seqlen_q: int
     max_seqlen_k: int
     math_mode: str = "flash"
+    q_row_stride: int = 0
+    k_row_stride: int = 0
+    v_row_stride: int = 0
     block_sparse: bool = False
     per_segment_tiles: bool = False
     block_tile_m: int = 0
@@ -195,7 +198,7 @@ def _materialize_tuning(
 
 TUNING = TuningContract(
     component_id="attention.varlen",
-    query_schema_version=23,
+    query_schema_version=24,
     config_schema_version=22,
     query_fields=frozenset(VarlenAttentionQuery.__dataclass_fields__),
     config_fields=frozenset(VarlenAttentionConfig.__dataclass_fields__),

@@ -74,11 +74,71 @@ the world size, and whose whole message fits `pipe_bytes`. The control record
 carries them as op kinds 3 and 4; proxy ABI 11 adds the two kinds and changes
 no region layout.
 
+Each pipelined kind reuses one receive row and one flag per source, phase and
+chunk, and a kernel waits until a flag equals its op's sequence number. Two
+transitions let a rank write a peer's rows before that peer finished reading
+the previous op: a reduce-scatter or two-shot after a reduce-scatter (phase 0),
+and a shard gather after a two-shot or shard gather (phase 1). For those, every
+rank writes its start-of-op sequence into a credit word of each peer's control
+record, and the proxy holds the hazardous phase until every peer's credit
+reached the op (proxy ABI 14). Without the credits, a write overtaking a slow
+peer's read ends in that peer's wait timeout or in silently mixed rows. Other
+transitions are ordered by data dependencies and carry no credits. On the ring
+transports, a credit to a rank that is not a neighbor travels as an empty
+mailbox write.
+
 Collective generations range from 1 through 2,147,483,647. The proxy fails
 with `RoCE sequence space exhausted` before dispatching a larger generation;
 recreate every rank's runtime to reset the sequence. The bound preserves the
 meaning of zero-initialized chunk-ready words and the healthy error sentinel.
 It applies to the direct and ring transports and does not change the proxy ABI.
+
+## Rails, lanes and the all-gather relay
+
+Each peer is reached over up to two rails, each a pair of RDMA devices on one
+IPv4 subnet. The direct transport routes a peer over the narrowest subnet it
+shares: on DGX Sparks whose first port joins a switch and whose second port is
+cabled to one partner, the partner's rails use the cable's two functions and
+every other peer's use the switch's. A peer's two rails use devices behind
+different PCIe links when possible, because the two ConnectX-7 functions behind
+one PCIe x4 link share its bandwidth.
+
+The two ranks of a group on one cabled pair hold every subnet in common, so
+subnet breadth cannot tell their cable from the switch. Each endpoint therefore
+also records its netdev's MAC address and, when lldpd runs on the host, the port
+MAC addresses that `lldpctl` reports for its neighbors. LLDP frames do not cross
+a switch, so devices of two ranks that list each other share a cable, and the
+planner prefers such links. Without lldpd on both hosts, a two-rank group on a
+cabled pair uses the switch.
+
+Each rail is `lanes` reliable queue pairs (constructor `lanes`, else
+`B12X_ROCE_LANES`, else 4; at most 4, equal on every rank). Two-shot and
+variable-length chunk `c` uses lane `c % lanes`; one-shot and ring relays use
+lane 0. A stripe and its flag always share a lane, so the flag-after-payload
+ordering holds per stripe. The connection blob carries every lane's queue-pair
+number and the lane count (proxy ABI 12); the region layout is unchanged.
+
+On four DGX Sparks with both a switch and partner cables, a CPU-driven 16 MiB
+two-shot (every chunk marked ready at once, 128 KiB chunks, 60 operations) sent
+192.5 Gb/s per rank with one lane and 206.8 Gb/s with four; over the switch
+alone it sent 190.8 Gb/s with either. A single queue pair per peer and device
+does not keep both PCIe links of a host busy once a cable adds wire capacity.
+
+When the ranks form pairs joined by direct cables (every rail to one peer uses
+subnets only the two of them hold), the two-shot all-gather is relayed
+(constructor `relay`, else `B12X_ROCE_RELAY`, else on; equal on every rank). A
+rank sends its reduced shard to its partner and to one rank of every other
+pair, which forwards each chunk over its own cable to its partner as soon as
+the chunk's flags arrived. The receiver sees the same bytes and flags as from
+a direct write, so results are unchanged bit for bit. The ConnectX-7 splits
+each PCIe link evenly between its cable and switch functions, so a flat
+two-shot, which sends one third of a rank's bytes to its partner, leaves cable
+capacity unused while the switch traffic finishes. With two pairs the relay
+puts two of a rank's three all-gather shards on its cable, and the whole
+two-shot is half cable and half switch. The relay applies to two-shot and
+shard-gather operations, not to the variable-length all-gather;
+`native_description()["relay_plan"]` is the plan a native runtime passes to
+`roce_set_relay`. Proxy ABI 13 adds `roce_set_relay`.
 
 ## Runnable checks
 
@@ -96,7 +156,12 @@ python3 tests/experimental/b12x/comm/validate_roce_ring_native.py \
 
 The default source directory is this checkout. Use `--source PATH` to validate
 another proxy source directory, `--skew-rank R` to delay one CPU driver between
-operations, or `--mesh` to check the ordinary direct transport. The validator
+operations, `--consume-delay-ms D` to make that rank read peers' rows late,
+`--scatter-gather` to add reduce-scatter and shard-gather ops in every order
+between pipelined kinds, `--mesh` to check the ordinary direct transport, `--lanes L` to
+select the queue pairs per rail, or `--mesh --relay` to relay two-shot
+all-gather chunks through cable partners, which requires ranks that pair up over
+direct cables and all four functions in `--hca-names`. The validator
 alternates one-shot, two-shot, and variable-length operations, including changing
 payload sizes, uneven shards, and empty contributions. Each rank reports routes,
 connected-peer count, forwarding count, and completed writes as JSON.

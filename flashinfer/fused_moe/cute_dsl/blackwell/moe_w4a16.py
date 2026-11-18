@@ -412,6 +412,7 @@ def launch_w4a16_moe(
     situ_linear_beta: Optional[float] = None,
     tactic: Optional[W4A16MoeTactic] = None,
     swap_ab: bool = False,
+    workspace: Optional[_W4A16Workspace] = None,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     top_k = int(token_selected_experts.size(1))
@@ -432,14 +433,15 @@ def launch_w4a16_moe(
     route_tile = gemm1_tactic[0][1]
     if gemm2_tactic[0][1] != route_tile:
         raise ValueError("W4A16 GEMM tactics must use the same routed-row tile")
-    workspace = _get_workspace(
-        x,
-        top_k,
-        num_experts,
-        num_local_experts,
-        intermediate_size,
-        route_tile,
-    )
+    if workspace is None:
+        workspace = _get_workspace(
+            x,
+            top_k,
+            num_experts,
+            num_local_experts,
+            intermediate_size,
+            route_tile,
+        )
 
     (
         tile_idx_to_expert_idx,

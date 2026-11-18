@@ -14,13 +14,15 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass.cutlass_dsl import Int32, Int64, Uint32, Uint64
+from cutlass.cutlass_dsl import Boolean, Int32, Int64, Uint32, Uint64, T, dsl_user_op
+from cutlass._mlir.dialects import nvvm
 
 from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
 from b12x._lib.program_cache import program_cache, register_program_cache
 from b12x._lib.runtime_control import raise_if_kernel_resolution_frozen
 from b12x._lib.utils.device import current_cuda_stream
 from b12x._lib.utils.pointers import make_ptr
+from b12x._lib.quant.csf_routing import mapped_expert_id
 
 _LAUNCH_PROGRAMS = {}
 register_program_cache(_LAUNCH_PROGRAMS)
@@ -360,9 +362,42 @@ class _Plane:
             entry += Int64(256)
 
 
+@dsl_user_op
+def _cta_any(predicate: Boolean, threads: int, *, loc=None, ip=None) -> Boolean:
+    result = Int32(
+        nvvm.barrier_cta_red(
+            predicate.ir_value(loc=loc, ip=ip),
+            Int32(0).ir_value(loc=loc, ip=ip),
+            nvvm.BarrierReduxKind.OR,
+            thread_count=Int32(threads).ir_value(loc=loc, ip=ip),
+            aligned=True,
+            results=[T.i32()],
+            loc=loc,
+            ip=ip,
+        )
+    )
+    return result != Int32(0)
+
+
 class _Pair:
-    def __init__(self, first, second, indexed=False, fuse_tasks=False):
+    def __init__(
+        self,
+        first,
+        second,
+        indexed=False,
+        fuse_tasks=False,
+        packed_routes=None,
+        mapped=False,
+    ):
         self.fuse_tasks = fuse_tasks
+        self.mapped = mapped
+        if mapped and packed_routes is not None:
+            raise ValueError("Mapped CSF expansion uses standalone route packing")
+        self.packed_routes = None
+        if packed_routes is not None:
+            from b12x._lib.quant.csf_route_pack import CsfRoutePack
+
+            self.packed_routes = CsfRoutePack(packed_routes)
         plane = _Plane
         if indexed:
             from b12x._lib.quant.nvfp4_csf_indexed import IndexedNvfp4Plane
@@ -386,9 +421,25 @@ class _Pair:
         }
         self.first = readers.get(first[3], plane)(first)
         self.second = readers.get(second[3], plane)(second)
+        self.compact_pair = isinstance(
+            self.first, CompactBlockStoragePlane
+        ) and isinstance(self.second, CompactBlockStoragePlane)
+        self.shared_words = 0
+        if self.compact_pair:
+            self.shared_words = max(
+                self.first.groups_per_task * 128 if self.first.shared_exceptions else 0,
+                self.second.groups_per_task * 128
+                if self.second.shared_exceptions
+                else 0,
+                2 * self.packed_routes.rounded if self.packed_routes is not None else 0,
+            )
         self.threads = max(
             getattr(self.first, "threads", 256), getattr(self.second, "threads", 256)
         )
+        if self.packed_routes is not None and self.packed_routes.rounded > self.threads:
+            raise ValueError(
+                "Packed CSF route capacity exceeds the decoder CTA thread count"
+            )
 
     @cute.jit
     def __call__(
@@ -404,6 +455,8 @@ class _Pair:
         o2: cute.Pointer,
         lut2: cute.Pointer,
         ids_ptr: cute.Pointer,
+        map_ptr: cute.Pointer,
+        route_experts: Int32,
         experts: Int32,
         bytes13: Int64,
         bytes2: Int64,
@@ -417,6 +470,9 @@ class _Pair:
         task_begin_ptr: cute.Pointer,
         task_slots: Int32,
         task_block_m: Int32,
+        packed_indices_ptr: cute.Pointer,
+        packed_experts_ptr: cute.Pointer,
+        packed_count_ptr: cute.Pointer,
         stream: cuda.CUstream,
     ):
         first = self.first.tensors(f13, e13, p13, o13, lut13, experts, bytes13)
@@ -432,6 +488,8 @@ class _Pair:
             first,
             second,
             ids,
+            cute.make_tensor(map_ptr, cute.make_layout((route_experts,))),
+            route_experts,
             experts,
             capacity,
             mode,
@@ -442,8 +500,16 @@ class _Pair:
             cute.make_tensor(task_expert_ptr, cute.make_layout((task_slots,))),
             cute.make_tensor(task_begin_ptr, cute.make_layout((task_slots,))),
             task_block_m,
+            packed_indices_ptr,
+            packed_experts_ptr,
+            packed_count_ptr,
         ).launch(
-            grid=(capacity * Int32(self.first.tasks + self.second.tasks), 1, 1),
+            grid=(
+                capacity * Int32(self.first.tasks + self.second.tasks)
+                + Int32(self.packed_routes is not None),
+                1,
+                1,
+            ),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -454,6 +520,8 @@ class _Pair:
         first,
         second,
         ids,
+        mapping,
+        route_experts: Int32,
         experts: Int32,
         capacity: Int32,
         mode: Int32,
@@ -464,70 +532,148 @@ class _Pair:
         task_expert,
         task_begin,
         task_block_m: Int32,
+        packed_indices_ptr: cute.Pointer,
+        packed_experts_ptr: cute.Pointer,
+        packed_count_ptr: cute.Pointer,
     ):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
-        # The following MoE launch observes both resets through stream order.
-        # This folds its two fill launches into the scale expansion.
-        if block == 0:
-            slot_to_reset = Int32(tid)
-            while slot_to_reset < barrier_slots:
-                barrier_count[slot_to_reset] = Int32(0)
-                barrier_epoch[slot_to_reset] = Int32(0)
-                slot_to_reset += Int32(self.threads)
-        slot = Int32(block) // Int32(self.first.tasks + self.second.tasks)
-        task = Int32(block) % Int32(self.first.tasks + self.second.tasks)
-        expert = slot
-        # mode 0: potentially repeated routes; mode 1: unique IDs;
-        # mode 2: expert counts; mode 3: every expert, no route read.
-        if mode != Int32(3):
-            raw = ids[slot].to(Int64)
-            if mode == Int32(2):
-                if raw <= Int64(0):
-                    expert = Int32(-1)
-            else:
-                expert = Int32(-1)
-                if raw >= Int64(0) and raw < Int64(experts):
-                    expert = raw.to(Int32)
-                if mode == Int32(0):
-                    # Every warp checks the same prefix in parallel. The
-                    # resulting predicate is uniform across the CTA, so only
-                    # the first route may write an expert's scale region.
-                    duplicate = cutlass.Boolean(False)
-                    prior = Int32(tid) % Int32(32)
-                    while prior < slot:
-                        duplicate = duplicate | (ids[prior].to(Int64) == raw)
-                        prior += Int32(32)
-                    if cute.arch.vote_any_sync(duplicate):
-                        expert = Int32(-1)
-        if expert >= Int32(0) and expert < experts:
-            if cutlass.const_expr(self.fuse_tasks):
-                if task == Int32(0) and Int32(tid) < Int32(32):
-                    previous = Int32(tid)
-                    prefix = Int32(0)
-                    while previous < expert:
-                        count = counts[previous]
-                        prefix += (count + task_block_m - Int32(1)) // task_block_m
-                        previous += Int32(32)
-                    prefix = cute.arch.warp_reduction_sum(prefix)
-                    tiles = (counts[expert] + task_block_m - Int32(1)) // task_block_m
-                    tile = Int32(tid)
-                    while tile < tiles:
-                        task_expert[prefix + tile] = expert
-                        task_begin[prefix + tile] = tile * task_block_m
-                        tile += Int32(32)
-            if task < Int32(self.first.tasks):
-                self.first.decode(first, expert, task, Int32(tid))
-            else:
-                self.second.decode(
-                    second, expert, task - Int32(self.first.tasks), Int32(tid)
+        shared = None
+        if cutlass.const_expr(self.shared_words > 0):
+            smem = cutlass.utils.SmemAllocator()
+            shared = smem.allocate_tensor(
+                Uint32, cute.make_layout(self.shared_words), byte_alignment=16
+            )
+        scale_block = Int32(block)
+        if cutlass.const_expr(self.packed_routes is not None):
+            scale_block -= Int32(1)
+            if block == 0:
+                if capacity == Int32(0):
+                    slot_to_reset = Int32(tid)
+                    while slot_to_reset < barrier_slots:
+                        barrier_count[slot_to_reset] = Int32(0)
+                        barrier_epoch[slot_to_reset] = Int32(0)
+                        slot_to_reset += Int32(self.threads)
+                self.packed_routes.run(
+                    ids,
+                    cute.make_tensor(
+                        packed_indices_ptr, cute.make_layout(self.packed_routes.slots)
+                    ),
+                    cute.make_tensor(
+                        packed_experts_ptr, cute.make_layout(self.packed_routes.blocks)
+                    ),
+                    cute.make_tensor(packed_count_ptr, cute.make_layout(1)),
+                    capacity,
+                    experts,
+                    Int32(tid),
+                    self.threads,
+                    shared,
                 )
+        if scale_block >= Int32(0):
+            # The following MoE launch observes both resets through stream order.
+            # This folds its two fill launches into the scale expansion.
+            if scale_block == 0:
+                slot_to_reset = Int32(tid)
+                while slot_to_reset < barrier_slots:
+                    barrier_count[slot_to_reset] = Int32(0)
+                    barrier_epoch[slot_to_reset] = Int32(0)
+                    slot_to_reset += Int32(self.threads)
+            slot = scale_block // Int32(self.first.tasks + self.second.tasks)
+            task = scale_block % Int32(self.first.tasks + self.second.tasks)
+            expert = slot
+            # mode 0: potentially repeated routes; mode 1: unique IDs;
+            # mode 2: expert counts; mode 3: every expert, no route read.
+            if mode != Int32(3):
+                raw = ids[slot].to(Int64)
+                if mode == Int32(2):
+                    if raw <= Int64(0):
+                        expert = Int32(-1)
+                else:
+                    if cutlass.const_expr(self.mapped):
+                        raw = mapped_expert_id(raw, mapping, route_experts, experts)
+                    expert = Int32(-1)
+                    if raw >= Int64(0) and raw < Int64(experts):
+                        expert = raw.to(Int32)
+                    if mode == Int32(0) or self.mapped:
+                        duplicate = Boolean(False)
+                        if cutlass.const_expr(self.packed_routes is not None):
+                            # Fused route capacity never exceeds the CTA thread count.
+                            prior = Int32(tid)
+                            if prior < slot:
+                                duplicate = ids[prior].to(Int64) == raw
+                        else:
+                            if Int32(tid) < Int32(32):
+                                prior = Int32(tid)
+                                while prior < slot:
+                                    previous = ids[prior].to(Int64)
+                                    if cutlass.const_expr(self.mapped):
+                                        previous = mapped_expert_id(
+                                            previous, mapping, route_experts, experts
+                                        )
+                                    duplicate = duplicate | (previous == raw)
+                                    prior += Int32(32)
+                        # Every thread participates, including invalid and first routes.
+                        if _cta_any(duplicate, self.threads):
+                            expert = Int32(-1)
+            if expert >= Int32(0) and expert < experts:
+                if cutlass.const_expr(self.fuse_tasks):
+                    if task == Int32(0) and Int32(tid) < Int32(32):
+                        previous = Int32(tid)
+                        prefix = Int32(0)
+                        while previous < expert:
+                            count = counts[previous]
+                            prefix += (count + task_block_m - Int32(1)) // task_block_m
+                            previous += Int32(32)
+                        prefix = cute.arch.warp_reduction_sum(prefix)
+                        tiles = (
+                            counts[expert] + task_block_m - Int32(1)
+                        ) // task_block_m
+                        tile = Int32(tid)
+                        while tile < tiles:
+                            task_expert[prefix + tile] = expert
+                            task_begin[prefix + tile] = tile * task_block_m
+                            tile += Int32(32)
+                if cutlass.const_expr(self.compact_pair):
+                    # Each CTA executes exactly one plane or route-metadata branch.
+                    if task < Int32(self.first.tasks):
+                        self.first.decode(first, expert, task, Int32(tid), shared)
+                    else:
+                        self.second.decode(
+                            second,
+                            expert,
+                            task - Int32(self.first.tasks),
+                            Int32(tid),
+                            shared,
+                        )
+                else:
+                    if task < Int32(self.first.tasks):
+                        self.first.decode(first, expert, task, Int32(tid))
+                    else:
+                        self.second.decode(
+                            second, expert, task - Int32(self.first.tasks), Int32(tid)
+                        )
 
 
 @program_cache
-def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False, fuse_tasks=False):
-    launch = _Pair(first, second, indexed, fuse_tasks)
-    key = (first, second, bool(ids64), bool(indexed), bool(fuse_tasks))
+def compile_nvfp4_csf_pair(
+    first,
+    second,
+    ids64=False,
+    indexed=False,
+    fuse_tasks=False,
+    packed_routes=None,
+    mapped=False,
+):
+    launch = _Pair(first, second, indexed, fuse_tasks, packed_routes, mapped)
+    key = (
+        first,
+        second,
+        bool(ids64),
+        bool(indexed),
+        bool(fuse_tasks),
+        packed_routes,
+        bool(mapped),
+    )
     raise_if_kernel_resolution_frozen("cute.compile", target=launch, cache_key=key)
     plane = (
         make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16),
@@ -546,6 +692,8 @@ def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False, fuse_tasks
             cute.AddressSpace.gmem,
             assumed_align=8 if ids64 else 4,
         ),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        0,
         1,
         1,
         1,
@@ -559,8 +707,11 @@ def compile_nvfp4_csf_pair(first, second, ids64=False, indexed=False, fuse_tasks
         make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         0,
         1,
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 4, cute.AddressSpace.gmem, assumed_align=4),
         current_cuda_stream(),
-        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 8, key),
+        compile_spec=KernelCompileSpec.from_key("quant.nvfp4_csf_pair", 10, key),
     )
 
 
@@ -598,6 +749,8 @@ def decode_nvfp4_csf_pair(
     indexed_scales=None,
     task_metadata=None,
     task_block_m=0,
+    packed_routes=None,
+    expert_map=None,
 ):
     """Launch the precompiled pair into caller-owned native NVFP4 scale grids.
 
@@ -607,6 +760,17 @@ def decode_nvfp4_csf_pair(
     """
     if first.num_experts != second.num_experts or mode not in (0, 1, 2, 3):
         raise ValueError("NVFP4-CSF expert counts or routing mode disagree")
+    if expert_map is not None and (
+        expert_map.dtype != torch.int32
+        or expert_map.device != first.fixed.device
+        or expert_map.ndim != 1
+        or not expert_map.is_contiguous()
+        or packed_routes is not None
+        or mode not in (0, 1)
+    ):
+        raise ValueError(
+            "Mapped CSF expansion requires direct routes and a contiguous CUDA int32 map"
+        )
     if (
         ids.dtype not in (torch.int32, torch.int64)
         or not ids.is_contiguous()
@@ -630,7 +794,7 @@ def decode_nvfp4_csf_pair(
     capacity = first.num_experts if mode == 3 else ids.numel()
     if mode == 2 and capacity != first.num_experts:
         raise ValueError("NVFP4-CSF count routing requires one count per expert")
-    if not capacity:
+    if not capacity and packed_routes is None:
         if barriers is not None or task_metadata is not None:
             raise ValueError("Fused decoder writes require a nonempty decoder grid")
         return
@@ -665,6 +829,21 @@ def decode_nvfp4_csf_pair(
         raise ValueError(
             "Fused task metadata requires counts and two CUDA int32 vectors"
         )
+    if packed_routes is not None and (
+        mode != 0
+        or program is None
+        or len(packed_routes) != 3
+        or packed_routes[2].numel() != 1
+        or any(
+            tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            or tensor.device != first.fixed.device
+            for tensor in packed_routes
+        )
+    ):
+        raise ValueError(
+            "Packed CSF routes require a prepared direct-route program and three CUDA int32 buffers"
+        )
     if program is None:
         program = compile_nvfp4_csf_pair(
             first.geometry,
@@ -672,6 +851,7 @@ def decode_nvfp4_csf_pair(
             ids.dtype == torch.int64,
             indexed_scales is not None,
             task_metadata is not None,
+            mapped=expert_map is not None,
         )
 
     sources = []
@@ -691,6 +871,7 @@ def decode_nvfp4_csf_pair(
     _decode_pair_op(
         sources,
         ids,
+        expert_map,
         out13,
         out2,
         None if barriers is None else barriers[0],
@@ -699,6 +880,9 @@ def decode_nvfp4_csf_pair(
         None if task_metadata is None else task_metadata[1],
         None if task_metadata is None else task_metadata[2],
         task_block_m,
+        None if packed_routes is None else packed_routes[0],
+        None if packed_routes is None else packed_routes[1],
+        None if packed_routes is None else packed_routes[2],
         first.num_experts,
         capacity,
         mode,
@@ -715,11 +899,15 @@ def decode_nvfp4_csf_pair(
         "barrier_epoch",
         "task_expert",
         "task_begin",
+        "packed_indices",
+        "packed_experts",
+        "packed_count",
     ),
 )
 def _decode_pair_op(
     sources: list[torch.Tensor],
     ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
     out13: torch.Tensor,
     out2: torch.Tensor,
     barrier_count: torch.Tensor | None,
@@ -728,6 +916,9 @@ def _decode_pair_op(
     task_expert: torch.Tensor | None,
     task_begin: torch.Tensor | None,
     task_block_m: int,
+    packed_indices: torch.Tensor | None,
+    packed_experts: torch.Tensor | None,
+    packed_count: torch.Tensor | None,
     num_experts: int,
     capacity: int,
     routing_mode: int,
@@ -769,6 +960,8 @@ def _decode_pair_op(
             cutlass.Int64 if ids.dtype == torch.int64 else cutlass.Int32,
             8 if ids.dtype == torch.int64 else 4,
         ),
+        device_ptr(sources[2] if expert_map is None else expert_map, cutlass.Int32, 4),
+        0 if expert_map is None else expert_map.numel(),
         num_experts,
         sources[1].numel(),
         sources[5].numel(),
@@ -788,6 +981,15 @@ def _decode_pair_op(
         device_ptr(sources[2] if task_begin is None else task_begin, cutlass.Int32, 4),
         0 if task_expert is None else task_expert.numel(),
         task_block_m,
+        device_ptr(
+            sources[2] if packed_indices is None else packed_indices, cutlass.Int32, 4
+        ),
+        device_ptr(
+            sources[2] if packed_experts is None else packed_experts, cutlass.Int32, 4
+        ),
+        device_ptr(
+            sources[2] if packed_count is None else packed_count, cutlass.Int32, 4
+        ),
         current_cuda_stream(),
     )
 
@@ -796,6 +998,7 @@ def _decode_pair_op(
 def _decode_pair_fake(
     sources,
     ids,
+    expert_map,
     out13,
     out2,
     barrier_count,
@@ -804,6 +1007,9 @@ def _decode_pair_fake(
     task_expert,
     task_begin,
     task_block_m,
+    packed_indices,
+    packed_experts,
+    packed_count,
     num_experts,
     capacity,
     routing_mode,
@@ -825,6 +1031,11 @@ class Nvfp4CsfDecoder:
     indexed_programs: tuple | None = None
     bitmap_routes: bool = False
     direct_routes: bool = False
+    packed_route_geometry: tuple | None = None
+    packed_route_programs: tuple | None = None
+    mapped_programs: tuple | None = None
+    mapped_routing_programs: tuple | None = None
+    mapped_indexed_programs: tuple | None = None
 
     @classmethod
     def prepare(cls, first, second, out13, out2, *, indexed_scales=None):
@@ -877,6 +1088,30 @@ class Nvfp4CsfDecoder:
                 if indexed_scales is not None
                 else None
             ),
+            mapped_programs=tuple(
+                compile_nvfp4_csf_pair(
+                    first.geometry, second.geometry, ids64, mapped=True
+                )
+                for ids64 in (False, True)
+            ),
+            mapped_routing_programs=tuple(
+                compile_csf_active_experts(
+                    ids64,
+                    first.num_experts if first.geometry[3] in range(4, 10) else 0,
+                    mapped=True,
+                )
+                for ids64 in (False, True)
+            ),
+            mapped_indexed_programs=(
+                tuple(
+                    compile_nvfp4_csf_pair(
+                        first.geometry, second.geometry, ids64, True, mapped=True
+                    )
+                    for ids64 in (False, True)
+                )
+                if indexed_scales is not None
+                else None
+            ),
         )
 
     def decode_all(self, out13, out2):
@@ -891,25 +1126,60 @@ class Nvfp4CsfDecoder:
             program=self.programs[0],
         )
 
-    def decode(self, ids, out13, out2, *, barriers=None):
+    def decode(
+        self, ids, out13, out2, *, barriers=None, packed_routes=None, expert_map=None
+    ):
         from b12x._lib.quant.csf_routing import mark_active_experts
 
+        if packed_routes is not None:
+            geometry = self.packed_route_geometry
+            if (
+                geometry is None
+                or self.packed_route_programs is None
+                or ids.numel() > geometry[0]
+                or len(packed_routes) != 3
+                or packed_routes[0].numel() < geometry[2]
+                or packed_routes[1].numel() < geometry[3]
+                or expert_map is not None
+            ):
+                raise ValueError("Packed CSF routes exceed their prepared geometry")
+            decode_nvfp4_csf_pair(
+                self.first,
+                self.second,
+                ids,
+                out13,
+                out2,
+                program=self.packed_route_programs[int(ids.dtype == torch.int64)],
+                barriers=barriers,
+                packed_routes=packed_routes,
+            )
+            return
         # Build presence once for batch decode. Repeated token routes do not
         # imply that every expert is active. Long prefills bound the scan work
         # by expanding the complete, statically sized expert set instead.
         mode = 0
         if ids.numel() >= 16 * self.first.num_experts:
             mode = 3
+            expert_map = None
         elif ids.numel() >= 64 and not self.direct_routes:
+            routing = (
+                self.routing_programs
+                if expert_map is None
+                else self.mapped_routing_programs
+            )
             mark_active_experts(
-                ids, self.active, self.routing_programs[int(ids.dtype == torch.int64)]
+                ids, self.active, routing[int(ids.dtype == torch.int64)], expert_map
             )
             ids, mode = self.active, 2
+            expert_map = None
         # Short route lists retain direct duplicate checks. Equal-size spans
         # avoid assigning a large gate/up slab and a small down slab the same
         # CTA budget. Presence and full-expert expansion retain their slab grid.
         indexed = self.indexed_programs is not None and mode == 0
-        programs = self.indexed_programs if indexed else self.programs
+        if expert_map is None:
+            programs = self.indexed_programs if indexed else self.programs
+        else:
+            programs = self.mapped_indexed_programs if indexed else self.mapped_programs
         decode_nvfp4_csf_pair(
             self.first,
             self.second,
@@ -920,4 +1190,5 @@ class Nvfp4CsfDecoder:
             program=programs[int(ids.dtype == torch.int64)],
             barriers=barriers,
             indexed_scales=self.indexed_scales if indexed else None,
+            expert_map=expert_map,
         )

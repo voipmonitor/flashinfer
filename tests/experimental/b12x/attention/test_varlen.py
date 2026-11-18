@@ -726,3 +726,84 @@ def test_unequal_value_prefill_qk256_v128_causal_window_ragged() -> None:
     assert bool(torch.isfinite(actual).all().item())
     assert bool(torch.isfinite(actual_lse).all().item())
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,head_dim", [(12, 12, 128), (12, 4, 128), (2, 2, 256)]
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_interleaved_qkv_replay(dtype, q_heads, kv_heads, head_dim, causal):
+    from b12x.attention import varlen
+    from b12x.preparation import PreparationSession, PreparedCall, require_prepared
+
+    device = _require_contiguous_backend()
+    widths = (q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim)
+    packed = torch.randn(257, sum(widths), device=device, dtype=dtype)
+    device = packed.device
+    q, k, v = (
+        part.view(257, heads, head_dim)
+        for part, heads in zip(
+            packed.split(widths, dim=1), (q_heads, kv_heads, kv_heads), strict=True
+        )
+    )
+    cu = torch.tensor([0, 129, 257], device=device, dtype=torch.int32)
+    declaration = varlen.plan(
+        q, k, v, cu, max_seqlen_q=129, max_seqlen_k=129, causal=causal
+    )
+
+    def prepare(state):
+        (spec,) = state.scratch_plan.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        binding = state.bind(scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu)
+        return PreparedCall(run=lambda: state.run(binding), owners=(scratch, binding))
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=1
+    ) as session:
+        session.prepare(
+            (declaration.request(name="interleaved-qkv", prepare_call=prepare),)
+        )
+        state = require_prepared(declaration, "attention.varlen", device)
+        (spec,) = state.scratch_plan.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        out = torch.empty_like(q, memory_format=torch.contiguous_format)
+        with pytest.raises(ValueError, match="strides must match"):
+            state.bind(scratch=scratch, q=q, k=k, v=v.contiguous(), cu_seqlens_q=cu)
+        varlen.run_out(q, k, v, cu, out=out, scratch=scratch, plan=declaration)
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            varlen.run_out(q, k, v, cu, out=out, scratch=scratch, plan=declaration)
+        session.freeze()
+        for lengths in ([129, 128], [128, 129], [129, 128]):
+            packed.normal_()
+            cu.copy_(
+                torch.tensor(
+                    [0, lengths[0], sum(lengths)], device=device, dtype=torch.int32
+                )
+            )
+            out.fill_(float("nan"))
+            allocated = torch.cuda.memory_allocated()
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_allocated() == allocated
+            start = 0
+            for length in lengths:
+                stop = start + length
+                reference = F.scaled_dot_product_attention(
+                    q[start:stop].transpose(0, 1).float(),
+                    k[start:stop]
+                    .transpose(0, 1)
+                    .float()
+                    .repeat_interleave(q_heads // kv_heads, dim=0),
+                    v[start:stop]
+                    .transpose(0, 1)
+                    .float()
+                    .repeat_interleave(q_heads // kv_heads, dim=0),
+                    is_causal=causal,
+                ).transpose(0, 1)
+                torch.testing.assert_close(
+                    out[start:stop].float(), reference, atol=0.02, rtol=0.01
+                )
+                start = stop
+        graph.reset()

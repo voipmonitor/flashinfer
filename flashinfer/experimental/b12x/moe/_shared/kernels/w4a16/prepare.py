@@ -491,6 +491,7 @@ def _pack_e8m0_k32_scales(
     reuse_input_storage: bool = False,
     allow_k_tail: bool = False,
     padded_size_n: int | None = None,
+    allocate=None,
 ) -> torch.Tensor:
     if allow_k_tail:
         if int(size_k) % 8 != 0:
@@ -530,7 +531,7 @@ def _pack_e8m0_k32_scales(
         )
     else:
         source = source.clamp(max=_E8M0_K32_BF16_MAX_SCALE_BYTE)
-        packed = torch.empty(
+        packed = (torch.empty if allocate is None else allocate)(
             (int(source.shape[0]), scale_cols, output_size_n),
             dtype=torch.uint8,
             device=scales.device,
@@ -687,6 +688,7 @@ def _repack_weight(
     size_n: int,
     row_rotation: int | None = None,
     reuse_input_storage: bool = False,
+    allocate=None,
 ) -> torch.Tensor:
     num_experts = int(weight.shape[0])
     if tuple(weight.shape[1:]) != (size_n, size_k // 2):
@@ -709,7 +711,9 @@ def _repack_weight(
             raise ValueError("reuse_input_storage requires contiguous packed weights")
         packed = weight.view(torch.int32).reshape(packed_shape)
     else:
-        packed = torch.empty(packed_shape, device=weight.device, dtype=torch.int32)
+        packed = (torch.empty if allocate is None else allocate)(
+            packed_shape, device=weight.device, dtype=torch.int32
+        )
 
     k_tiles = size_k // _PACKED_TILE_SIZE
     n_tiles = size_n // _PACKED_TILE_N_SIZE
@@ -753,7 +757,10 @@ def _permute_nvfp4_scales(
     a_dtype: torch.dtype,
     row_rotation: int | None = None,
     output_size_n: int | None = None,
+    allocate=None,
+    scale_allocate=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    scale_allocate = allocate if scale_allocate is None else scale_allocate
     combined_scale_factor = _nvfp4_compute_scale_factor(scales, a_dtype)
     packed_scales: torch.Tensor | None = None
     for expert in range(scales.shape[0]):
@@ -775,7 +782,7 @@ def _permute_nvfp4_scales(
             scale_factor=combined_scale_factor,
         )
         if packed_scales is None:
-            packed_scales = torch.empty(
+            packed_scales = (torch.empty if scale_allocate is None else scale_allocate)(
                 (int(scales.shape[0]), *expert_packed.shape),
                 dtype=expert_packed.dtype,
                 device=expert_packed.device,
@@ -783,7 +790,7 @@ def _permute_nvfp4_scales(
         packed_scales[expert].copy_(expert_packed)
     if packed_scales is None:
         packed_size_n = int(size_n) if output_size_n is None else int(output_size_n)
-        packed_scales = torch.empty(
+        packed_scales = (torch.empty if scale_allocate is None else scale_allocate)(
             (0, size_k // _PACKED_TILE_SIZE, packed_size_n // 2),
             dtype=torch.float8_e4m3fn,
             device=scales.device,
@@ -792,7 +799,14 @@ def _permute_nvfp4_scales(
         global_scales,
         a_dtype=a_dtype,
     ).to(torch.float32)
-    packed_global = packed_global / combined_scale_factor
+    if allocate is None:
+        packed_global = packed_global / combined_scale_factor
+    else:
+        destination = allocate(
+            packed_global.shape, dtype=packed_global.dtype, device=packed_global.device
+        )
+        torch.div(packed_global, combined_scale_factor, out=destination)
+        packed_global = destination
     return packed_scales, packed_global.contiguous()
 
 
@@ -809,7 +823,10 @@ def _prepare_w4a16_packed_weights(
     source_format: str,
     w13_layout: str = "w13",
     reuse_input_storage: bool = False,
+    allocate=None,
+    scale_allocate=None,
 ) -> W4A16PackedWeights:
+    scale_allocate = allocate if scale_allocate is None else scale_allocate
     source_format = _normalize_source_format(source_format)
     w13_layout = _normalize_w13_layout(w13_layout)
     shape = validate_w4a16_packed_inputs(
@@ -849,12 +866,14 @@ def _prepare_w4a16_packed_weights(
         size_n=w13_rows,
         row_rotation=w13_row_rotation,
         reuse_input_storage=reuse_input_storage,
+        allocate=allocate,
     )
     packed_w2 = _repack_weight(
         w2_fp4 if reuse_input_storage else w2_fp4.contiguous(),
         size_k=intermediate_size,
         size_n=hidden_size,
         reuse_input_storage=reuse_input_storage,
+        allocate=allocate,
     )
     native_w13_global_scale = _source_global_scale(
         w13_global_scale,
@@ -871,6 +890,8 @@ def _prepare_w4a16_packed_weights(
         size_n=w13_rows,
         a_dtype=params_dtype,
         row_rotation=w13_row_rotation,
+        allocate=allocate,
+        scale_allocate=scale_allocate,
     )
     packed_w2_scale, packed_w2_global_scale = _permute_nvfp4_scales(
         w2_scale,
@@ -878,6 +899,8 @@ def _prepare_w4a16_packed_weights(
         size_k=intermediate_size,
         size_n=hidden_size,
         a_dtype=params_dtype,
+        allocate=allocate,
+        scale_allocate=scale_allocate,
     )
 
     return W4A16PackedWeights(
@@ -911,6 +934,8 @@ def prepare_w4a16_modelopt_nvfp4_weights(
     params_dtype: torch.dtype = torch.bfloat16,
     w13_layout: str = "w13",
     reuse_input_storage: bool = False,
+    allocate=None,
+    scale_allocate=None,
 ) -> W4A16PackedWeights:
     """Prepare ModelOpt NVFP4 tensors into the W4A16 packed runtime layout.
 
@@ -920,6 +945,7 @@ def prepare_w4a16_modelopt_nvfp4_weights(
     activations, ``w13_layout`` describes whether fused W13 rows arrive in
     checkpoint/logical W13 order or already swapped W31 order.
     """
+    scale_allocate = allocate if scale_allocate is None else scale_allocate
     return _prepare_w4a16_packed_weights(
         w13_fp4,
         w13_blockscale,
@@ -932,6 +958,8 @@ def prepare_w4a16_modelopt_nvfp4_weights(
         source_format="modelopt_nvfp4",
         w13_layout=w13_layout,
         reuse_input_storage=reuse_input_storage,
+        allocate=allocate,
+        scale_allocate=scale_allocate,
     )
 
 
@@ -947,12 +975,15 @@ def prepare_w4a16_modelopt_native_weights(
     params_dtype: torch.dtype = torch.bfloat16,
     source_format: str = "modelopt_nvfp4",
     w13_layout: str = "w13",
+    allocate=None,
+    scale_allocate=None,
 ) -> W4A16ModelOptWeights:
     """Prepare W4A16 consumers of checkpoint-native ModelOpt NVFP4 weights.
 
     Direct and tensor-core execution share the FP4 payload, swizzled E4M3
     block scales, and raw weight global scales with the source.
     """
+    scale_allocate = allocate if scale_allocate is None else scale_allocate
     source_format = _normalize_source_format(source_format)
     if source_format not in _MODEL_OPT_NVFP4_FORMATS:
         raise ValueError(
@@ -1035,6 +1066,8 @@ def prepare_w4a16_e8m0_native_weights(
     activation: str,
     params_dtype: torch.dtype = torch.bfloat16,
     w13_layout: str = "w13",
+    allocate=None,
+    scale_allocate=None,
 ) -> W4A16ModelOptWeights:
     """Prepare native MXFP4 (E8M0 K/32) weights for the W4A16 path.
 
@@ -1045,6 +1078,7 @@ def prepare_w4a16_e8m0_native_weights(
     that the small-M micro decode kernel reads. ``run_w4a16_moe`` routes small M
     to micro and the rest to the main W4A16 kernel automatically.
     """
+    scale_allocate = allocate if scale_allocate is None else scale_allocate
     w13_layout = _normalize_w13_layout(w13_layout)
     shape = validate_w4a16_packed_inputs(
         w13_fp4,
@@ -1090,6 +1124,7 @@ def prepare_w4a16_e8m0_native_weights(
         size_n=w13_rows,
         row_rotation=w13_row_rotation,
         padded_size_n=padded_w13_scale_n,
+        allocate=scale_allocate,
     )
     micro_w13_scale = (
         packed_w13_scale
@@ -1099,6 +1134,7 @@ def prepare_w4a16_e8m0_native_weights(
             size_k=hidden_size,
             size_n=w13_rows,
             padded_size_n=padded_w13_scale_n,
+            allocate=scale_allocate,
         )
     )
     packed_w2_scale = _pack_e8m0_k32_scales(
@@ -1106,6 +1142,7 @@ def prepare_w4a16_e8m0_native_weights(
         size_k=intermediate_size,
         size_n=hidden_size,
         allow_k_tail=allow_w2_k_tail,
+        allocate=scale_allocate,
     )
     # Storage-compatible single grid: micro reads the SAME packed _pack_e8m0_k32
     # scales the main GEMM reads (no separate K/16 micro grid).
@@ -1239,6 +1276,8 @@ def prepare_w4a16_fp4_e8m0_k32_weights(
     params_dtype: torch.dtype = torch.bfloat16,
     w13_layout: str = "w13",
     reuse_input_storage: bool = False,
+    allocate=None,
+    scale_allocate=None,
 ) -> W4A16PackedWeights:
     """Prepare FP4 weights with E8M0 K/32 scales for W4A16.
 
@@ -1246,6 +1285,7 @@ def prepare_w4a16_fp4_e8m0_k32_weights(
     saturated to the BF16 kernel's supported byte range and rearranged for
     kernel access; they are not expanded to K/16 or folded into global scales.
     """
+    scale_allocate = allocate if scale_allocate is None else scale_allocate
     w13_layout = _normalize_w13_layout(w13_layout)
     shape = validate_w4a16_packed_inputs(
         w13_fp4,
@@ -1284,12 +1324,14 @@ def prepare_w4a16_fp4_e8m0_k32_weights(
         size_n=w13_rows,
         row_rotation=w13_row_rotation,
         reuse_input_storage=reuse_input_storage,
+        allocate=allocate,
     )
     packed_w2 = _repack_weight(
         w2_fp4 if reuse_input_storage else w2_fp4.contiguous(),
         size_k=intermediate_size,
         size_n=hidden_size,
         reuse_input_storage=reuse_input_storage,
+        allocate=allocate,
     )
     packed_w13_scale = _pack_e8m0_k32_scales(
         w13_scale,
@@ -1297,12 +1339,14 @@ def prepare_w4a16_fp4_e8m0_k32_weights(
         size_n=w13_rows,
         row_rotation=w13_row_rotation,
         reuse_input_storage=reuse_input_storage,
+        allocate=scale_allocate,
     )
     packed_w2_scale = _pack_e8m0_k32_scales(
         w2_scale,
         size_k=intermediate_size,
         size_n=hidden_size,
         reuse_input_storage=reuse_input_storage,
+        allocate=scale_allocate,
     )
 
     return W4A16PackedWeights(

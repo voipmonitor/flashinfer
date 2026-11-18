@@ -587,8 +587,10 @@ def _build_extend_forward_kernel(
     msa_block_sparse: bool,
     msa_union_tile: bool,
     page_size: int,
-    use_fp8_pv_repack: bool,
+    use_fp8_pv_repack: bool = False,
     controls_key: tuple = (),
+    has_factored_relative_bias: bool = False,
+    gqa_group_size: int = 1,
 ) -> object:
     return build_extend_forward_kernel(
         traits,
@@ -597,6 +599,8 @@ def _build_extend_forward_kernel(
         window_left=window_left,
         has_attention_sink_bias=has_attention_sink_bias,
         has_relative_attention_bias=has_relative_attention_bias,
+        has_factored_relative_bias=has_factored_relative_bias,
+        gqa_group_size=gqa_group_size,
         msa_block_sparse=msa_block_sparse,
         msa_union_tile=msa_union_tile,
         page_size=page_size,
@@ -682,12 +686,16 @@ def _resolve_paged_attention_binding(
     v_descale: torch.Tensor | None,
     attention_sink_bias: torch.Tensor | None,
     relative_attention_bias: torch.Tensor | None,
+    relative_bias_factors: torch.Tensor | None,
+    relative_bias_projection: torch.Tensor | None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     object,
     torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
     torch.Tensor | None,
@@ -709,6 +717,8 @@ def _resolve_paged_attention_binding(
             ("v_descale", v_descale),
             ("attention_sink_bias", attention_sink_bias),
             ("relative_attention_bias", relative_attention_bias),
+            ("relative_bias_factors", relative_bias_factors),
+            ("relative_bias_projection", relative_bias_projection),
         )
         if value is not None
     ]
@@ -731,6 +741,8 @@ def _resolve_paged_attention_binding(
         binding.v_descale,
         binding.attention_sink_bias,
         binding.relative_attention_bias,
+        binding.relative_bias_factors,
+        binding.relative_bias_projection,
     )
 
 
@@ -755,7 +767,9 @@ def _capture_decode_graph_replay_metadata_if_needed(
             "prepare_decode_graph_replay_state before capture"
         )
     owner_scratch_plan = getattr(scratch, "_owner_scratch_plan", None)
-    if owner_scratch_plan is not None:
+    if owner_scratch_plan is not None and not getattr(
+        scratch, "_caller_owned_replay_metadata", False
+    ):
         # ``Plan.bind()`` may have run before capture.  In that case the graph
         # first sees the Plan-owned schedule addresses here, in ``run()``, and
         # the owner must be pinned before a later prepare can replace them.
@@ -801,6 +815,8 @@ def paged_attention_forward(
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
     relative_attention_bias: torch.Tensor | None = None,
+    relative_bias_factors: torch.Tensor | None = None,
+    relative_bias_projection: torch.Tensor | None = None,
     binding=None,
     _compile_only: bool = False,
     _launchers: _PagedLaunchers | None = None,
@@ -817,6 +833,8 @@ def paged_attention_forward(
         v_descale,
         attention_sink_bias,
         relative_attention_bias,
+        relative_bias_factors,
+        relative_bias_projection,
     ) = _resolve_paged_attention_binding(
         binding=binding,
         q=q,
@@ -828,6 +846,8 @@ def paged_attention_forward(
         v_descale=v_descale,
         attention_sink_bias=attention_sink_bias,
         relative_attention_bias=relative_attention_bias,
+        relative_bias_factors=relative_bias_factors,
+        relative_bias_projection=relative_bias_projection,
     )
     plan = workspace.plan
     page_table = workspace.page_table
@@ -953,7 +973,11 @@ def paged_attention_forward(
             )
     elif q2k_indices is not None:
         raise ValueError("q2k_indices can only be supplied for MSA block-sparse plans")
-    has_attention_sink_bias = attention_sink_bias is not None
+    # 0: no sink, 1: one logit per head, 2: one per query row and head.  The
+    # rank selects the kernel's indexing, so it is part of every program key.
+    has_attention_sink_bias = (
+        0 if attention_sink_bias is None else int(attention_sink_bias.ndim)
+    )
     if attention_sink_bias is None:
         attention_sink_bias = (
             workspace._prepared_optional_buffers["attention_sink_bias"]
@@ -961,17 +985,37 @@ def paged_attention_forward(
             else torch.empty(0, dtype=torch.float32, device=q.device)
         )
     else:
-        if attention_sink_bias.ndim != 1:
+        if attention_sink_bias.ndim == 2:
+            if plan.mode != "extend":
+                raise ValueError(
+                    "a per-row attention_sink_bias [total_q, num_q_heads] is "
+                    f"supported by extend plans only, got mode {plan.mode!r}"
+                )
+            if (
+                int(attention_sink_bias.shape[0]) < int(plan.total_q)
+                or int(attention_sink_bias.shape[1]) != plan.num_q_heads
+                or attention_sink_bias.dtype != torch.float32
+                or not attention_sink_bias.is_contiguous()
+            ):
+                raise ValueError(
+                    "a per-row attention_sink_bias must be contiguous float32 "
+                    f"[at least {int(plan.total_q)}, {plan.num_q_heads}], got "
+                    f"{attention_sink_bias.dtype} {tuple(attention_sink_bias.shape)}"
+                )
+        elif attention_sink_bias.ndim != 1:
             raise ValueError(
-                f"attention_sink_bias must be rank-1 [num_q_heads], got {tuple(attention_sink_bias.shape)}"
+                "attention_sink_bias must be [num_q_heads] or "
+                f"[total_q, num_q_heads], got {tuple(attention_sink_bias.shape)}"
             )
-        if int(attention_sink_bias.shape[0]) != plan.num_q_heads:
+        elif int(attention_sink_bias.shape[0]) != plan.num_q_heads:
             raise ValueError(
                 f"attention_sink_bias must have {plan.num_q_heads} elements, got {int(attention_sink_bias.shape[0])}"
             )
         if attention_sink_bias.device != q.device:
             raise ValueError("attention_sink_bias must be on the same CUDA device as q")
-        if _launchers is not None and (
+        if attention_sink_bias.ndim == 2:
+            pass
+        elif _launchers is not None and (
             attention_sink_bias.dtype != torch.float32
             or not attention_sink_bias.is_contiguous()
         ):
@@ -986,7 +1030,42 @@ def paged_attention_forward(
             if not attention_sink_bias.is_contiguous():
                 attention_sink_bias = attention_sink_bias.contiguous()
 
-    has_relative_attention_bias = relative_attention_bias is not None
+    has_factored_relative_bias = relative_bias_factors is not None
+    if has_factored_relative_bias != (relative_bias_projection is not None):
+        raise ValueError(
+            "relative_bias_factors and relative_bias_projection must be supplied together"
+        )
+    if has_factored_relative_bias:
+        if plan.mode != "extend" or plan.msa_block_sparse:
+            raise ValueError("factored relative bias requires dense extend attention")
+        if relative_attention_bias is not None:
+            raise ValueError("dense and factored relative bias cannot be combined")
+        for name, tensor, rank in (
+            ("relative_bias_factors", relative_bias_factors, 3),
+            ("relative_bias_projection", relative_bias_projection, 2),
+        ):
+            if (
+                tensor.dtype != torch.bfloat16
+                or tensor.ndim != rank
+                or tensor.device != q.device
+                or tensor.shape[-1] != 16
+                or tensor.stride(-1) != 1
+                or any(stride <= 0 for stride in tensor.stride())
+            ):
+                raise ValueError(
+                    f"{name} must be BF16 with rank {rank}, final extent 16, and positive strides on q's device"
+                )
+        if (
+            relative_bias_factors.shape[0] < plan.total_q
+            or relative_bias_factors.shape[1] != plan.num_q_heads
+            or relative_bias_projection.shape[0] != 1024
+        ):
+            raise ValueError(
+                "factored relative bias requires factors [at least total_q, num_q_heads, 16] and projection [1024, 16]"
+            )
+    has_relative_attention_bias = (
+        relative_attention_bias is not None or has_factored_relative_bias
+    )
     if relative_attention_bias is not None:
         if relative_attention_bias.ndim != 3:
             raise ValueError(
@@ -1118,6 +1197,8 @@ def paged_attention_forward(
                     plan, resident_ctas_per_sm=int(traits.num_ctas_per_sm)
                 ),
                 controls_key=controls_key,
+                has_factored_relative_bias=has_factored_relative_bias,
+                gqa_group_size=int(plan.gqa_group_size),
             )
         elif use_laguna_verify_kernel:
             forward_kernel = _build_laguna_verify_forward_kernel(
@@ -1308,6 +1389,12 @@ def paged_attention_forward(
         relative_attention_bias,
         _torch_to_cutlass_dtype(q.dtype),
     )
+    relative_bias_factors_arg = _to_kernel_tensor(
+        relative_bias_factors, cutlass.BFloat16, assumed_align=2
+    )
+    relative_bias_projection_arg = _to_kernel_tensor(
+        relative_bias_projection, cutlass.BFloat16, assumed_align=2
+    )
     k_descale_arg = _to_kernel_tensor(k_descale, cutlass.Float32)
     v_descale_arg = _to_kernel_tensor(v_descale, cutlass.Float32)
     k_tma_desc_ptrs: torch.Tensor | None = None
@@ -1422,8 +1509,9 @@ def paged_attention_forward(
             bool(use_native_fp8_pv),
             bool(decode_native_fp8_runtime_chunk_guard),
             int(plan.window_left),
-            bool(has_attention_sink_bias),
+            2 if has_attention_sink_bias == 2 else bool(has_attention_sink_bias),
             bool(has_relative_attention_bias),
+            bool(has_factored_relative_bias),
             bool(plan.msa_block_sparse),
             bool(getattr(plan, "msa_union_tile", False)),
             bool(use_laguna_verify_kernel),
@@ -1562,6 +1650,13 @@ def paged_attention_forward(
     )
     forward_args.extend((k_descale_arg, v_descale_arg))
     if plan.mode == "extend":
+        forward_cache_key.extend(
+            (
+                _tensor_meta_key(relative_bias_factors),
+                _tensor_meta_key(relative_bias_projection),
+            )
+        )
+        cache_key_labels.extend(("relative_bias_factors", "relative_bias_projection"))
         k_tma_desc_arg = _to_kernel_tensor(
             k_tma_desc_ptrs, cutlass.Int64, assumed_align=8
         )
@@ -1599,9 +1694,11 @@ def paged_attention_forward(
             v_descale_arg,
         ]
     forward_args.append(stream)
+    if plan.mode == "extend":
+        forward_args.extend((relative_bias_factors_arg, relative_bias_projection_arg))
     forward_spec = KernelCompileSpec.from_key(
         "attention.paged.forward",
-        26,
+        27,
         tuple(forward_cache_key),
         labels=tuple(cache_key_labels),
     )

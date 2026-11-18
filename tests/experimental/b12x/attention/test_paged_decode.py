@@ -729,3 +729,62 @@ def test_paged_decode_write_kv_appends_rows_exactly(fp8):
         exp_view[page, offset, :, :dqk] = k.to(dtype)
         exp_view[page, offset, :, dqk:] = v.to(dtype)
     assert torch.equal(packed.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize("split", [False, True])
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("sinks", [False, True])
+def test_caller_owned_placeholder_binding(split, fp8, sinks):
+    from dataclasses import replace
+    from b12x.attention.paged_decode._preparation import scratch_specs
+
+    state, inputs, _ = _metadata_case(fp8=fp8)
+    query = replace(state.query, caller_owned_placeholders=True, has_sinks=sinks)
+    config = replace(state.config, split_kv=split)
+    state = replace(
+        state,
+        query=query,
+        config=config,
+        dummy_part=None,
+        dummy_sinks=None,
+        dummy_descale=None,
+    )
+    inputs["attention_sink_bias"] = torch.zeros(query.num_q_heads) if sinks else None
+    scratch = [
+        torch.empty(spec.shape, dtype=spec.dtype)
+        for spec in scratch_specs(query, config, torch.device("cpu"))
+    ]
+    binding = state.bind(plan=None, scratch=scratch, **inputs)
+    assert binding.o_part.data_ptr() == scratch[0].data_ptr()
+    assert binding.lse_part.data_ptr() == scratch[1].data_ptr()
+    assert binding.o_part.shape == (
+        query.max_total_q if split else 1,
+        query.num_q_heads,
+        config.max_splits if split else 1,
+        query.head_dim_vo,
+    )
+    assert (
+        binding.sinks.data_ptr()
+        == (inputs["attention_sink_bias"] if sinks else scratch[2]).data_ptr()
+    )
+    assert (
+        binding.k_descale.data_ptr()
+        == (inputs["k_descale"] if fp8 else scratch[3]).data_ptr()
+    )
+    assert (
+        binding.v_descale.data_ptr()
+        == (inputs["v_descale"] if fp8 else scratch[3]).data_ptr()
+    )
+    with pytest.raises(ValueError, match="scratch must match"):
+        state.bind(plan=None, scratch=scratch[:-1], **inputs)
+
+
+def test_legacy_unsplit_binding_keeps_plan_owned_placeholders():
+    from dataclasses import replace
+
+    state, inputs, _ = _metadata_case()
+    state = replace(state, config=replace(state.config, split_kv=False))
+    binding = state.bind(plan=None, scratch=(), **inputs)
+    assert binding.o_part is state.dummy_part[0]
+    assert binding.lse_part is state.dummy_part[1]
+    assert binding.k_descale is state.dummy_descale

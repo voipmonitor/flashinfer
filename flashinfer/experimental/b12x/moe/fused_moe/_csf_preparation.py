@@ -15,9 +15,9 @@ from b12x.loader._csf_source import CsfSource, upload_csf_planes
 from .weights import CsfBlockPlanes, Mxfp4CsfWeights, Nvfp4CsfWeights, PackedWeights
 
 
-def prepare_csf_block_weights(plan, weights):
+def prepare_csf_block_weights(plan, weights, *, allocate=None):
     """Apply native preparation once and retain only compressed resident scales."""
-    from .planning import ActivationMode, prepare_weights
+    from .planning import ActivationMode, _prepare_weights
 
     nvfp4 = isinstance(weights, Nvfp4CsfWeights)
     mode = plan.activation.mode
@@ -73,7 +73,9 @@ def prepare_csf_block_weights(plan, weights):
                 buffers, (2 * n, h), (h // 32, n // 32), strict=True
             )
         )
-        unit = torch.ones(e, dtype=torch.float32, device=weights.w13.device)
+        unit = (torch.empty if allocate is None else allocate)(
+            (e,), dtype=torch.float32, device=weights.w13.device
+        ).fill_(1)
         native_weights = PackedWeights(
             w13=weights.w13,
             w2=weights.w2,
@@ -82,10 +84,21 @@ def prepare_csf_block_weights(plan, weights):
             w13_global_scales=unit,
             w2_global_scales=unit,
         )
+    rotation = (
+        0
+        if plan.activation.outer_scale == "token"
+        else n
+        if plan.source.w13_layout.value
+        == ("w13" if mode is ActivationMode.A16 else "w31")
+        else 0
+    )
     initial_planes = None
     if nvfp4 and mode is ActivationMode.A4:
         initial_planes = tuple(
-            Nvfp4CompactBlockPlane(prepare_csf_payload(source)) for source in sources
+            Nvfp4CompactBlockPlane(
+                prepare_csf_payload(source, allocate=allocate if not rot else None)
+            )
+            for source, rot in zip(sources, (rotation, 0), strict=True)
         )
         Nvfp4CsfDecoder.prepare(*initial_planes, *source_outputs).decode_all(
             *source_outputs
@@ -118,18 +131,13 @@ def prepare_csf_block_weights(plan, weights):
     elif not nvfp4:
         table = torch.arange(256, device=device).clamp_max_(247).to(torch.uint8)
         tables = (table, table)
-    prepared = prepare_weights(plan=plan, weights=native_weights)
+    prepared = _prepare_weights(
+        plan=plan, weights=native_weights, allocate=allocate, scale_allocate=torch.empty
+    )
     rep = prepared._impl.representation
     native = None if rep is None else rep.value
     a16 = mode is ActivationMode.A16
     destination = 1 if a16 else 0 if nvfp4 else 3 if n % 128 == 64 else 2
-    rotation = (
-        0
-        if plan.activation.outer_scale == "token"
-        else n
-        if (plan.source.w13_layout.value == ("w13" if a16 else "w31"))
-        else 0
-    )
     if (
         a16
         and not nvfp4
@@ -180,6 +188,7 @@ def prepare_csf_block_weights(plan, weights):
                 rotation=rot,
                 value_table=table,
                 group_rows=group if destination in (2, 3) else None,
+                allocate=allocate,
             ),
             layout=int(a16),
         )
@@ -203,7 +212,7 @@ def prepare_csf_block_weights(plan, weights):
     )
 
 
-def prepare_online_csf_weights(plan, weights, scale_scratch):
+def prepare_online_csf_weights(plan, weights, scale_scratch, *, allocate=None):
     """Compress native expert block scales losslessly, then prepare them as CSF.
 
     The GPU encoder writes the slab checkpoint encoding, so the experts follow
@@ -270,5 +279,5 @@ def prepare_online_csf_weights(plan, weights, scale_scratch):
         compressed = Mxfp4CsfWeights(
             weights.w13, weights.w2, sources[0], sources[1], *scale_scratch
         )
-    prepared = prepare_csf_block_weights(inner, compressed)
+    prepared = prepare_csf_block_weights(inner, compressed, allocate=allocate)
     return replace(prepared, plan=replace(prepared.plan, scale_compression="csf"))

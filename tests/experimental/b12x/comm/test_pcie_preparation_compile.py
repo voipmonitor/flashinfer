@@ -326,4 +326,41 @@ def test_paired_row_blocks_validate_transport_geometry(change):
         TUNING.validate_query(replace(query, call=FrozenMapping({**fields, **change})), None)
     with pytest.raises(ValueError, match="row-parallel"):
         TUNING.validate_query(replace(query, world_size=8), None)
-    assert _pair_launcher_key(16, 7, 512, True, False) == (16, 7, 512, True, False)
+    assert _pair_launcher_key(16, 7, 512, True, False) == _pair_launcher_key(16, 7, 512, True, False, 1, 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA compilation")
+@pytest.mark.parametrize("row_blocks", [1, 2, 4, 8])
+@pytest.mark.parametrize("load_batch", [1, 2])
+def test_paired_gather_compiles_row_partition_geometries(row_blocks, load_batch):
+    query = PcieQuery(
+        surface="DcpAllToAll.all_gather_pair",
+        world_size=16,
+        rank=0,
+        topology="pcie_ipc",
+        call=FrozenMapping(
+            dict(
+                threads=512,
+                row_blocks=row_blocks,
+                load_batch=load_batch,
+                disjoint_output=True,
+            )
+        ),
+        setup=FrozenMapping(),
+    )
+    payload = TUNING.encode_query(query)
+    ordinal = torch.cuda.current_device()
+    if row_blocks == 1 and load_batch != 1:
+        with pytest.raises(ValueError, match="batched paired loads require"):
+            compile_dcp_surface(payload, ordinal)
+        return
+    description = describe_compilation(
+        CompileJob.create(
+            "b12x.comm.pcie._dcp_preparation:compile_dcp_surface", payload, ordinal
+        )
+    )
+    assert len(description.programs) == 2
+    compile_in_process((description,))
+    launchers = compile_dcp_surface(payload, ordinal)
+    assert set(program_keys(launchers)) == set(description.programs)
+    load_programs(launchers)

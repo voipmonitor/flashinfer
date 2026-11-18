@@ -442,13 +442,19 @@ def _validate_config(query, config, device):
         if not simt and config.tile_m == 8 and config.split_k != 1:
             raise ValueError("transposed IQ2_XS does not support split-K")
         if (
+            query.recipe == "q8_0"
+            and config.tile_n == 32
+            and (config.tile_m not in (None, 16) or query.num_tokens > 32)
+        ):
+            raise ValueError("Q8 N32 requires M16 tiles and at most 32 rows")
+        if (
             type(config.tile_n) is not int
             or config.tile_n
             not in (
                 (4,)
                 if simt
                 else (32, 64, 128)
-                if query.recipe == "mxfp8"
+                if query.recipe in ("mxfp8", "q8_0")
                 else (64, 128)
             )
             or type(config.tile_k) is not int
@@ -545,7 +551,12 @@ def _tuning_parameters(query, device):
             ) == (16, 64, 64, 1, 4)
         if parameters["mode"] != "a16":
             return True
-        if parameters["tile_n"] == 32 and query.recipe != "mxfp8":
+        if parameters["tile_n"] == 32 and not (
+            query.recipe == "mxfp8"
+            or query.recipe == "q8_0"
+            and query.num_tokens <= 32
+            and parameters["tile_m"] == 16
+        ):
             return False
         if parameters["tile_n"] == 4:
             return (
@@ -670,7 +681,7 @@ TUNING = TuningContract(
     validate_query=_validate_query,
     validate_config=_validate_config,
     default_config=_default_config,
-    candidate_contract_version=55,
+    candidate_contract_version=56,
     knobs=(
         Knob(
             name="mode", values=("a16", "quantized"), binding=ParameterBinding.COMPILE

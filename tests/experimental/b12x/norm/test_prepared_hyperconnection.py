@@ -13,6 +13,44 @@ from b12x.norm.hyperconnection import _impl
 from ..conftest import require_b12x
 
 
+@pytest.mark.parametrize("rows", [1, 2])
+@pytest.mark.parametrize("row_stride", [6144, 14336])
+def test_head_gate_validates_only_addressed_row_strides(monkeypatch, rows, row_stride):
+    from types import SimpleNamespace
+
+    from b12x.norm.hyperconnection import _kernels
+
+    values = torch.empty((rows, 6144, 1), dtype=torch.bfloat16)
+    gates = torch.empty_strided((rows, 6144), (row_stride, 1), dtype=torch.bfloat16)
+    gates.copy_(torch.arange(rows * 6144).reshape(rows, 6144))
+    query = SimpleNamespace(
+        streams=6144, hidden_size=1, max_tokens=rows, gate_stride=6144
+    )
+    launches = []
+
+    def launch(actual_values, actual_gates, output):
+        assert actual_values is values and output is values
+        addressed = actual_gates.as_strided(actual_gates.shape, (query.gate_stride, 1))
+        torch.testing.assert_close(addressed, gates, rtol=0, atol=0)
+        launches.append(True)
+
+    def require_operation(operation):
+        assert operation == "head_gate"
+
+    prepared = SimpleNamespace(
+        query=query, launch=launch, require_operation=require_operation
+    )
+    monkeypatch.setattr(_kernels, "plan_from_handle", lambda handle: prepared)
+    monkeypatch.setattr(_kernels, "require_prepared", lambda plan, *args: plan)
+    if rows > 1 and row_stride != query.gate_stride:
+        with pytest.raises(ValueError, match="row stride"):
+            _kernels._head_gate_op._init_fn(values, gates, 0)
+        assert not launches
+    else:
+        _kernels._head_gate_op._init_fn(values, gates, 0)
+        assert launches == [True]
+
+
 @pytest.mark.parametrize("rows,width", [(1, 768), (7, 3072), (4096, 768)])
 def test_prepared_swiglu_oai_replays_changed_inputs(rows, width):
     device = require_b12x()

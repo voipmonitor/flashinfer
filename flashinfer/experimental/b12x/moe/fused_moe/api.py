@@ -127,6 +127,7 @@ def _canonical_prepare_weights(
     device: torch.device | str | None = None,
     staging: TrellisStaging | None = None,
     scale_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
+    allocate=None,
 ) -> PreparedExperts:
     """Prepare the canonical weight representation owned by this layer."""
     return _prepare_weights(
@@ -135,6 +136,7 @@ def _canonical_prepare_weights(
         device=device,
         staging=staging,
         scale_scratch=scale_scratch,
+        allocate=allocate,
     )
 
 
@@ -146,6 +148,7 @@ def _canonical_plan_execution(
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | None = None,
     scale_expansion=None,
+    activation_mode: ActivationMode | None = None,
 ):
     """Declare capacity variants; preparation publishes executable states."""
     return _plan_execution(
@@ -155,6 +158,7 @@ def _canonical_plan_execution(
         invocation=invocation,
         override=override,
         scale_expansion=scale_expansion,
+        activation_mode=activation_mode,
     )
 
 

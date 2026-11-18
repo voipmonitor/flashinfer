@@ -329,6 +329,7 @@ def test_expanded_scales_match_native_under_poisoned_replay(
     packing=None,
     inactive=False,
     zero_tiny=False,
+    compiled_packed_expansion=False,
 ):
     """Poisoned scale scratch is restored before native kernels execute."""
     device = require_b12x()
@@ -412,11 +413,21 @@ def test_expanded_scales_match_native_under_poisoned_replay(
             )
             owners.append((buffers, binding))
             outputs.append(output)
+        if compiled_packed_expansion:
+            assert owners[1][1].csf_route_pack
         session.freeze()
         for _, binding in owners:
+
+            def run(binding=binding):
+                return moe.run(binding=binding)
+
+            forward = (
+                torch.compile(run, fullgraph=True) if compiled_packed_expansion else run
+            )
+            forward()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                moe.run(binding=binding)
+                forward()
             graphs.append(graph)
         for _ in range(3):
             source.neg_()
@@ -429,6 +440,14 @@ def test_expanded_scales_match_native_under_poisoned_replay(
                 buffer.view(torch.uint8).fill_(0xFF)
             for output in outputs:
                 output.fill_(float("nan"))
+            if compiled_packed_expansion:
+                for _, binding in owners:
+                    for buffer in (
+                        binding.packed_route_indices,
+                        binding.block_expert_ids,
+                        binding.packed_route_count,
+                    ):
+                        buffer.fill_(-42)
             allocated = torch.cuda.memory_stats(device)["allocation.all.allocated"]
             for graph in graphs:
                 graph.replay()
@@ -777,4 +796,34 @@ def test_w4a16_wide_inline_poisoned_graph(monkeypatch):
         ),
         activation_mode="a16",
         packing="mma_packed",
+    )
+
+
+@pytest.mark.parametrize("tokens", [4, 8])
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+def test_compiled_csf_packed_routes_restore_poisoned_scratch(
+    tokens, ids_dtype, monkeypatch
+):
+    test_expanded_scales_match_native_under_poisoned_replay(
+        512,
+        192,
+        tokens,
+        "w31",
+        ids_dtype,
+        monkeypatch,
+        activation_mode="a16",
+        packing="source_native",
+        inactive=True,
+        compiled_packed_expansion=True,
+        execution_override=moe.MoeDecodeConfig(
+            backend="w4a16",
+            route_planner="internal",
+            max_active_clusters=None,
+            dynamic_tile_m=None,
+            w4a16_route_mode="packed",
+            w4a16_block_size_m=16,
+            w4a16_tile_config=(128, 64, 64, 128),
+            w4a16_pipeline_stages=3,
+            csf_inline_scales=False,
+        ),
     )

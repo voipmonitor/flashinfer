@@ -913,6 +913,8 @@ def moe_reference_w4a16_fp4_e8m0_k32(
         x_f32 = x[t].float()
         for k_idx in range(top_k):
             eid = int(topk_ids[t, k_idx].item())
+            if not 0 <= eid < E:
+                continue
             router_w = float(topk_weights[t, k_idx].item())
             alpha_fc1 = (
                 float(w1_alphas[eid].item())

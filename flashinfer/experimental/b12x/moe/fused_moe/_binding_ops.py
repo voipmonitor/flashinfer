@@ -1,11 +1,166 @@
 """Compiler-visible prepared MoE execution over caller-owned storage."""
 
 from copy import copy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 
 from b12x.preparation.types import plan_from_handle, require_prepared
+
+
+@dataclass(frozen=True)
+class _ScaleLayout:
+    shape: tuple
+    stride: tuple
+    dtype: torch.dtype
+    device: torch.device
+
+    @classmethod
+    def of(cls, tensor):
+        return cls(tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device)
+
+    def placeholder(self):
+        return torch.empty_strided(
+            self.shape, self.stride, dtype=self.dtype, device="meta"
+        )
+
+
+@dataclass(frozen=True)
+class _ScaleTemplates:
+    planes: tuple
+    active: _ScaleLayout
+    aliases: tuple
+
+
+def _scale_templates(experts):
+    metadata = getattr(experts, "_csf_scale_templates", None)
+    if metadata is not None:
+        return metadata
+    planes = (experts.w1_blockscale, experts.w2_blockscale)
+    aliases = []
+    if experts.representation is not None:
+        payload = experts.representation.value
+        for names, index, plane in (
+            (("w13_scale", "w13_sfb", "micro_w13_scale"), 0, planes[0]),
+            (("w2_scale", "w2_sfb", "micro_w2_scale"), 1, planes[1]),
+        ):
+            for name in names:
+                tensor = getattr(payload, name, None)
+                if (
+                    isinstance(tensor, torch.Tensor)
+                    and tensor.untyped_storage().data_ptr()
+                    == plane.untyped_storage().data_ptr()
+                ):
+                    offset = (
+                        tensor.storage_offset() * tensor.element_size()
+                        - plane.storage_offset() * plane.element_size()
+                    )
+                    aliases.append((name, index, offset, _ScaleLayout.of(tensor)))
+    return _ScaleTemplates(
+        tuple(_ScaleLayout.of(t) for t in planes),
+        _ScaleLayout.of(experts.nvfp4_csf.active),
+        tuple(aliases),
+    )
+
+
+def release_weight_views(experts):
+    """Evict declaration views borrowing the prepared expert weight destinations."""
+    from . import _impl
+
+    pointers = experts.w1_fp4.data_ptr(), experts.w2_fp4.data_ptr()
+    for key in tuple(_impl._WEIGHT_CACHE):
+        if len(key) >= 4 and (key[0], key[2]) == pointers:
+            _impl._WEIGHT_CACHE.pop(key)
+    key = _impl._LAST_WEIGHTS[0]
+    if key is not None and len(key) >= 4 and (key[0], key[2]) == pointers:
+        _impl._LAST_WEIGHTS = (None, None)
+
+
+def materialize_scale_templates(experts):
+    """Allocate CSF declaration planes when reusable weights enter preparation."""
+    impl = experts._impl
+    metadata = getattr(impl, "_csf_scale_templates", None)
+    if metadata is None or not impl.w1_blockscale.is_meta:
+        return
+    planes = [
+        torch.empty_strided(
+            layout.shape, layout.stride, dtype=layout.dtype, device=layout.device
+        )
+        for layout in metadata.planes
+    ]
+    layout = metadata.active
+    active = torch.empty_strided(
+        layout.shape, layout.stride, dtype=layout.dtype, device=layout.device
+    ).zero_()
+    rebound = _scale_view(
+        impl,
+        [*(plane.view(torch.uint8) for plane in planes), active],
+        replace(impl.nvfp4_csf, active=active),
+    )
+    for name in ("w1_blockscale", "w2_blockscale", "representation", "nvfp4_csf"):
+        object.__setattr__(impl, name, getattr(rebound, name))
+
+
+def release_scale_templates(experts, plan):
+    """Release expanded CSF destinations after every prepared binding has finalized.
+
+    Functional invocations must supply scale planes before binding. Compressed
+    records, weights, programs, and immutable scale layouts remain owned.
+    """
+
+    def release_impl(impl):
+        release_weight_views(impl)
+        if impl.nvfp4_csf is None or impl.w1_blockscale.is_meta:
+            return
+        metadata = _scale_templates(impl)
+        object.__setattr__(impl, "_csf_scale_templates", metadata)
+        planes = tuple(layout.placeholder() for layout in metadata.planes)
+        object.__setattr__(impl, "w1_blockscale", planes[0])
+        object.__setattr__(impl, "w2_blockscale", planes[1])
+        if impl.representation is not None:
+            payload = copy(impl.representation.value)
+            for name, index, offset, layout in metadata.aliases:
+                object.__setattr__(
+                    payload,
+                    name,
+                    planes[index]
+                    .view(layout.dtype)
+                    .as_strided(
+                        layout.shape, layout.stride, offset // layout.dtype.itemsize
+                    ),
+                )
+            object.__setattr__(
+                impl, "representation", replace(impl.representation, value=payload)
+            )
+        object.__setattr__(
+            impl,
+            "nvfp4_csf",
+            replace(impl.nvfp4_csf, active=metadata.active.placeholder()),
+        )
+
+    def release_state(state):
+        from ._preparation import _FusedMoeCapacityState, _FusedMoeState
+        from ._token_outer import State
+
+        if isinstance(state, _FusedMoeCapacityState):
+            for variant in state.variants.values():
+                release_state(variant)
+        elif isinstance(state, _FusedMoeState):
+            release_impl(state.experts._impl)
+            if state.execution_experts is not None:
+                release_impl(state.execution_experts)
+        elif isinstance(state, State):
+            release_impl(state.experts._impl)
+            if state.scale_decoder is not None:
+                layout = _ScaleLayout.of(state.scale_decoder.active)
+                object.__setattr__(
+                    state,
+                    "scale_decoder",
+                    replace(state.scale_decoder, active=layout.placeholder()),
+                )
+
+    release_impl(experts._impl)
+    release_state(require_prepared(plan, "moe.decode"))
 
 
 def scale_buffers(binding):
@@ -31,17 +186,16 @@ def scale_buffers(binding):
 
 
 def _scale_view(experts, buffers, decoder=None):
+    metadata = _scale_templates(experts)
     buffers = [
-        buffers[0].view(experts.w1_blockscale.dtype),
-        buffers[1].view(experts.w2_blockscale.dtype),
+        buffers[0].view(metadata.planes[0].dtype),
+        buffers[1].view(metadata.planes[1].dtype),
         buffers[2],
     ]
-    for source, target in zip(
-        (experts.w1_blockscale, experts.w2_blockscale), buffers[:2]
-    ):
+    for source, target in zip(metadata.planes, buffers[:2]):
         if (
             target.shape != source.shape
-            or target.stride() != source.stride()
+            or target.stride() != source.stride
             or target.dtype != source.dtype
             or target.device != source.device
         ):
@@ -54,26 +208,13 @@ def _scale_view(experts, buffers, decoder=None):
     if representation is not None:
         payload = representation.value
         updates = {}
-        for names, before, after in zip(
-            (("w13_scale", "w13_sfb"), ("w2_scale", "w2_sfb")),
-            (experts.w1_blockscale, experts.w2_blockscale),
-            buffers[:2],
-        ):
-            for name in names:
-                value = getattr(payload, name, None)
-                if (
-                    isinstance(value, torch.Tensor)
-                    and value.untyped_storage().data_ptr()
-                    == before.untyped_storage().data_ptr()
-                ):
-                    offset = (
-                        value.storage_offset() * value.element_size()
-                        - before.storage_offset() * before.element_size()
-                        + after.storage_offset() * after.element_size()
-                    ) // value.element_size()
-                    updates[name] = after.view(value.dtype).as_strided(
-                        value.shape, value.stride(), offset
-                    )
+        for name, index, offset, layout in metadata.aliases:
+            after = buffers[index].view(layout.dtype)
+            updates[name] = after.as_strided(
+                layout.shape,
+                layout.stride,
+                after.storage_offset() + offset // layout.dtype.itemsize,
+            )
         if updates:
             object.__setattr__(
                 result,
@@ -95,10 +236,13 @@ def _bind_scale_buffers(binding, buffers):
         if hasattr(binding, "experts")
         else binding.state.scale_decoder
     )
-    active = decoder.active
+    experts = (
+        binding.experts if hasattr(binding, "experts") else binding.state.experts._impl
+    )
+    active = _scale_templates(experts).active
     if (
         buffers[2].shape != active.shape
-        or buffers[2].stride() != active.stride()
+        or buffers[2].stride() != active.stride
         or buffers[2].dtype != active.dtype
         or buffers[2].device != active.device
     ):
@@ -154,6 +298,8 @@ def prepared_moe_out(
         output_expert_map=output_expert_map,
         scales_expanded=scales_expanded,
         a4_prefill=a4_prefill,
+        _scale_buffers=scale_storage or scale_inputs,
+        _weight_views_cache={},
     )
     state.run(_bind_scale_buffers(binding, scale_storage or scale_inputs))
 
@@ -222,6 +368,8 @@ def prepared_routed_moe_out(
         image_mask=image_mask,
         num_valid_tokens=num_valid_tokens,
         scales_expanded=scales_expanded,
+        _scale_buffers=scale_storage or scale_inputs,
+        _weight_views_cache={},
     )
     state.run(_bind_scale_buffers(binding, scale_storage or scale_inputs))
 

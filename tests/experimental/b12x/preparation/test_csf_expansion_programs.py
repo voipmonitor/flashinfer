@@ -29,7 +29,7 @@ def test_scale_factory_declares_and_retains_all_route_abis(bits, destination):
         "b12x._lib.quant.csf_blocks_tuning:compile_expansion", query, config, ordinal
     )
     description = describe_compilation(job)
-    assert len(description.programs) == 6
+    assert len(description.programs) == 10
     compile_in_process((description,))
     assert all(compiled_program_available(key) for key in description.programs)
     programs = compile_expansion(query, config, ordinal)

@@ -623,3 +623,80 @@ def test_gate_mean_partitions_span_one_warp_to_the_covering_block():
     space = TUNING.parameter_space(query, IDENTITY)
     blocks = {assignment["pointwise_block"] for assignment in space.configurations()}
     assert blocks == {32, 64, 128, 256, 512, 1024, 2048, 4096}
+
+
+@pytest.mark.parametrize("rows", [1, 8, 32, 33, 64])
+@pytest.mark.parametrize("effort", ["default", "audit"])
+def test_q8_n32_choices_preserve_decode_capacity_boundary(rows, effort):
+    from b12x.gemm.blockscaled._tuning import (
+        TUNING,
+        BlockscaledConfig,
+        BlockscaledQuery,
+    )
+
+    query = BlockscaledQuery(
+        recipe="q8_0",
+        num_tokens=rows,
+        in_features=4096,
+        padded_in_features=4096,
+        out_features=136,
+        autotune_effort=effort,
+    )
+    choices = [config for _, config in TUNING.choices(query, IDENTITY)]
+    for config in choices:
+        TUNING.validate_config(query, config, IDENTITY)
+        assert config.mma_warps is None
+    narrow = [config for config in choices if config.tile_n == 32]
+    if rows <= 32:
+        assert {
+            (config.tile_m, config.tile_k, config.split_k) for config in narrow
+        } == {
+            (16, tile_k, split)
+            for tile_k in (64, 128, 256)
+            for split in (1, 2, 4, 8, 16)
+        }
+    else:
+        assert not narrow
+    for tile_n in (64, 128):
+        assert any(
+            config.tile_m == 16 and config.tile_n == tile_n for config in choices
+        )
+    for tile_m in (None, 16):
+        config = BlockscaledConfig(
+            mode="a16",
+            tile_m=tile_m,
+            tile_n=32,
+            tile_k=256,
+            split_k=8,
+        )
+        if rows <= 32:
+            TUNING.validate_config(query, config, IDENTITY)
+        else:
+            with pytest.raises(ValueError, match="at most 32 rows"):
+                TUNING.validate_config(query, config, IDENTITY)
+    for tile_m in (1, 2, 4, 8, 32, 64):
+        with pytest.raises(ValueError):
+            TUNING.validate_config(
+                query,
+                BlockscaledConfig(
+                    mode="a16",
+                    tile_m=tile_m,
+                    tile_n=32,
+                    tile_k=256,
+                    split_k=1,
+                ),
+                IDENTITY,
+            )
+    for recipe in ("iq2_xs", "iq2_xxs", "nvfp4"):
+        with pytest.raises(ValueError, match="launch geometry"):
+            TUNING.validate_config(
+                replace(query, recipe=recipe),
+                BlockscaledConfig(
+                    mode="a16",
+                    tile_m=16,
+                    tile_n=32,
+                    tile_k=256,
+                    split_k=1,
+                ),
+                IDENTITY,
+            )

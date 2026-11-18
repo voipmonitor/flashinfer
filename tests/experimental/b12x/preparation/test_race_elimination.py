@@ -1,4 +1,4 @@
-"""Rounds after the first re-time only the candidates near the leader.
+"""Screening and bounded confirmation preserve comparable winning scores.
 
 The race protocol lives in ``b12x.preparation._measurement``; these cases drive
 it with timers that report fixed latencies, so the survivor set, the round
@@ -91,7 +91,7 @@ def test_scenario_score_minimizes_total_time_despite_geometric_speedup(host_timi
     assert measurement.latencies_us == (550.0, 590.0)
 
 
-@pytest.mark.parametrize("rounds", (7, 15))
+@pytest.mark.parametrize("rounds", (4, 5, 6, 7, 15))
 def test_trailing_candidates_stop_after_one_round_and_keep_their_median(
     host_timing, rounds
 ):
@@ -104,6 +104,7 @@ def test_trailing_candidates_stop_after_one_round_and_keep_their_median(
     assert measurement.latencies_us == (10.0, 10.9, 12.0, 40.0)
     assert prepared.completed_rounds == prepared.planned_rounds == SURVIVOR_ROUNDS
     assert prepared.active_count == 2
+    assert measurement.scoring_start_round == 0
 
 
 def test_a_candidate_at_the_margin_is_measured_to_the_last_round(host_timing):
@@ -127,6 +128,107 @@ def test_an_improving_leader_removes_a_candidate_after_a_later_round(host_timing
     assert prepared.active_count == 1
 
 
+def test_stale_first_round_winner_is_remeasured_before_selection(host_timing):
+    simt = _Timer(29.2256, 31.3344)
+    tensor_core = _Timer(26.0736, 32.1888, 29.4432, 26.7712)
+
+    measurement = _measure(_race((simt, tensor_core)), rounds=7)
+
+    scores = dict(zip(("simt", "tc"), measurement.latencies_us, strict=True))
+    assert min(scores, key=scores.get) == "tc"
+    assert _rounds(simt) > 1
+    assert _rounds(tensor_core) > 3
+
+
+@pytest.mark.parametrize("rounds", (4, 5, 6, 15))
+def test_confirmation_uses_only_fresh_scores_within_total_round_budget(
+    host_timing, rounds
+):
+    stale = _Timer(29.2256, 31.3344)
+    leader = _Timer(26.0736, 32.1888, 29.4432, 26.7712)
+    prepared = _race((stale, leader))
+
+    measurement = _measure(prepared, rounds=rounds)
+
+    confirmation_rounds = min(3, rounds - 3)
+    assert measurement.latencies_us == (31.3344, 26.7712)
+    assert measurement.scoring_start_round == 3
+    assert [_rounds(stale), _rounds(leader)] == [
+        1 + confirmation_rounds,
+        3 + confirmation_rounds,
+    ]
+    assert (
+        prepared.completed_rounds == prepared.planned_rounds == 3 + confirmation_rounds
+    )
+    assert prepared.active_count == 2
+
+
+@pytest.mark.parametrize("champion", (False, True))
+@pytest.mark.parametrize("far_latency,winner", ((7.0, 2), (20.0, 1)))
+def test_confirmation_includes_every_candidate_when_a_tied_minimum_is_stale(
+    host_timing, champion, far_latency, winner
+):
+    measured = _Timer(10.0, 12.0, 12.0, 14.0)
+    stale = _Timer(12.0, 9.0)
+    far = _Timer(40.0, far_latency)
+    prepared = _race((measured, stale, far))
+
+    result = _measure(prepared, rounds=7, champion=champion)
+
+    assert result.latencies_us == (14.0, 9.0, far_latency)
+    assert min(range(3), key=result.latencies_us.__getitem__) == winner
+    assert result.scoring_start_round == 3
+    assert [_rounds(timer) for timer in prepared.timers] == [6, 4, 4]
+
+
+def test_confirmation_preserves_observer_rounds_progress_and_overlap_counts(
+    host_timing,
+):
+    timers = (_Timer(12.0, 15.0), _Timer(10.0, 14.0, 14.0, 8.0))
+    prepared = PreparedRace(timers, None, 8)
+    observed, progress = [], []
+
+    def observe(index, turn, repetition, samples):
+        observed.append((index, turn, repetition, samples))
+        progress.append((prepared.completed_rounds, prepared.planned_rounds))
+
+    result = _measure(
+        prepared,
+        rounds=7,
+        compilation_active=lambda: True,
+        sample_observer=observe,
+    )
+
+    assert result.latencies_us == (15.0, 8.0)
+    assert result.overlapped_samples == 8 * sum(timer.replays for timer in timers)
+    assert {turn for _, turn, _, _ in observed} == set(range(6))
+    for turn in range(result.scoring_start_round, prepared.completed_rounds):
+        assert {
+            index for index, sampled_turn, _, _ in observed if sampled_turn == turn
+        } == {0, 1}
+    assert progress == sorted(progress)
+    assert prepared.completed_rounds == prepared.planned_rounds == 6
+
+
+def test_confirmation_recalibrates_replay_counts(host_timing, monkeypatch):
+    monkeypatch.setattr(_measurement, "ROUND_BUDGET_US", 16)
+    timers = (_Timer(12.0, 12.0, 4.0), _Timer(10.0, 10.0, 14.0, 14.0, 14.0, 14.0, 8.0))
+    observed = []
+    result = _measure(
+        _race(timers),
+        rounds=7,
+        sample_observer=lambda index, turn, repetition, samples: observed.append(
+            (index, turn)
+        ),
+    )
+
+    assert result.latencies_us == (4.0, 8.0)
+    assert result.scoring_start_round == 3
+    for turn in range(3, 6):
+        assert observed.count((0, turn)) == 4
+        assert observed.count((1, turn)) == 2
+
+
 def test_the_carried_champion_is_re_timed_against_every_batch(host_timing):
     champion, leader = _Timer(40.0), _Timer(10.0)
     prepared = _race((champion, leader))
@@ -148,14 +250,17 @@ def test_a_first_timer_that_is_not_a_champion_is_eliminated_like_any_other(host_
     assert prepared.active_count == 1
 
 
-def test_a_lower_session_round_count_still_bounds_the_survivors(host_timing):
-    leader, near = _Timer(10.0), _Timer(10.5)
-    prepared = _race((leader, near))
+@pytest.mark.parametrize("rounds", (1, 2, 3))
+def test_low_round_budgets_measure_all_candidates_equally(host_timing, rounds):
+    leader, far = _Timer(10.0), _Timer(40.0)
+    prepared = _race((leader, far))
 
-    _measure(prepared, rounds=2)
+    result = _measure(prepared, rounds=rounds)
 
-    assert prepared.planned_rounds == 2
-    assert [_rounds(timer) for timer in (leader, near)] == [2, 2]
+    assert prepared.completed_rounds == prepared.planned_rounds == rounds
+    assert [_rounds(timer) for timer in (leader, far)] == [rounds, rounds]
+    assert result.latencies_us == (10.0, 40.0)
+    assert result.scoring_start_round == 0
 
 
 def test_an_exhaustive_race_re_times_every_candidate_every_round(host_timing):
@@ -290,6 +395,36 @@ def test_cancellation_yields_with_completed_gpu_work(queued_timing):
     assert not queue
     assert all(timer.completed == timer.replays == 1 for timer in timers)
     assert prepared.completed_rounds == 0
+
+
+def test_cancellation_during_confirmation_drains_replayed_work(
+    queued_timing, monkeypatch
+):
+    queue, order, _ = queued_timing
+    monkeypatch.setattr(_measurement, "ROUND_BUDGET_US", 0)
+
+    class ChangingTimer(_QueuedTimer):
+        def samples(self):
+            self.latency_us = self.sequence[
+                min(self.replays - 1, len(self.sequence) - 1)
+            ]
+            return super().samples()
+
+    stale = ChangingTimer("stale", 12.0, queue, order)
+    stale.sequence = (12.0, 15.0)
+    leader = ChangingTimer("leader", 10.0, queue, order)
+    leader.sequence = (10.0, 14.0, 14.0, 8.0)
+    prepared = PreparedRace((stale, leader), None, 8)
+    steps = measure_race_steps(prepared, device_ordinal=0, rounds=7, eliminate=True)
+
+    while prepared.planned_rounds < 6:
+        next(steps)
+    steps.close()
+
+    assert prepared.completed_rounds == 3
+    assert not queue
+    assert all(timer.completed == timer.replays for timer in prepared.timers)
+    assert stale.replays == 2 and leader.replays == 4
 
 
 @pytest.mark.parametrize("latency", [0.0, -1.0, float("nan"), float("inf")])

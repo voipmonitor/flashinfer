@@ -137,6 +137,7 @@ class RaceLedger:
                 "candidates": [trial.index for trial in trials],
                 "carried_champion": None if champion is None else champion.index,
                 "latencies_us": [float(value) for value in measurement.latencies_us],
+                "scoring_start_round": measurement.scoring_start_round,
                 "winner": winner,
                 "overlapped_samples": measurement.overlapped_samples,
                 "seconds": seconds,

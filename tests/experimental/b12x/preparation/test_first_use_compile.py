@@ -229,7 +229,8 @@ def test_evict_planning_artifacts_drops_unresolved_deferred_programs_only(monkey
     jit = type(
         "Jit", (), {"device_caches": {0: (kernel_cache, key_cache, None, None)}}
     )()
-    monkeypatch.setattr(compile_plan, "_NATIVE_JITS", {jit})
+    monkeypatch.setattr(compile_plan, "_NATIVE_JITS", set())
+    monkeypatch.setattr(compile_plan, "_PLANNED_TRITON_JITS", {jit}, raising=False)
 
     removed = compile_plan.evict_planning_artifacts([planned.__b12x_programs__[0]])
 

@@ -139,6 +139,9 @@ def compile_varlen_attention(query_payload, invocation, config_payload, ordinal)
             num_q_tiles=int(invocation["num_q_tiles"]),
             total_blocks_cap=int(invocation["total_blocks_cap"]),
             per_segment_tiles=bool(per_segment_tiles),
+            q_stride=tuple(invocation["q_stride"]),
+            k_stride=tuple(invocation["k_stride"]),
+            v_stride=tuple(invocation["v_stride"]),
         )
 
 
@@ -432,6 +435,7 @@ def _varlen_invocation(
             v,
             cu_seqlens_q,
             cu_seqlens_k,
+            allow_row_padding=math_mode == "flash",
         )
     )
     sink = contiguous._validate_attention_sink_bias_metadata(
@@ -464,6 +468,9 @@ def _varlen_invocation(
         block_sparse=bool(block_sparse),
         per_segment_tiles=bool(per_segment_tiles),
         math_mode=math_mode,
+        q_row_stride=q.stride(0),
+        k_row_stride=k.stride(0),
+        v_row_stride=v.stride(0),
     )
     TUNING.validate_query(query, None)
     if math_mode == "eager_bf16" and (left != -1 or right != -1 or sink is not None):
@@ -473,6 +480,9 @@ def _varlen_invocation(
             "q_shape": q_shape,
             "k_shape": k_shape,
             "v_shape": v_shape,
+            "q_stride": tuple(q.stride()),
+            "k_stride": tuple(k.stride()),
+            "v_stride": tuple(v.stride()),
             "cu_seqlens_q_shape": cu_q_shape,
             "cu_seqlens_k_shape": cu_k_shape,
             "dtype": _dtype_name(dtype),
@@ -681,15 +691,16 @@ def plan(
     across replay. Binding validates storage metadata without reading GPU values.
 
     Bindings may use fewer packed rows or segments than the planning tensors.
-    Head dimensions, dtype, and contiguous layouts remain fixed. GPU cumulative
-    lengths must describe the bound tensors; supplied maximum lengths must not
+    Head dimensions, dtype, and input strides remain fixed. Packed inputs may
+    have row padding with contiguous heads and 16-byte-aligned row strides.
+    GPU cumulative lengths must describe the bound tensors; supplied maximum lengths must not
     exceed the prepared limits. Live shapes never select or compile a program.
 
     ``math_mode="eager_bf16"`` rounds QK and scaled scores to BF16, performs
     FP32 softmax, and rounds normalized probabilities to BF16 before PV. Two
     tiled passes retain linear-size row statistics without a score matrix.
-    This mode requires BF16, equal Q/KV heads, and dense noncausal attention
-    without local windows or attention sinks. The default ``"flash"`` retains
+    This mode requires contiguous BF16 inputs, equal Q/KV heads, and dense
+    noncausal attention without local windows or attention sinks. The default ``"flash"`` retains
     FP32 scores and rounds unnormalized tile probabilities before PV.
     """
     query, invocation = _varlen_invocation(
@@ -774,6 +785,9 @@ def plan(
             num_q_tiles=int(num_q_tiles),
             total_blocks_cap=int(total_blocks_cap),
             per_segment_tiles=bool(per_segment_tiles),
+            q_stride=tuple(invocation["q_stride"]),
+            k_stride=tuple(invocation["k_stride"]),
+            v_stride=tuple(invocation["v_stride"]),
         )
         return _VarlenState(
             concrete,

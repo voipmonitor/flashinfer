@@ -1708,3 +1708,40 @@ def test_raster_policy_participates_in_dense_compile_key():
     assert _compile_key_differences(
         _bk64_launch(policy=policy), _bk64_launch(policy=preserving)
     ) == [(policy, preserving)]
+
+
+@pytest.mark.parametrize("tile_n,warps", [(32, 4), (64, 8), (128, 8)])
+def test_q8_n32_compute_geometry_matches_atom(tile_n, warps):
+    kernel = dense_kernel.DenseGemmKernel(
+        sf_vec_size=32,
+        mma_tiler_mn=(16, tile_n),
+        cluster_shape_mn=(1, 1),
+        mma_k=16,
+        tile_k=256,
+        weight_only="q8_0",
+    )
+    assert kernel.atom_shape == (1, warps, 1)
+    assert kernel.num_mma_warps == warps
+    assert kernel.tma_load_warp_id == warps
+    assert kernel.threads_per_cta == (warps + 1) * 32
+    assert 8 * kernel.atom_shape[1] <= tile_n
+
+
+@pytest.mark.parametrize("recipe", ["q8_0", "mxfp8", "iq2_xs", "iq2_xxs", "nvfp4"])
+def test_q8_n32_dense_support_matches_packed_codec(recipe):
+    supported = dense_kernel.DenseGemmKernel.can_implement(
+        cutlass.BFloat16,
+        cutlass.Uint8,
+        16 if recipe == "nvfp4" else 32,
+        cutlass.Float32,
+        (16, 32),
+        (1, 1),
+        136,
+        4096,
+        1,
+        "k",
+        "k",
+        "n",
+        weight_only=recipe,
+    )
+    assert supported == (recipe in ("q8_0", "mxfp8"))

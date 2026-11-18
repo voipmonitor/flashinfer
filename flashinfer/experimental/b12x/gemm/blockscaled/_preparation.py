@@ -742,11 +742,14 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
         if query.recipe in IQ2_CODECS:
             from b12x._lib.quant.iq2_xs import _DEVICE_TABLES
 
-            resident = _DEVICE_TABLES.get(("cuda", device.ordinal, False, query.recipe))
+            selectors = config.tile_n != 4
+            resident = _DEVICE_TABLES.get(
+                ("cuda", device.ordinal, selectors, query.recipe)
+            )
             persistent.append(
                 PersistentMemory(
-                    ("iq2.execution_lut", device.ordinal, query.recipe),
-                    block_codec(query.recipe).lut_bytes(),
+                    ("iq2.execution_lut", device.ordinal, query.recipe, selectors),
+                    block_codec(query.recipe).lut_bytes(selectors=selectors),
                     0
                     if resident is None
                     else resident.numel() * resident.element_size(),
@@ -840,7 +843,10 @@ def _plan_bf16(query: BlockscaledQuery, *, invocation=FrozenMapping(), override=
             from b12x._lib.quant.iq2_xs import iq2_xs_execution_lut
 
             lut = iq2_xs_execution_lut(
-                resolved_device, prepare=True, codec=query.recipe
+                resolved_device,
+                prepare=True,
+                selectors=config.tile_n != 4,
+                codec=query.recipe,
             )
         return _PackedExecutionState(
             query,
@@ -1059,6 +1065,8 @@ class _FixedExecutionState:
         sf_vec_size,
         block_fp8,
         stream,
+        out=None,
+        workspace=None,
     ):
         from ._a16 import _stream_context, scale_storage
         from b12x._lib.intrinsics.reference import (
@@ -1079,9 +1087,22 @@ class _FixedExecutionState:
         if (ab_dtype, sf_dtype, sf_vec_size, bool(block_fp8)) != expected:
             raise ValueError("serialized operand recipe differs from preparation")
         m = lhs_values.shape[0]
+        if out is not None and (
+            out.shape != (m, q.out_features)
+            or out.dtype != getattr(torch, c_dtype)
+            or out.device != self.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "serialized output must match the prepared contiguous shape, dtype, and device"
+            )
         if m == 0:
-            return lhs_values.new_empty(
-                (0, q.out_features), dtype=getattr(torch, c_dtype)
+            return (
+                out
+                if out is not None
+                else lhs_values.new_empty(
+                    (0, q.out_features), dtype=getattr(torch, c_dtype)
+                )
             )
         if self.gemv is not None:
             if alpha is not None:
@@ -1113,9 +1134,12 @@ class _FixedExecutionState:
                         "block-FP8 scale geometry differs from preparation"
                     )
                 if self.gemv is not None:
-                    out = torch.empty(
-                        (m, q.out_features), dtype=torch.bfloat16, device=self.device
-                    )
+                    if out is None:
+                        out = torch.empty(
+                            (m, q.out_features),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
                     self.gemv(
                         lhs_values,
                         sfa,
@@ -1150,6 +1174,8 @@ class _FixedExecutionState:
                 (rhs_values.view(q.out_features, rhs_values.shape[1], 1), sfb),
                 alpha=alpha,
                 stream=stream,
+                out=None if out is None else out.view(m, q.out_features, 1),
+                split_k_workspace=workspace,
             )[:, :, 0]
 
     def run_mxfp8(

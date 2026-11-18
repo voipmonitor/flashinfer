@@ -1274,12 +1274,49 @@ class PagedMqaPlan:
 
     @property
     def launch_count(self):
-        return len(self._submissions)
+        return len(self._programs)
 
-    def run(self):
-        """Submit the logits program (one launch) on the current PyTorch stream."""
+    def functional(self):
+        """Release bound operands and accept explicit storage on each launch."""
+        self._submissions = None
+        self.output = self.logical_output = self.schedule_meta = self._retained = None
+        return self
+
+    def run(
+        self,
+        q=None,
+        kv_cache=None,
+        weights=None,
+        context_lens=None,
+        block_table=None,
+        *,
+        output=None,
+    ):
+        """Submit the prepared logits program with bound or explicit operands."""
         import tvm_ffi
 
+        if self._submissions is None:
+            if any(
+                t is None
+                for t in (q, kv_cache, weights, context_lens, block_table, output)
+            ):
+                raise ValueError(
+                    "functional paged MQA requires every operand and output"
+                )
+            values = logits_bindings(
+                q,
+                kv_cache,
+                weights,
+                context_lens,
+                block_table,
+                output,
+                num_sms=self.num_sms,
+            )
+            with tvm_ffi.use_torch_stream():
+                for module, record in self._programs:
+                    arguments = tuple(values[key] for kind, key in record["arg_plan"])
+                    module[record["ffi_entry"]](*arguments)
+            return output[:, : self.max_context_len]
         with tvm_ffi.use_torch_stream():
             for entry, args in self._submissions:
                 entry(*args)

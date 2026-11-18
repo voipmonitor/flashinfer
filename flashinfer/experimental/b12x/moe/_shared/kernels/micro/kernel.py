@@ -39,7 +39,9 @@ from b12x.moe._shared.kernels.activations import is_gated_moe_activation
 from b12x._lib.intrinsics.sync import ld_global_acquire_i32
 from b12x._lib.intrinsics.memory import ld_global_cg_f32
 from b12x._lib.intrinsics.memory import ld_global_nc_u32
+from b12x._lib.intrinsics.memory import ld_global_nc_v2_u32
 from b12x._lib.intrinsics.memory import ld_global_nc_v4_u32
+from b12x._lib.intrinsics.memory import ld_shared_v4_u32
 from b12x._lib.utils.pointers import make_ptr
 from b12x._lib.intrinsics.quantization import mx_scale_from_amax32
 from b12x.moe._shared.kernels.activations import normalize_moe_activation
@@ -121,8 +123,10 @@ class MoEMicroKernelBackend:
         trellis_intermediate_hadamard: bool = False,
     ):
         activation = normalize_moe_activation(activation)
-        if int(compile_time_phase) not in {0, 1, 2}:
+        if int(compile_time_phase) not in {0, 1, 2, 3}:
             raise ValueError(f"unsupported direct micro phase {compile_time_phase!r}")
+        if int(compile_time_phase) == 3 and not w4a16_mode:
+            raise ValueError("private FC2 execution requires W4A16 intermediates")
         if scale_format not in {"e4m3_k16", "e8m0_k32"}:
             raise ValueError(f"unsupported micro scale_format {scale_format!r}")
         if w4a16_mode and a8_mx_mode:
@@ -198,6 +202,7 @@ class MoEMicroKernelBackend:
         self.m1_fc2_onepass = False
         self.m1_fc2_rows_per_cta = _K_PER_CTA * 2
         self.launch_block_dim = _BLOCK_DIM
+        self.fc1_two_ctas = False
         self.grid_x = 0
 
     @property
@@ -231,6 +236,7 @@ class MoEMicroKernelBackend:
             self.m1_fc2_onepass,
             self.m1_fc2_rows_per_cta,
             self.launch_block_dim,
+            self.fc1_two_ctas,
         )
 
     @cute.jit
@@ -398,7 +404,13 @@ class MoEMicroKernelBackend:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Float32:
-        return _block_dot_hfma2_f32acc(u_a, u_b, smem_xh, xh_base)
+        if cutlass.const_expr(self.fc1_two_ctas):
+            addr = Int32(smem_xh.iterator.toint()) + xh_base * Int32(4)
+            xh0, xh1, xh2, xh3 = ld_shared_v4_u32(addr)
+            xh4, xh5, xh6, xh7 = ld_shared_v4_u32(addr + Int32(16))
+            return fp4_dot8_sum_f32acc(u_a, u_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7)
+        else:
+            return _block_dot_hfma2_f32acc(u_a, u_b, smem_xh, xh_base)
 
     @cute.jit
     def _block_dot_hfma2_pair_for_math(
@@ -410,9 +422,17 @@ class MoEMicroKernelBackend:
         smem_xh: cute.Tensor,
         xh_base: Int32,
     ) -> Tuple[Float32, Float32]:
-        return _block_dot_hfma2_pair_f32acc(
-            up_a, up_b, gate_a, gate_b, smem_xh, xh_base
-        )
+        if cutlass.const_expr(self.fc1_two_ctas):
+            addr = Int32(smem_xh.iterator.toint()) + xh_base * Int32(4)
+            xh0, xh1, xh2, xh3 = ld_shared_v4_u32(addr)
+            xh4, xh5, xh6, xh7 = ld_shared_v4_u32(addr + Int32(16))
+            return self._block_dot_hfma2_pair_regs_for_math(
+                up_a, up_b, gate_a, gate_b, xh0, xh1, xh2, xh3, xh4, xh5, xh6, xh7
+            )
+        else:
+            return _block_dot_hfma2_pair_f32acc(
+                up_a, up_b, gate_a, gate_b, smem_xh, xh_base
+            )
 
     @cute.jit
     def _block_dot_hfma2_pair_regs_for_math(
@@ -524,6 +544,15 @@ class MoEMicroKernelBackend:
             m=m, k=k, n=n, num_topk=num_topk, weight_E=weight_E, is_gated=self.is_gated
         )
         num_fc1_chunks = _fc1_chunks_for_m(m, n)
+        self.fc1_two_ctas = bool(
+            self.compile_time_phase == 1
+            and self.w4a16_mode
+            and self.scale_format_e8m0_k32
+            and m > 1
+            and n <= 256
+            and cfg.k_segments_aligned
+            and cfg.k_segments not in (2, 6, 8, 12)
+        )
         if self.w4a16_mode and m == 1 and n <= 2048:
             # The 4-output-rows/warp retile only helps the k_segments==8 aligned
             # gated path (its activation reg-hoist + dual-dot assume 4 rows).
@@ -593,18 +622,23 @@ class MoEMicroKernelBackend:
             ):
                 a8_chunks -= 1
             num_fc1_chunks = a8_chunks
+        if self.fc1_two_ctas:
+            num_fc1_chunks = n // _BLOCK_SIZE
         cfg = _remake_shape_config_fc1(cfg, num_fc1_chunks)
 
         fc1_tasks = m * cfg.num_topk * cfg.fc1_chunks
         w4a16_rowpair_fc2 = bool(self.w4a16_mode and m > 1 and cfg.fc2_n_chunks == 1)
-        m1_half_cta_fc2 = bool(self.compile_time_phase == 2 and m == 1)
-        m1_fc2_rows = _K_PER_CTA if m1_half_cta_fc2 else _K_PER_CTA * 2
+        half_cta_fc2 = bool(
+            (self.compile_time_phase == 2 and m == 1)
+            or (self.compile_time_phase == 3 and cfg.fc2_n_chunks == 1)
+        )
+        m1_fc2_rows = _K_PER_CTA if half_cta_fc2 else _K_PER_CTA * 2
         if self.weight_layout_trellis256:
             fc2_tasks = (m * cfg.k_dim) // 16
         elif m == 1:
             fc2_tasks = cfg.k_dim // m1_fc2_rows
         elif w4a16_rowpair_fc2:
-            fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 2)
+            fc2_tasks = (m * cfg.k_dim) // m1_fc2_rows
         else:
             fc2_tasks = (m * cfg.k_dim) // (_K_PER_CTA * 4)
         if max_active_ctas is None:
@@ -628,7 +662,7 @@ class MoEMicroKernelBackend:
         if self.compile_time_phase == 1:
             # A standalone FC1 phase has no cooperative-grid requirement.
             grid_x = max(1, fc1_tasks)
-        elif self.compile_time_phase == 2:
+        elif self.compile_time_phase in (2, 3):
             # Likewise FC2 can expose every output-row task directly once
             # FC1 has completed in a prior launch.
             grid_x = max(1, fc2_tasks)
@@ -648,7 +682,7 @@ class MoEMicroKernelBackend:
         self.m_const = m if m in (1, 9) else 0
         self.m1_fc2_onepass = m1_fc2_onepass
         self.m1_fc2_rows_per_cta = m1_fc2_rows
-        self.launch_block_dim = _K_PER_CTA * 16 if m1_half_cta_fc2 else _BLOCK_DIM
+        self.launch_block_dim = _K_PER_CTA * 16 if half_cta_fc2 else _BLOCK_DIM
         self.grid_x = grid_x
         # Required inter_fp32 element count: the per-token intermediate plus
         # the trellis K-split scratch tail. Callers must zero-initialize; the
@@ -1458,7 +1492,7 @@ class MoEMicroKernelBackend:
         scatter_output: cute.Tensor,
     ):
         cfg = self._cfg
-        rows_per_cta = Int32(_K_PER_CTA * 2)
+        rows_per_cta = Int32(self.launch_block_dim // 16)
         linear_row_base = fc2_task * rows_per_cta
         t = linear_row_base // Int32(cfg.k_dim)
         k_chunk_off = linear_row_base - t * Int32(cfg.k_dim)
@@ -2221,7 +2255,7 @@ class MoEMicroKernelBackend:
         bidx_x, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         gdim_x, _, _ = cute.arch.grid_dim()
-        if cutlass.const_expr(self.compile_time_phase == 2):
+        if cutlass.const_expr(self.compile_time_phase in (2, 3)):
             self._run_fc2(
                 Int32(bidx_x),
                 Int32(gdim_x),
@@ -2251,6 +2285,10 @@ class MoEMicroKernelBackend:
             smem_xh = cute.make_tensor(
                 smem_xh_ptr, cute.make_layout(2 * cfg.smem_xh_size)
             )
+        elif cutlass.const_expr(self.fc1_two_ctas):
+            smem_xh_size = cfg.k_half + 4 * (cfg.k_dim // (_BLOCK_SIZE * 8))
+            smem_xh_ptr = cute.arch.alloc_smem(Uint32, smem_xh_size, alignment=16)
+            smem_xh = cute.make_tensor(smem_xh_ptr, cute.make_layout(smem_xh_size))
         else:
             smem_xh_ptr = cute.arch.alloc_smem(Uint32, cfg.smem_xh_size)
             smem_xh = cute.make_tensor(smem_xh_ptr, cute.make_layout(cfg.smem_xh_size))
@@ -2420,7 +2458,9 @@ class MoEMicroKernelBackend:
                     in_blk = tidx
                     while in_blk < Int32(cfg.k_dim // _BLOCK_SIZE):
                         x_base = t * Int32(cfg.k_dim) + in_blk * Int32(_BLOCK_SIZE)
-                        pad_off = in_blk // Int32(8)
+                        pad_off = (in_blk // Int32(8)) * Int32(
+                            4 if self.fc1_two_ctas else 1
+                        )
                         phys_base = in_blk * Int32(_BLOCK_SIZE // 2) + pad_off
                         if cutlass.const_expr(self.w4a16_mode):
                             for i in cutlass.range_constexpr(_BLOCK_SIZE // 2):
@@ -4765,7 +4805,10 @@ class MoEMicroKernelBackend:
                         partial_up = Float32(0.0)
                         partial_gate = Float32(0.0)
                         if cutlass.const_expr(cfg.k_segments_aligned):
-                            for seg in cutlass.range_constexpr(cfg.k_segments):
+                            for seg in cutlass.range(
+                                cfg.k_segments,
+                                unroll=2 if self.fc1_two_ctas else cfg.k_segments,
+                            ):
                                 seg_byte_off = Int64(seg * (_BLOCK_SIZE // 2))
                                 scale_col = lane * Int32(cfg.k_segments) + Int32(seg)
                                 sf_group_off = Int64(scale_col // Int32(4)) * Int64(512)
@@ -4773,13 +4816,21 @@ class MoEMicroKernelBackend:
                                 xh_base = (
                                     xh_buf_base
                                     + scale_col * Int32(_BLOCK_SIZE // 2)
-                                    + scale_col // Int32(8)
+                                    + (scale_col // Int32(8))
+                                    * Int32(4 if self.fc1_two_ctas else 1)
                                 )
 
-                                gw0 = ld_global_nc_u32(gate_byte_addr + seg_byte_off)
-                                gw1 = ld_global_nc_u32(
-                                    gate_byte_addr + seg_byte_off + Int64(4)
-                                )
+                                if cutlass.const_expr(self.fc1_two_ctas):
+                                    gw0, gw1 = ld_global_nc_v2_u32(
+                                        gate_byte_addr + seg_byte_off
+                                    )
+                                else:
+                                    gw0 = ld_global_nc_u32(
+                                        gate_byte_addr + seg_byte_off
+                                    )
+                                    gw1 = ld_global_nc_u32(
+                                        gate_byte_addr + seg_byte_off + Int64(4)
+                                    )
                                 if cutlass.const_expr(self.scale_format_e8m0_k32):
                                     sf_g = self._ld_e8m0_scale(
                                         w1s_base_addr,
@@ -4809,10 +4860,17 @@ class MoEMicroKernelBackend:
                                     )
 
                                 if cutlass.const_expr(self.is_gated):
-                                    uw0 = ld_global_nc_u32(up_byte_addr + seg_byte_off)
-                                    uw1 = ld_global_nc_u32(
-                                        up_byte_addr + seg_byte_off + Int64(4)
-                                    )
+                                    if cutlass.const_expr(self.fc1_two_ctas):
+                                        uw0, uw1 = ld_global_nc_v2_u32(
+                                            up_byte_addr + seg_byte_off
+                                        )
+                                    else:
+                                        uw0 = ld_global_nc_u32(
+                                            up_byte_addr + seg_byte_off
+                                        )
+                                        uw1 = ld_global_nc_u32(
+                                            up_byte_addr + seg_byte_off + Int64(4)
+                                        )
                                     if cutlass.const_expr(self.scale_format_e8m0_k32):
                                         sf_u = self._ld_e8m0_scale(
                                             w1s_base_addr,
@@ -5051,10 +5109,14 @@ class MoEMicroKernelBackend:
                                     linear_beta = Float32(SITU_DEFAULT_LINEAR_BETA)
                                     activated = (
                                         beta
-                                        * cute.math.tanh(gate_red / beta, fastmath=False)
+                                        * cute.math.tanh(
+                                            gate_red / beta, fastmath=False
+                                        )
                                         * sigmoid
                                         * linear_beta
-                                        * cute.math.tanh(up_red / linear_beta, fastmath=False)
+                                        * cute.math.tanh(
+                                            up_red / linear_beta, fastmath=False
+                                        )
                                     )
                                 else:
                                     activated = sigmoid * gate_red
@@ -5558,7 +5620,9 @@ class MoEMicroKernelBackend:
         # (compiled out under the trellis layout)
         elif cutlass.const_expr(not self.weight_layout_trellis256):
             if cutlass.const_expr(self.w4a16_mode and cfg.fc2_n_chunks == 1):
-                fc2_task_count = (m_val * Int32(cfg.k_dim)) // Int32(_K_PER_CTA * 2)
+                fc2_task_count = (m_val * Int32(cfg.k_dim)) // Int32(
+                    self.launch_block_dim // 16
+                )
             else:
                 fc2_task_count = (m_val * Int32(cfg.k_dim)) // Int32(_K_PER_CTA * 4)
             fc2_task = Int32(bidx_x)
@@ -5730,9 +5794,9 @@ class MoEMicroKernelBackend:
             grid=(grid_x, Int32(1), Int32(1)),
             block=(self.launch_block_dim, 1, 1),
             # The fused and FC1-only bodies use 512-thread CTAs;
-            # the FC2-only m=1 specialization is a 256-thread independent CTA.
-            # One block per SM preserves each variant's register budget.
-            min_blocks_per_mp=1,
+            # public m=1 FC2 and private narrow FC2 use 256-thread CTAs.
+            # Narrow private FC1 trades per-warp output work for two resident CTAs.
+            min_blocks_per_mp=2 if self.fc1_two_ctas else 1,
             # The fused phase crosses a software all-CTA barrier between FC1
             # and FC2.  Require whole-grid admission so auxiliary-stream work
             # cannot leave resident CTAs spinning while peers remain queued.

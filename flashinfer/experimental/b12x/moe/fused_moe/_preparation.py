@@ -198,12 +198,16 @@ def _query(
     routing: RoutingSpec,
     controls: FrozenMapping,
     invocation: FrozenMapping,
+    activation_mode=None,
 ) -> MoeDecodeQuery:
     plan = experts.plan._impl
     quant_modes = tuple(sorted(plan.quant_modes))
     quant_mode = quant_modes[0] if len(quant_modes) == 1 else "multi"
     cutoff = experts.plan.activation.a16_max_tokens
-    if cutoff:
+    if activation_mode is not None:
+        quant_mode = _packed_recipe(experts.plan.source, activation_mode)
+        quant_modes = (quant_mode,)
+    elif cutoff:
         if tokens <= cutoff:
             quant_mode, quant_modes = "w4a16", ("w4a16",)
         else:
@@ -595,6 +599,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                 weight_layout=weight_layout,
             )
         ):
+            split = caps.decode_config.w4a16_direct_schedule == "split"
             launches = tuple(
                 _compile_w4a16_small_m_direct(
                     **native_args,
@@ -602,13 +607,32 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
                     fast_math=caps.w4a16_fast_math,
                     topk_ids_dtype=ids_dtype,
                     device=core.device,
+                    compile_time_phase=1 if split else 0,
                 )
                 for m in range(1, native_tokens + 1)
                 for ids_dtype in (torch.int32, torch.int64)
             )
+            fc2_launches = (
+                tuple(
+                    _compile_w4a16_small_m_direct(
+                        **native_args,
+                        m=m,
+                        fast_math=caps.w4a16_fast_math,
+                        topk_ids_dtype=ids_dtype,
+                        device=core.device,
+                        compile_time_phase=3,
+                    )
+                    for m in range(1, native_tokens + 1)
+                    for ids_dtype in (torch.int32, torch.int64)
+                )
+                if split
+                else ()
+            )
             native_direct = attach_programs(
-                W4A16SmallMDirectCompileResult(int(route_block), launches),
-                *(launch.compiled for launch in launches),
+                W4A16SmallMDirectCompileResult(
+                    int(route_block), launches, fc2_launches
+                ),
+                *(launch.compiled for launch in (*launches, *fc2_launches)),
             )
             # Native micro kernels support K16 tails outside the generic tile grid.
             if scale_format == "e4m3_k16" and core.n % 64:
@@ -650,6 +674,7 @@ def _w4a16_primary_launches(scratch, caps) -> _W4A16PrimaryLaunches:
             force_tile_config=caps.decode_config.w4a16_tile_config,
             csf_inline_scales=caps.decode_config.csf_inline_scales,
             pipeline_stages=caps.decode_config.w4a16_pipeline_stages,
+            fc1_pipeline_stages=caps.decode_config.w4a16_fc1_pipeline_stages,
             skip_empty_m_blocks=caps.w4a16_skip_empty_m_blocks,
             small_m_occupancy=caps.w4a16_small_m_occupancy,
         )
@@ -1009,6 +1034,7 @@ def _program_carriers(
                         plan.num_topk,
                         device=plan.device,
                         topk_ids_dtype=dtype,
+                        swiglu_limit=plan.swiglu_limit,
                     )
                 )
         else:
@@ -1151,11 +1177,27 @@ def compile_nvfp4_csf_programs(payload, ordinal):
     first, second, indexed, bitmap_routes = payload
     with torch.cuda.device(ordinal):
         return tuple(
-            compile_nvfp4_csf_pair(first, second, ids64, use_index)
+            compile_nvfp4_csf_pair(first, second, ids64, use_index, mapped=mapped)
+            for mapped in (False, True)
             for ids64 in (False, True)
             for use_index in ((False, True) if indexed else (False,))
         ) + tuple(
-            compile_csf_active_experts(ids64, first[6] if bitmap_routes else 0)
+            compile_csf_active_experts(
+                ids64, first[6] if bitmap_routes else 0, mapped=mapped
+            )
+            for mapped in (False, True)
+            for ids64 in (False, True)
+        )
+
+
+@program_cache(scope="preparation")
+def compile_csf_packed_routes(first, second, geometry, ordinal):
+    """Declare both route ID widths for fused scale and route preparation."""
+    from b12x._lib.quant.nvfp4_csf import compile_nvfp4_csf_pair
+
+    with torch.cuda.device(ordinal):
+        return tuple(
+            compile_nvfp4_csf_pair(first, second, ids64, packed_routes=geometry)
             for ids64 in (False, True)
         )
 
@@ -1273,6 +1315,8 @@ class _FusedMoeState:
 
     def bind(self, **kwargs):
         experts = kwargs.pop("experts", self.experts)
+        scale_buffers = kwargs.pop("_scale_buffers", ())
+        weight_views_cache = kwargs.pop("_weight_views_cache", None)
         if experts is not self.experts:
             raise ValueError("prepared experts differ from the plan declaration")
         kwargs["a4_prefill"] = self._precision_choice(kwargs.get("a4_prefill"))
@@ -1290,6 +1334,13 @@ class _FusedMoeState:
             raise ValueError("fast_math differs from the prepared numerical contract")
         kwargs["fast_math"] = fast_math
         kwargs["experts"] = self.execution_experts or self.experts._impl
+        if scale_buffers:
+            from ._binding_ops import _scale_view
+
+            impl = kwargs["experts"]
+            kwargs["experts"] = _scale_view(
+                impl, scale_buffers, replace(impl.nvfp4_csf, active=scale_buffers[2])
+            )
         kwargs["unit_scale_contract"] = (
             _quant_mode(self.experts, self.config) == "w4a16"
         )
@@ -1299,6 +1350,7 @@ class _FusedMoeState:
             self.scratch.bind(**kwargs),
             compact_launches=self.compact_launches,
             output_layout=self.scratch.caps.output_layout,
+            weight_views_cache=weight_views_cache,
         )
         if (
             self.experts.plan.activation.a4_prefill is not None
@@ -1308,6 +1360,24 @@ class _FusedMoeState:
             raise ValueError(
                 "A4 prefill has no compatible prepared launch for this binding"
             )
+        decoder = binding.experts.nvfp4_csf
+        if (
+            decoder is not None
+            and decoder.packed_route_geometry is not None
+            and binding.route_pack_launches is not None
+            and binding.route_expert_map is None
+            and not binding.scales_expanded
+            and not self.config.csf_inline_scales
+            and binding.a4_prefill_launches is None
+        ):
+            route_pack = binding.route_pack_launches
+            if decoder.packed_route_geometry == (
+                route_pack.numel_capacity,
+                route_pack.block_size,
+                route_pack.max_packed_routes,
+                route_pack.max_route_blocks,
+            ):
+                binding = replace(binding, csf_route_pack=True)
         return binding
 
     def run(self, binding):
@@ -1434,6 +1504,7 @@ def plan(
     invocation: FrozenMapping = FrozenMapping(),
     override: MoeDecodeConfig | None = None,
     scale_expansion=None,
+    activation_mode=None,
 ):
     """Declare prefill capacity and exact planned variants without GPU work."""
     if not isinstance(experts, PreparedExperts):
@@ -1449,8 +1520,18 @@ def plan(
         and type(invocation["a4_prefill"]) is not bool
     ):
         raise TypeError("a4_prefill must be a boolean or None")
+    if activation_mode is not None:
+        if invocation.get("a4_prefill") is True:
+            raise ValueError(
+                "execution activation_mode cannot be combined with a4_prefill=True"
+            )
+        invocation = FrozenMapping({**invocation.to_dict(), "a4_prefill": False})
     controls = _control_snapshot(experts.plan.activation.a4_prefill)
-    cutoff = min(experts.plan.activation.a16_max_tokens, capacity.max_tokens)
+    cutoff = (
+        min(experts.plan.activation.a16_max_tokens, capacity.max_tokens)
+        if activation_mode is None
+        else 0
+    )
     counts = tuple(
         sorted(
             {
@@ -1500,7 +1581,9 @@ def plan(
 
     def child(tokens):
         expansion = expansions.get(tokens)
-        query = _query(experts, capacity, tokens, routing, controls, invocation)
+        query = _query(
+            experts, capacity, tokens, routing, controls, invocation, activation_mode
+        )
         declaration_invocation = FrozenMapping(
             {
                 **invocation.to_dict(),
@@ -1523,10 +1606,91 @@ def plan(
                 query, config, experts.plan._impl, torch.device("cuda", device.ordinal)
             )
 
+        def packed_expansion_arguments(config, device, scale_config=None):
+            if (
+                lsc is None
+                or config.w4a16_route_mode != "packed"
+                or config.csf_inline_scales
+            ):
+                return None
+            if scale_config is not None:
+                first, second = tuple(
+                    replace(
+                        plane,
+                        groups_per_task=scale_config.groups_per_task,
+                        shared_exceptions=scale_config.shared_exceptions,
+                    )
+                    for plane in (lsc.first, lsc.second)
+                )
+                direct_routes = scale_config.direct_routes
+            else:
+                decoder = expansion.prepared.state if expansion is not None else lsc
+                if getattr(decoder, "indexed_programs", None) is not None:
+                    return None
+                first, second = decoder.first, decoder.second
+                direct_routes = decoder.direct_routes
+            scratch = plan_tp_moe_scratch(
+                caps_for(config, device), prewarm_launches=False
+            )
+            if scratch.launch_plan.implementation != "w4a16" or scratch.full_rotation:
+                return None
+            from b12x.moe._shared.kernels.w4a16.host import (
+                route_pack_capacity,
+                select_route_block_size_m,
+            )
+
+            core = scratch._core_workspace_plan
+            tokens = int(scratch.launch_plan.max_tokens_per_launch)
+            block_m = core.route_block_size_m or select_route_block_size_m(
+                tokens, core.num_topk, core.route_E
+            )
+            routes, slots, blocks = route_pack_capacity(
+                tokens * core.num_topk, block_m, core.route_E, topk=core.num_topk
+            )
+            rounded = 1 << (routes - 1).bit_length()
+            threads = max(
+                min(getattr(plane, "groups_per_task", 8), 8) * 32
+                for plane in (first, second)
+            )
+            if (
+                not 0 < routes <= 128
+                or slots > 4096
+                or rounded > threads
+                or core.route_E != first.num_experts
+                or routes >= 16 * core.route_E
+                or (routes >= 64 and not direct_routes)
+                or (core.route_E + 1) * rounded > 2**31
+            ):
+                return None
+            return (
+                first.geometry,
+                second.geometry,
+                (routes, block_m, max(slots, 1), max(blocks, 1)),
+            )
+
         def compile_jobs(config, device):
             route_query = _route_query_from_moe(query, routing)
             caps = caps_for(config, device)
             launch_plan = plan_tp_moe_scratch(caps, prewarm_launches=False).launch_plan
+            if expansion is None:
+                packed_expansions = (packed_expansion_arguments(config, device),)
+            else:
+                scale_configs = (
+                    (expansion.override,)
+                    if expansion.override is not None
+                    else tuple(
+                        candidate
+                        for _, candidate in expansion.contract.eligible_plan(
+                            expansion.query, device.identity
+                        ).candidates
+                    )
+                )
+                packed_expansions = tuple(
+                    dict.fromkeys(
+                        packed_expansion_arguments(config, device, scale_config)
+                        for scale_config in scale_configs
+                    )
+                )
             return (
                 CompileJob.create(
                     "b12x.moe.fused_moe._preparation:compile_fused_moe",
@@ -1551,6 +1715,15 @@ def plan(
                     )
                     if lsc_payload and expansion is None
                     else ()
+                ),
+                *(
+                    CompileJob.create(
+                        "b12x.moe.fused_moe._preparation:compile_csf_packed_routes",
+                        *packed_expansion,
+                        CompileJob.DEVICE_ORDINAL,
+                    )
+                    for packed_expansion in packed_expansions
+                    if packed_expansion is not None
                 ),
                 *(
                     CompileJob.create(
@@ -1587,10 +1760,23 @@ def plan(
                 scale_decoder = expansion.prepared.state.decoder(lsc.active)
                 launchers.extend(scale_decoder.programs)
                 launchers.extend(scale_decoder.routing_programs)
+                launchers.extend(scale_decoder.mapped_programs)
+                launchers.extend(scale_decoder.mapped_routing_programs)
             elif lsc_payload:
                 launchers.extend(
                     compile_nvfp4_csf_programs(lsc_payload, device.ordinal)
                 )
+            packed_expansion = packed_expansion_arguments(selection.config, device)
+            if packed_expansion is not None:
+                packed_programs = compile_csf_packed_routes(
+                    *packed_expansion, device.ordinal
+                )
+                scale_decoder = replace(
+                    scale_decoder or lsc,
+                    packed_route_geometry=packed_expansion[2],
+                    packed_route_programs=packed_programs,
+                )
+                launchers.extend(packed_programs)
             route_query = _route_query_from_moe(query, routing)
             route_launcher = compile_route_topk(
                 ROUTE_TUNING.encode_query(route_query), device.ordinal

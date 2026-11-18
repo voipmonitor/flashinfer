@@ -60,6 +60,8 @@ _OPERANDS = (
     "v_descale",
     "attention_sink_bias",
     "relative_attention_bias",
+    "relative_bias_factors",
+    "relative_bias_projection",
 )
 
 
@@ -350,10 +352,19 @@ class _PagedState:
                 "paged binding requests an undeclared native specialization"
             )
         storage_key = (key, binding.k_cache.data_ptr(), binding.v_cache.data_ptr())
-        resources = self.resources.get(storage_key)
+        optional_layouts = tuple(
+            None if value is None else (tuple(value.shape), value.stride(), value.dtype)
+            for value in (
+                binding.k_descale,
+                binding.v_descale,
+                binding.attention_sink_bias,
+            )
+        )
+        constant_key = (key, None, None, optional_layouts)
+        resources = self.resources.get(constant_key, self.resources.get(storage_key))
         if resources is None:
-            # A plan materialized on first use meets its KV pool here; the
-            # pool's resources are built once per pool, never under capture.
+            # Materialize outside capture, including any address-dependent TMA
+            # descriptors or mutable scale/sink conversion destinations.
             if not _preparing and _capturing():
                 raise ValueError(
                     "a paged KV pool's resources cannot be created during CUDA "
@@ -368,7 +379,12 @@ class _PagedState:
                 v_descale=binding.v_descale,
                 attention_sink_bias=binding.attention_sink_bias,
             )
-            self.resources[storage_key] = resources
+            descriptors = resources["plane_tma_descs"][:2]
+            conversions = resources["optional_buffers"].values()
+            constants_only = all(value is None for value in descriptors) and all(
+                value.numel() == 0 for value in conversions
+            )
+            self.resources[constant_key if constants_only else storage_key] = resources
         install_paged_resources(binding, resources)
         return binding
 

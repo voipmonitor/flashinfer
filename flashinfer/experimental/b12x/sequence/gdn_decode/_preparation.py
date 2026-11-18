@@ -12,7 +12,14 @@ from b12x._lib.compile_pool import CompileJob
 from b12x._lib.program_cache import program_cache
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 from ._impl import Binding, Caps, KdaBinding, _bind, _bind_kda, _scratch_layout
-from ._tuning import GdnConfig, GdnQuery, TUNING, _OPERANDS, aligned_operands
+from ._tuning import (
+    GdnConfig,
+    GdnQuery,
+    TUNING,
+    _OPERANDS,
+    _SCALAR_COUNTS,
+    aligned_operands,
+)
 
 
 def _alignment(tensor):
@@ -74,7 +81,9 @@ def invocation_from_tensors(caps: Caps, *, scratch=None, **tensors) -> FrozenMap
         if kda
         else None,
         "pointer_alignments": {
-            name: _alignment(tensors[name]) for name in _OPERANDS if name in tensors
+            name: 4 if name in _SCALAR_COUNTS else _alignment(tensors[name])
+            for name in _OPERANDS
+            if name in tensors
         },
     }
     return FrozenMapping(fields)
@@ -391,7 +400,7 @@ class _GdnState:
             if (
                 alignment is not None
                 and not (q.recover_speculative_state and name == "b")
-                and _alignment(tensor) != alignment
+                and _alignment(tensor) < alignment
             ):
                 raise ValueError(
                     f"GDN {name} pointer alignment {_alignment(tensor)} differs from the prepared {alignment}"

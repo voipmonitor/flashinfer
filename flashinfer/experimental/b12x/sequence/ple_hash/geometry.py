@@ -122,12 +122,20 @@ def compute_geometry(
     )
 
 
-def allocate_geometry(geometry: Geometry, *, device) -> GeometryTensors:
-    """Allocate fresh checkpoint-owned geometry tensors before weight loading."""
+def allocate_geometry(geometry: Geometry, *, device, allocate=None) -> GeometryTensors:
+    """Allocate checkpoint-owned geometry, optionally using caller-supplied storage."""
     if not isinstance(geometry, Geometry):
         raise TypeError("allocate_geometry requires host Geometry")
+
+    def make_tensor(value):
+        if allocate is None:
+            return torch.tensor(value, dtype=torch.int64, device=device)
+        result = allocate((len(value),), dtype=torch.int64, device=device)
+        result.copy_(torch.tensor(value, dtype=torch.int64))
+        return result
+
     tensors = tuple(
-        torch.tensor(value, dtype=torch.int64, device=device)
+        make_tensor(value)
         for value in (
             geometry.prime_sizes,
             geometry.table_offsets,

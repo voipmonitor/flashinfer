@@ -34,7 +34,7 @@ SURFACES = {
     "DcpAllToAllPool.all_gather_pair": (2, 4, 8, 16),
     "DcpAllToAllPool.all_gather_pair_kimi_topk": (2, 4, 8, 16),
     "DcpAllToAllPool.kimi_topk16": (2, 4, 8, 16),
-    "DcpTopKOwnerExchange.stage_candidates": (2, 3, 4, 6, 8),
+    "DcpTopKOwnerExchange.stage_candidates": (2, 3, 4, 6, 8, 16),
     "VocabParallelArgmax.fused_add_argmax": (8, 12, 16),
     "PCIeHierarchicalAllReduce.all_reduce": (9, 10, 12, 16),
     "PCIeIslandRSAllReduce.all_reduce": (16,),
@@ -107,7 +107,7 @@ def _validate_query(query: PcieQuery, device) -> None:
             call["active_blocks"],
             cluster_size=call["joint_cluster_size"],
         )
-    if query.call.get("row_blocks"):
+    if query.call.get("row_blocks") is True:
         if not (query.surface.endswith(".all_gather_pair") and query.world_size == 16
                 and query.call["threads"] == 512 and query.call["first_dtype"] == "torch.bfloat16"
                 and query.call["second_dtype"] == "torch.float32"
@@ -146,6 +146,29 @@ def _validate_query(query: PcieQuery, device) -> None:
             ):
                 raise ValueError(
                     "word exchange requires disjoint aligned data and owned TP2/TP4 state"
+                )
+    if query.surface.endswith(".all_gather_pair"):
+        blocks = query.call.get("row_blocks", 1)
+        if type(blocks) is bool:
+            # The deployed Kimi pair uses a shape-specific launcher selected by a boolean.
+            blocks = 1
+        if type(blocks) is not int or not 1 <= blocks <= 64:
+            raise ValueError("paired gather row blocks must fit the signal plane")
+        if blocks > 1 and not query.call.get("disjoint_output", False):
+            raise ValueError("parallel paired gather requires disjoint outputs")
+        load_batch = query.call.get("load_batch", 1)
+        if type(load_batch) is not int or load_batch not in (1, 2):
+            raise ValueError("paired gather load batch must be one or two")
+        if load_batch != 1 and (
+            blocks == 1 or not query.call.get("disjoint_output", False)
+        ):
+            raise ValueError("batched paired loads require disjoint multi-CTA rows")
+    if query.surface.endswith(".all_gather_pair_kimi_topk"):
+        for field in ("row_blocks", "load_batch"):
+            value = query.call.get(field, 1)
+            if type(value) is not int or value != 1:
+                raise ValueError(
+                    "fused Kimi paired gather requires row_blocks=1 and load_batch=1"
                 )
     if query.surface == "kimi_topk16":
         if query.topology != "local":

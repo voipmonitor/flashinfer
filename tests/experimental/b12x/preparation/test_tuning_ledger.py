@@ -7,6 +7,7 @@ from b12x.preparation._ledger import admission_levels
 from b12x.tools import tuning_ledger
 
 from .test_defaults import contract
+from .test_race_elimination import _Timer, host_timing
 from .test_session import _deterministic_timer, request, session
 
 
@@ -73,6 +74,7 @@ def test_complete_race_appends_one_record_and_cached_restart_adds_none(
     assert all(c["local"] and not c["restored"] for c in record["candidates"])
     assert all(c["batch"] is not None for c in record["candidates"])
     assert record["batches"] and record["batches"][-1]["winner"] == 1
+    assert record["batches"][-1]["scoring_start_round"] == 0
     assert record["protocol"]["rounds"] == 15 and record["protocol"]["samples"] == 2
     assert set(record["phase_seconds"]) >= {"compile", "prepare", "measure"}
     assert record["seconds"] >= 0
@@ -96,6 +98,61 @@ def test_complete_race_appends_one_record_and_cached_restart_adds_none(
     assert analysis["measured"] == 3
     assert "test.arithmetic" in tuning_ledger.summarize([analysis])
     assert "test.arithmetic" in tuning_ledger.describe_records([analysis])
+
+
+def test_confirmed_scores_publish_selection_and_scoring_window(
+    tmp_path, monkeypatch, host_timing
+):
+    from b12x.preparation import _measurement
+
+    class Timer(_Timer):
+        def close(self):
+            pass
+
+    sequences = {
+        3: (29.2256, 31.3344),
+        6: (26.0736, 32.1888, 29.4432, 26.7712),
+        12: (40.0,),
+    }
+
+    def prepare(calls, **kwargs):
+        timers = tuple(Timer(*sequences[call.output]) for call in calls)
+        yield
+        return _measurement.PreparedRace(timers, None, 1)
+
+    monkeypatch.setattr(_measurement, "prepare_race_steps", prepare)
+    with session(tmp_path, rounds=7, race_batch=3) as engine:
+        result = engine.prepare(
+            (request(name="confirmed", tuning=contract(), benchmark=_benchmark),)
+        )
+        assert result.selections["confirmed"].source == "tuned"
+        assert result.selections["confirmed"].config.width == 2
+        record = engine._race_progress_cache().ledger_records()[0]["record"]
+        assert record["champion"]["index"] == 1
+        (batch,) = record["batches"]
+        assert batch["scoring_start_round"] == 3
+        assert batch["latencies_us"] == [31.3344, 26.7712, 40.0]
+        assert [row["round"] for row in record["candidates"][0]["rounds"]] == [
+            0,
+            3,
+            4,
+            5,
+        ]
+        assert [row["round"] for row in record["candidates"][1]["rounds"]] == list(
+            range(6)
+        )
+
+    def unexpected_prepare(*args, **kwargs):
+        pytest.fail("cached selection must not repeat the race")
+
+    monkeypatch.setattr(_measurement, "prepare_race_steps", unexpected_prepare)
+    with session(tmp_path, rounds=7, race_batch=3) as engine:
+        result = engine.prepare(
+            (request(name="cached", tuning=contract(), benchmark=_benchmark),)
+        )
+        assert result.selections["cached"].source == "cached"
+        assert result.selections["cached"].config.width == 2
+        assert len(engine._race_progress_cache().ledger_records()) == 1
 
 
 def _record(*, key, effort, default_index, candidates, winner=None):

@@ -254,3 +254,45 @@ def test_nvfp4_direct_micro_supports_partial_512_k_groups() -> None:
         spec for spec in plan.tensor_specs if spec.name == "barrier_count"
     )
     assert barrier_spec.shape == (22,)
+
+
+def test_mxfp4_oracle_ignores_inactive_routes() -> None:
+    experts, hidden, intermediate = 2, 32, 32
+    x = torch.full((2, hidden), 0.25, dtype=torch.bfloat16)
+    w13 = _packed_fp4_constant(1.0, groups=experts, rows=2 * intermediate, cols=hidden)
+    w2 = _packed_fp4_constant(1.0, groups=experts, rows=hidden, cols=intermediate)
+    s13 = _e8m0_blockscale_constant(
+        0.125, groups=experts, rows=2 * intermediate, cols=hidden
+    )
+    s2 = _e8m0_blockscale_constant(
+        0.125, groups=experts, rows=hidden, cols=intermediate
+    )
+    one = torch.ones(experts)
+
+    def reference(ids, probabilities):
+        return moe_reference_w4a16_fp4_e8m0_k32(
+            x,
+            w13,
+            s13,
+            one,
+            w2,
+            s2,
+            one,
+            ids,
+            probabilities,
+            experts,
+            hidden,
+            intermediate,
+            activation="situ",
+        )
+
+    expected = reference(
+        torch.tensor([[0, 1], [0, 1]]), torch.tensor([[0.3, 0.7], [0.0, 0.0]])
+    )
+    actual = reference(
+        torch.tensor([[0, -1, 1, experts], [-1, -7, experts, experts + 4]]),
+        torch.tensor([[0.3, 1.0, 0.7, 1.0], [1.0, 1.0, 1.0, 1.0]]),
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.count_nonzero(actual[0]) == hidden
+    assert torch.count_nonzero(actual[1]) == 0

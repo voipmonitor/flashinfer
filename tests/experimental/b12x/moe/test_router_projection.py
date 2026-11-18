@@ -22,7 +22,14 @@ def test_router_projection_geometry(hidden, experts, top_k):
     check_router_replay(3, 4, 8, 4, hidden, experts, top_k)
 
 
-def check_router_replay(rows, tile, warps, warps_per_expert, hidden, experts, top_k):
+@pytest.mark.parametrize("rows", [1, 8, 17])
+def test_tensor_core_router_projection_replay(rows):
+    check_router_replay(rows, 8, 8, 4, 2560, 512, 10, projection="tensor_core")
+
+
+def check_router_replay(
+    rows, tile, warps, warps_per_expert, hidden, experts, top_k, *, projection="simt"
+):
     device = torch.device("cuda", torch.cuda.current_device())
     generator = torch.Generator(device=device).manual_seed(73)
     weight = (
@@ -46,6 +53,7 @@ def check_router_replay(rows, tile, warps, warps_per_expert, hidden, experts, to
         rows_per_tile=tile,
         warps=warps,
         warps_per_expert=warps_per_expert,
+        projection=projection,
     )
     run(source, weight, logits, counters, selected, ids, scores)
     graph = torch.cuda.CUDAGraph()
@@ -91,6 +99,9 @@ def check_router_replay(rows, tile, warps, warps_per_expert, hidden, experts, to
                     torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
                 )
                 assert not counters.count_nonzero()
+                torch.testing.assert_close(
+                    logits, logits.bfloat16().float(), rtol=0, atol=0
+                )
                 torch.testing.assert_close(ids, expected_ids.int(), rtol=0, atol=0)
                 torch.testing.assert_close(
                     selected, expected_selected, rtol=0.008, atol=0.002

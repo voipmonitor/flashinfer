@@ -12,6 +12,7 @@ class PagedKVWriteQuery:
     head_dim_v: int
     page_size: int
     kv_dtype: str
+    caller_owned_placeholders: bool = False
 
     def __post_init__(self):
         if any(

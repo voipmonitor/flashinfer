@@ -109,16 +109,57 @@ def test_audit_restores_small_projection_backends_and_preserves_pins():
         ],
         ("tc", {"max_rows": 9}),
         ("tc", {"max_rows": 8, "in_features": 65}),
-        ("tc", {"max_rows": 8, "output_dtype": "float32"}),
+        ("tc", {"max_rows": 8, "source_dtype": "float32"}),
+        ("tc", {"max_rows": 8, "weight_dtype": "float32"}),
         ("tc", {"max_rows": 8, "bias_dtype": "bfloat16"}),
+        ("tc", {"max_rows": 8, "bias_dtype": "float32"}),
+        *[
+            ("tc", {"max_rows": 8, name: False})
+            for name in (
+                "source_contiguous",
+                "source_aligned",
+                "weight_contiguous",
+                "weight_aligned",
+                "output_contiguous",
+            )
+        ],
     ],
 )
-def test_audit_keeps_backend_support_mandatory(backend, changes):
-    q = replace(query(), autotune_effort="audit", **changes)
+@pytest.mark.parametrize("output_dtype", ["bfloat16", "float32"])
+def test_audit_keeps_backend_support_mandatory(backend, changes, output_dtype):
+    q = replace(query(), autotune_effort="audit", output_dtype=output_dtype, **changes)
     config = GemvConfig(backend=backend)
     with pytest.raises(ValueError, match="ineligible"):
         TUNING.validate_config(q, config, None)
     assert config not in choices(q)
+
+
+@pytest.mark.parametrize("n", [240, 304, 368, 432, 496])
+@pytest.mark.parametrize("rows", [1, 8])
+def test_tensor_core_fp32_joins_existing_projection_candidates(n, rows):
+    import torch
+
+    q = replace(query(), max_rows=rows, in_features=4096, out_features=n)
+    expected = {
+        GemvConfig(backend="simt", rows_per_tile=tile, block_threads=threads)
+        for tile in (1, 2, 4, 8)
+        for threads in (128, 256)
+    }
+    expected.add(GemvConfig(backend="tc"))
+    if n >= 256:
+        expected.add(GemvConfig(backend="mma"))
+    for output_dtype in ("bfloat16", "float32"):
+        active = replace(q, output_dtype=output_dtype, autotune_effort="default")
+        dtype_expected = set(expected)
+        if output_dtype == "bfloat16" or hasattr(torch.ops.aten.mm, "dtype_out"):
+            dtype_expected.add(GemvConfig(backend="torch"))
+        TUNING.validate_config(active, GemvConfig(backend="tc"), None)
+        assert choices(active) == dtype_expected
+        assert choices(replace(active, autotune_effort="audit")) == dtype_expected | {
+            GemvConfig(backend="mma"),
+            GemvConfig(backend="prefill"),
+        }
+        assert TUNING.default_config(active, None).backend == "simt"
 
 
 def test_default_preserves_projection_defaults():
@@ -129,3 +170,15 @@ def test_default_preserves_projection_defaults():
     assert TUNING.default_config(replace(q, max_rows=1), None) == GemvConfig(
         backend="simt", rows_per_tile=2
     )
+
+
+@pytest.mark.parametrize("output_dtype", ["bfloat16", "float32"])
+def test_tensor_core_projection_needs_no_workspace(output_dtype):
+    from b12x.gemm.bf16_gemv._preparation import plan
+
+    q = replace(query(output_dtype=output_dtype), max_rows=8)
+    requirements = plan(q)._memory_requirements(
+        GemvConfig(backend="tc"), SimpleNamespace(ordinal=0)
+    )
+    assert requirements.scratch_nbytes == 0
+    assert not requirements.persistent

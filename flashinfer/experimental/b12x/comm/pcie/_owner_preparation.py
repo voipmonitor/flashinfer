@@ -51,6 +51,7 @@ def _runtime_slab_bytes(runtime) -> int:
             max_rows=runtime.max_rows,
             topk=runtime.topk,
             world_size=runtime.world_size,
+            counted=runtime.counted,
         )
         return int(layout.slab_bytes)
     raise ValueError("PCIe runtime does not expose its IPC slab capacity")
@@ -100,7 +101,10 @@ def query_from_runtime(
             "indices": _tensor_call(indices),
             "scores": _tensor_call(scores),
             "rows": int(indices.shape[0]),
+            "length_aware": raw.get("local_counts") is not None,
         }
+        if raw.get("local_counts") is not None:
+            controls["counts"] = _tensor_call(raw["local_counts"])
         setup = {
             "max_rows": int(runtime.max_rows),
             "max_owner_rows": int(runtime.max_owner_rows),
@@ -160,7 +164,9 @@ def query_from_runtime(
         }
     elif surface == "PCIeIslandRSAllReduce.all_reduce":
         inp, out = raw["inp"], raw.get("out")
-        from .pcie_island_rs import _pick_blocks
+        from .pcie_island_rs import _pick_blocks, _validate_output_overlap
+
+        _validate_output_overlap(inp, out)
 
         blocks = int(runtime.blocks)
         if raw.get("blocks") is not None and int(raw["blocks"]) != blocks:
@@ -262,7 +268,11 @@ def compile_owner_surface(query_payload, ordinal):
             from ._dcp_topk_cute import _get_compiled_topk_stage
 
             return _get_compiled_topk_stage(
-                query.world_size, query.rank, call["topk"], call["threads"]
+                query.world_size,
+                query.rank,
+                call["topk"],
+                call["threads"],
+                length_aware=call.get("length_aware", False),
             )
         if query.surface == "VocabParallelArgmax.fused_add_argmax":
             from ._vocab_argmax_cute import get_vocab_argmax_launcher
@@ -414,17 +424,26 @@ def prepared_call(state, **actual):
     """Build a priming call that invokes the materialized native owner state."""
     runtime, query = state.runtime, state.query
     if query.surface == "DcpTopKOwnerExchange.stage_candidates":
+        if bool(query.call.get("length_aware", False)) != (
+            actual.get("local_counts") is not None
+        ):
+            raise ValueError("candidate counts differ from the prepared DCP top-k plan")
 
         def run():
             return runtime._stage_candidates_on_device(
                 actual["local_indices"],
                 actual["local_scores"],
+                actual.get("local_counts"),
                 launcher=state.launcher(),
                 threads=query.call["threads"],
                 block_limit=query.call["block_limit"],
             )
 
-        return PreparedCall(run=run, capture_safe=True)
+        return PreparedCall(
+            run=run,
+            capture_safe=True,
+            capture_context=lambda: runtime._capture_prepared(state),
+        )
     if query.surface == "VocabParallelArgmax.fused_add_argmax":
         out = actual.get("out")
         if out is None:
@@ -457,11 +476,14 @@ def prepared_call(state, **actual):
             capture_safe=True,
         )
     if query.surface == "PCIeIslandRSAllReduce.all_reduce":
+        from .pcie_island_rs import _validate_output_overlap
+
         out = actual.get("out")
         if out is None:
             import torch
 
             out = torch.empty_like(actual["inp"])
+        _validate_output_overlap(actual["inp"], out)
         return PreparedCall(
             run=lambda: runtime._run_prepared(
                 state.launcher(),

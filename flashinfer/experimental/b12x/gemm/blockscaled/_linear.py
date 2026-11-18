@@ -93,11 +93,16 @@ def _source_2d(source: torch.Tensor) -> torch.Tensor:
     return source.reshape(-1, source.shape[-1]).contiguous()
 
 
-def _pad_k(tensor: torch.Tensor, padded_k: int) -> torch.Tensor:
+def _pad_k(tensor: torch.Tensor, padded_k: int, *, allocate=None) -> torch.Tensor:
     rows, width = map(int, tensor.shape)
-    if width == padded_k:
+    if width == padded_k and (allocate is None or tensor.is_contiguous()):
         return tensor.contiguous()
-    padded = tensor.new_zeros((rows, padded_k))
+    if allocate is None:
+        padded = tensor.new_zeros((rows, padded_k))
+    else:
+        padded = allocate((rows, padded_k), dtype=tensor.dtype, device=tensor.device)
+        if width != padded_k:
+            padded.zero_()
     padded[:, :width] = tensor
     return padded.contiguous()
 
@@ -180,7 +185,9 @@ def _mxfp8_scale_mma_from_input(
     return physical.permute(2, 3, 0, 4, 1).unsqueeze(-1)
 
 
-def _unit_scale_mma(rows: int, width: int, device: torch.device) -> torch.Tensor:
+def _unit_scale_mma(
+    rows: int, width: int, device: torch.device, *, allocate=None
+) -> torch.Tensor:
     scale_rows = torch.full(
         (rows, width // MXFP8_SCALE_VEC_SIZE),
         127,
@@ -192,15 +199,17 @@ def _unit_scale_mma(rows: int, width: int, device: torch.device) -> torch.Tensor
         m=rows,
         k=width,
         num_groups=1,
+        allocate=allocate,
     )
 
 
-def _unit_block_scale(rows: int, width: int, device: torch.device) -> torch.Tensor:
-    return torch.ones(
-        (rows // 128, width // 128),
-        dtype=torch.float32,
-        device=device,
-    )
+def _unit_block_scale(
+    rows: int, width: int, device: torch.device, *, allocate=None
+) -> torch.Tensor:
+    shape = (rows // 128, width // 128)
+    if allocate is None:
+        return torch.ones(shape, dtype=torch.float32, device=device)
+    return allocate(shape, dtype=torch.float32, device=device).fill_(1)
 
 
 _UNIT_SCALE_MMA_CACHE: dict[tuple, torch.Tensor] = {}
@@ -299,6 +308,8 @@ def is_mxfp8_linear_supported() -> tuple[bool, str | None]:
 def pack_mxfp8_linear_weight(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
+    *,
+    allocate=None,
 ) -> MXFP8LinearWeight:
     """Pack ModelOpt ``[N,K]`` MXFP8 values and compact ``[N,K/32]`` scales."""
 
@@ -334,17 +345,48 @@ def pack_mxfp8_linear_weight(
 
     padded_in_features = _align_up(in_features, 128)
     padded_scale_k = padded_in_features // MXFP8_SCALE_VEC_SIZE
-    weight_values = _pad_k(
-        weight[:out_features, :in_features],
-        padded_in_features,
-    )
-    scale_rows_u8 = _scale_rows_to_u8(weight_scale[:out_features, :scale_k])
-    scale_rows = _pad_scale_rows_k(scale_rows_u8, padded_scale_k)
+    if allocate is None:
+        weight_values = _pad_k(weight[:out_features, :in_features], padded_in_features)
+        scale_rows_u8 = _scale_rows_to_u8(weight_scale[:out_features, :scale_k])
+        scale_rows = _pad_scale_rows_k(scale_rows_u8, padded_scale_k)
+    else:
+        source = weight[:out_features, :in_features]
+        if in_features == padded_in_features and source.is_contiguous():
+            weight_values = source
+        else:
+            weight_values = allocate(
+                (out_features, padded_in_features),
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+            if in_features != padded_in_features:
+                weight_values.zero_()
+            weight_values[:, :in_features].copy_(source)
+        source_scale = weight_scale[:out_features, :scale_k]
+        if source_scale.dtype == torch.float8_e8m0fnu:
+            source_scale = source_scale.view(torch.uint8)
+        elif source_scale.dtype != torch.uint8:
+            raise ValueError(
+                f"weight_scale must be uint8/e8m0, got {source_scale.dtype}"
+            )
+        if scale_k == padded_scale_k and source_scale.is_contiguous():
+            scale_rows = source_scale.view(torch.float8_e8m0fnu)
+        else:
+            scale_rows = allocate(
+                (out_features, padded_scale_k),
+                dtype=torch.float8_e8m0fnu,
+                device=weight.device,
+            )
+            scale_bytes = scale_rows.view(torch.uint8)
+            if scale_k != padded_scale_k:
+                scale_bytes.fill_(127)
+            scale_bytes[:, :scale_k].copy_(source_scale)
     scale_mma = pack_mxfp8_scales_for_dense_gemm(
         scale_rows,
         m=out_features,
         k=padded_in_features,
         num_groups=1,
+        allocate=allocate,
     )
     return MXFP8LinearWeight(
         weight=MXFP8Rows(
@@ -367,6 +409,8 @@ def is_tensor_fp8_linear_supported() -> tuple[bool, str | None]:
 def pack_tensor_fp8_linear_weight(
     weight: torch.Tensor,
     output_scale: torch.Tensor,
+    *,
+    allocate=None,
 ) -> TensorFP8LinearWeight:
     """Pack an E4M3 ``[N,K]`` weight with one combined dequantization scale."""
 
@@ -396,11 +440,12 @@ def pack_tensor_fp8_linear_weight(
         )
 
     padded_in_features = _align_up(in_features, 128)
-    values = _pad_k(weight, padded_in_features)
+    values = _pad_k(weight, padded_in_features, allocate=allocate)
     scale_mma = _unit_scale_mma(
         out_features,
         padded_in_features,
         weight.device,
+        allocate=allocate,
     )
     return TensorFP8LinearWeight(
         values=values,
@@ -409,6 +454,7 @@ def pack_tensor_fp8_linear_weight(
             out_features,
             padded_in_features,
             weight.device,
+            allocate=allocate,
         ),
         output_scale=output_scale.reshape(1).contiguous(),
         in_features=in_features,
@@ -425,6 +471,7 @@ def pack_weight(
     global_scale: torch.Tensor | None = None,
     global_scale_kind: str = "multiplier",
     activation_global_scale: torch.Tensor | None = None,
+    allocate=None,
 ) -> Weight:
     """Pack a serialized dense weight for ``blockscaled.mm``.
 
@@ -444,6 +491,8 @@ def pack_weight(
     ``q8_0`` takes ``[N,K/32,34]`` blocks containing INT8 values and FP16 scales.
     Omit ``scale`` and ``global_scale``.
     Preparation losslessly rearranges descriptors and metadata for A16 GEMM.
+    ``allocate`` can supply newly created output storage as
+    ``allocate(shape, dtype=..., device=...)``. Compatible input storage is borrowed.
     """
 
     if activation_global_scale is not None and recipe != "nvfp4":
@@ -455,7 +504,7 @@ def pack_weight(
             or global_scale_kind != "multiplier"
         ):
             raise ValueError("IQ2_XS scales are embedded in its block payload")
-        return pack_iq2_xs_weight(weight, codec=recipe)
+        return pack_iq2_xs_weight(weight, codec=recipe, allocate=allocate)
     if scale is None:
         raise ValueError("this weight recipe requires a scale tensor")
     if recipe == "mxfp4":
@@ -485,13 +534,13 @@ def pack_weight(
     ):
         raise ValueError("global_scale/kind are specific to recipe='nvfp4'")
     if scale.dtype == torch.float32 and scale.numel() == 1 and recipe != "mxfp8":
-        return pack_tensor_fp8_linear_weight(weight, scale)
+        return pack_tensor_fp8_linear_weight(weight, scale, allocate=allocate)
     if (
         scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
         and scale.ndim == 2
         and recipe != "tensor_fp8"
     ):
-        return pack_mxfp8_linear_weight(weight, scale)
+        return pack_mxfp8_linear_weight(weight, scale, allocate=allocate)
     raise ValueError(
         "unsupported blockscaled weight scale: expected one FP32 combined "
         "tensor scale or a 2D uint8/UE8M0 MXFP8 scale; got "

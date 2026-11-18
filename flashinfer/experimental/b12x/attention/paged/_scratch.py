@@ -407,6 +407,28 @@ class _B12XPagedPlanMetadataCache:
     total_q: int
 
 
+_REPLAY_METADATA_FIELDS = (
+    "request_indices",
+    "qo_tile_indices",
+    "kv_tile_indices",
+    "merge_indptr",
+    "o_indptr",
+    "block_valid_mask",
+    "kv_window_start_tokens",
+    "kv_chunk_size_ptr",
+    "total_num_rows_ptr",
+)
+
+
+@dataclass(frozen=True)
+class ReplayMetadata:
+    """Schedule tensors and immutable chunk policy supplied by an attention caller."""
+
+    tensors: tuple[torch.Tensor, ...]
+    chunk_pages_lut: torch.Tensor | None
+    live: bool = False
+
+
 def _make_plan_metadata_cache(
     plan: PagedPlan,
     *,
@@ -488,6 +510,7 @@ class B12XPagedAttentionScratch:
     _use_regular_decode_graph_replay: bool = False
     _decode_graph_metadata_captured_in_graph: bool = False
     _uses_plan_owned_decode_graph_metadata: bool = False
+    _caller_owned_replay_metadata: bool = False
     # Keep the public scratch Plan reachable from a materialized binding.  A
     # binding may be created before CUDA graph capture, so ``bind()`` cannot be
     # the only place that records that the Plan-owned replay addresses escaped
@@ -574,6 +597,8 @@ class B12XPagedAttentionScratch:
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
         relative_attention_bias: torch.Tensor | None = None,
+        relative_bias_factors: torch.Tensor | None = None,
+        relative_bias_projection: torch.Tensor | None = None,
     ) -> "B12XPagedAttentionBinding":
         return build_paged_attention_binding(
             scratch=self,
@@ -593,6 +618,8 @@ class B12XPagedAttentionScratch:
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
             relative_attention_bias=relative_attention_bias,
+            relative_bias_factors=relative_bias_factors,
+            relative_bias_projection=relative_bias_projection,
         )
 
     @torch._dynamo.disable
@@ -1463,6 +1490,8 @@ class B12XPagedAttentionBinding:
     v_descale: torch.Tensor | None = None
     attention_sink_bias: torch.Tensor | None = None
     relative_attention_bias: torch.Tensor | None = None
+    relative_bias_factors: torch.Tensor | None = None
+    relative_bias_projection: torch.Tensor | None = None
     plan: "Plan | None" = None
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1558,6 +1587,8 @@ def build_paged_attention_binding(
     v_descale: torch.Tensor | None = None,
     attention_sink_bias: torch.Tensor | None = None,
     relative_attention_bias: torch.Tensor | None = None,
+    relative_bias_factors: torch.Tensor | None = None,
+    relative_bias_projection: torch.Tensor | None = None,
 ) -> B12XPagedAttentionBinding:
     scratch._validate_static_shapes(q, k_cache, v_cache)
     _validate_output(output, scratch=scratch)
@@ -1586,6 +1617,12 @@ def build_paged_attention_binding(
         scratch=scratch,
         name="relative_attention_bias",
     )
+
+    for name, tensor in (
+        ("relative_bias_factors", relative_bias_factors),
+        ("relative_bias_projection", relative_bias_projection),
+    ):
+        _validate_optional_tensor_device(tensor, scratch=scratch, name=name)
 
     metadata = _metadata_tuple(
         page_table=page_table,
@@ -1617,6 +1654,8 @@ def build_paged_attention_binding(
         v_descale=v_descale,
         attention_sink_bias=attention_sink_bias,
         relative_attention_bias=relative_attention_bias,
+        relative_bias_factors=relative_bias_factors,
+        relative_bias_projection=relative_bias_projection,
     )
 
 
@@ -1883,6 +1922,71 @@ class B12XPagedAttentionScratchPlan:
     _use_regular_decode_graph_replay: bool = False
     _q2k_indices_data_ptr: int | None = None
     _decode_graph_replay_state_captured: bool = False
+    _replay_metadata_layout: tuple | None = None
+
+    def replay_metadata(self) -> ReplayMetadata:
+        """Return schedule seeds without transferring their allocation ownership."""
+        cache = self._plan_metadata_cache
+        if cache is None:
+            raise RuntimeError(
+                "paged replay metadata requires explicit caller operands"
+            )
+        tensors = tuple(getattr(cache, name) for name in _REPLAY_METADATA_FIELDS)
+        live = (
+            self.caps.use_cuda_graph
+            and self.caps.mode == "decode"
+            and not self.caps.msa_block_sparse
+            and self._plan is not None
+            and self._plan.enable_cuda_graph
+            and self._plan.split_kv
+            and not self._plan.msa_block_sparse
+            and self._decode_graph_chunk_pages_lut is not None
+        )
+        return ReplayMetadata(tensors, self._decode_graph_chunk_pages_lut, live)
+
+    def release_replay_metadata(self) -> None:
+        """Retire declaration allocations once all subsequent binds supply metadata."""
+        metadata = self.replay_metadata()
+        values = (*metadata.tensors, metadata.chunk_pages_lut)
+        self._replay_metadata_layout = tuple(
+            None
+            if value is None
+            else (tuple(value.shape), tuple(value.stride()), value.dtype, value.device)
+            for value in values
+        )
+        self._plan_metadata_cache = None
+        self._decode_graph_chunk_pages_lut = None
+
+    def _bind_replay_metadata(self, metadata: ReplayMetadata):
+        expected = self._replay_metadata_layout
+        if expected is None:
+            source = self.replay_metadata()
+            expected = tuple(
+                None
+                if value is None
+                else (
+                    tuple(value.shape),
+                    tuple(value.stride()),
+                    value.dtype,
+                    value.device,
+                )
+                for value in (*source.tensors, source.chunk_pages_lut)
+            )
+        values = (*metadata.tensors, metadata.chunk_pages_lut)
+        actual = tuple(
+            None
+            if value is None
+            else (tuple(value.shape), tuple(value.stride()), value.dtype, value.device)
+            for value in values
+        )
+        if actual != expected:
+            raise ValueError("caller replay metadata differs from the prepared layout")
+        cache = _B12XPagedPlanMetadataCache(
+            *metadata.tensors,
+            kv_chunk_size=int(self.plan.kv_chunk_size),
+            total_q=int(self.plan.total_q),
+        )
+        return cache, metadata.chunk_pages_lut
 
     def _mark_decode_graph_replay_state_captured(
         self,
@@ -2328,15 +2432,29 @@ class B12XPagedAttentionScratchPlan:
         v_descale: torch.Tensor | None = None,
         attention_sink_bias: torch.Tensor | None = None,
         relative_attention_bias: torch.Tensor | None = None,
+        relative_bias_factors: torch.Tensor | None = None,
+        relative_bias_projection: torch.Tensor | None = None,
         q2k_indices: torch.Tensor | None = None,
         metadata_launchers: object | None = None,
         external_schedule: object | None = None,
+        replay_metadata: ReplayMetadata | None = None,
     ) -> B12XPagedAttentionBinding:
         scratch_storage = scratch_tensor(
             scratch,
             self._scratch_specs,
             owner="paged attention",
         )
+        if replay_metadata is None:
+            cache, chunk_pages_lut = (
+                self._plan_metadata_cache,
+                self._decode_graph_chunk_pages_lut,
+            )
+            if self._replay_metadata_layout is not None:
+                raise RuntimeError(
+                    "paged replay metadata requires explicit caller operands"
+                )
+        else:
+            cache, chunk_pages_lut = self._bind_replay_metadata(replay_metadata)
         scratch_views = _materialize_paged_attention_scratch(
             self.caps,
             scratch_storage,
@@ -2347,16 +2465,19 @@ class B12XPagedAttentionScratchPlan:
             plan_k_cache=self._plan_k_cache,
             plan_v_cache=self._plan_v_cache,
             planner_budget=self._planner_budget,
-            plan_metadata_cache=self._plan_metadata_cache,
-            decode_graph_chunk_pages_lut=self._decode_graph_chunk_pages_lut,
+            plan_metadata_cache=cache,
+            decode_graph_chunk_pages_lut=chunk_pages_lut,
             decode_graph_max_chunks_per_req=self._decode_graph_max_chunks_per_req,
             use_regular_decode_graph_replay=self._use_regular_decode_graph_replay,
             owner_scratch_plan=self,
         )
+        scratch_views._caller_owned_replay_metadata = replay_metadata is not None
         scratch_views.install_prepared_resources(metadata_launchers=metadata_launchers)
         if external_schedule is not None:
             external_schedule.install(scratch_views, self)
-        scratch_views._q2k_indices_data_ptr = self._q2k_indices_data_ptr
+        scratch_views._q2k_indices_data_ptr = (
+            None if replay_metadata is not None else self._q2k_indices_data_ptr
+        )
         binding = build_paged_attention_binding(
             scratch=scratch_views,
             q=q,
@@ -2374,10 +2495,13 @@ class B12XPagedAttentionScratchPlan:
             v_descale=v_descale,
             attention_sink_bias=attention_sink_bias,
             relative_attention_bias=relative_attention_bias,
+            relative_bias_factors=relative_bias_factors,
+            relative_bias_projection=relative_bias_projection,
             q2k_indices=q2k_indices,
         )
         if (
-            self.caps.use_cuda_graph
+            replay_metadata is None
+            and self.caps.use_cuda_graph
             and self.caps.mode == "decode"
             and self._plan_metadata_cache is not None
             and torch.cuda.is_current_stream_capturing()
@@ -2390,7 +2514,8 @@ class B12XPagedAttentionScratchPlan:
             self._mark_decode_graph_replay_state_captured(
                 scratch_views._plan_metadata_cache
             )
-        self._q2k_indices_data_ptr = scratch_views._q2k_indices_data_ptr
+        if replay_metadata is None:
+            self._q2k_indices_data_ptr = scratch_views._q2k_indices_data_ptr
         return binding
 
 
@@ -2692,6 +2817,8 @@ def make_compile_bindings(
                 "v_descale",
                 "attention_sink_bias",
                 "relative_attention_bias",
+                "relative_bias_factors",
+                "relative_bias_projection",
             )
         },
     )
@@ -2715,8 +2842,30 @@ def variant_key(binding: B12XPagedAttentionBinding) -> Hashable:
         binding.q2k_indices is not None,
         binding.k_descale is not None,
         binding.v_descale is not None,
-        binding.attention_sink_bias is not None,
+        # A per-row sink (rank 2) is indexed differently from a per-head one.
+        (
+            2
+            if binding.attention_sink_bias is not None
+            and binding.attention_sink_bias.ndim == 2
+            else binding.attention_sink_bias is not None
+        ),
         binding.relative_attention_bias is not None,
+        (
+            None
+            if binding.relative_bias_factors is None
+            else (
+                tuple(binding.relative_bias_factors.shape),
+                tuple(binding.relative_bias_factors.stride()),
+            )
+        ),
+        (
+            None
+            if binding.relative_bias_projection is None
+            else (
+                tuple(binding.relative_bias_projection.shape),
+                tuple(binding.relative_bias_projection.stride()),
+            )
+        ),
     )
     layout = (
         tuple(binding.q.stride()),

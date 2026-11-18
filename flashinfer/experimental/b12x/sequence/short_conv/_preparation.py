@@ -15,7 +15,7 @@ from b12x._lib.scratch_layout import (
 )
 from b12x.preparation import FrozenMapping, MemoryRequirements, Plan
 
-from ._tuning import OPERANDS, TUNING, ShortConvQuery
+from ._tuning import OPERANDS, SCALAR_COUNTS, TUNING, ShortConvQuery
 
 _SCRATCH = frozenset(("gathered_state", "request_ids"))
 _BOOL = frozenset(("state_is_fresh", "request_is_prefill"))
@@ -58,7 +58,11 @@ def invocation_from_tensors(*, conv_state, scratch=None, **tensors):
             "state_strides": tuple(conv_state.stride()),
             "input_row_stride": tensors["x"].stride(0),
             "input_alignments": tuple(
-                alignment if name in _SCRATCH else _alignment(tensors[name])
+                alignment
+                if name in _SCRATCH
+                else 4
+                if name in SCALAR_COUNTS
+                else _alignment(tensors[name])
                 for name in OPERANDS
             ),
         }
@@ -299,7 +303,7 @@ class PreparedShortConv:
             if (
                 tensor is None
                 or tensor.device != self.device
-                or _alignment(tensor) != alignment
+                or _alignment(tensor) < alignment
             ):
                 raise ValueError(
                     f"short convolution {name} device/alignment differs from preparation"

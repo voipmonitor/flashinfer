@@ -22,6 +22,89 @@ _SMALL_PREFIX_MAX_ROUTE_BLOCKS = 512
 
 
 _FAST_COUNT_BLOCK_T = 1024
+_SORTED_PACK_MAX_ROUTES = 128
+
+
+@triton.jit
+def _route_group_start_maximum(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def _pack_topk_routes_sorted_kernel(
+    topk_ids,
+    expert_map,
+    packed_route_indices,
+    block_expert_ids,
+    packed_route_count,
+    expert_offsets,
+    expert_counts,
+    live_numel,
+    NUMEL_CAPACITY: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    MAX_PACKED_ROUTES: tl.constexpr,
+    MAX_ROUTE_BLOCKS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_ROUTE_INIT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+    COUNTS_ALIAS_PACKED: tl.constexpr,
+):
+    routes = tl.arange(0, triton.next_power_of_2(NUMEL_CAPACITY))
+    raw_ids = tl.load(topk_ids + routes, mask=routes < live_numel, other=-1)
+    valid = (routes < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    ids = raw_ids
+    if HAS_EXPERT_MAP:
+        safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1)
+        valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+    ids = ids.to(tl.int32)
+    key_dtype: tl.constexpr = (
+        tl.int32
+        if (NUM_EXPERTS + 1) * triton.next_power_of_2(NUMEL_CAPACITY) <= 2**31
+        else tl.int64
+    )
+    keys = (
+        tl.where(valid, ids, NUM_EXPERTS).to(key_dtype)
+        * triton.next_power_of_2(NUMEL_CAPACITY)
+        + routes
+    )
+    keys = tl.sort(keys, descending=False)
+    sorted_ids = (keys // triton.next_power_of_2(NUMEL_CAPACITY)).to(tl.int32)
+    sorted_routes = (keys % triton.next_power_of_2(NUMEL_CAPACITY)).to(tl.int32)
+    previous = tl.maximum(routes - 1, 0)
+    previous_ids = tl.gather(sorted_ids, previous, axis=0)
+    first = (routes == 0) | (sorted_ids != previous_ids)
+    starts = tl.associative_scan(
+        tl.where(first, routes, 0), 0, _route_group_start_maximum
+    )
+    previous_starts = tl.gather(starts, previous, axis=0)
+    padding = tl.where(
+        first, (BLOCK_SIZE - (routes - previous_starts) % BLOCK_SIZE) % BLOCK_SIZE, 0
+    )
+    slots = routes + tl.cumsum(padding, 0)
+    live = sorted_ids < NUM_EXPERTS
+    total = tl.max(tl.where(live, (slots // BLOCK_SIZE + 1) * BLOCK_SIZE, 0), 0)
+
+    init_routes = tl.arange(0, BLOCK_ROUTE_INIT)
+    tl.store(
+        packed_route_indices + init_routes,
+        live_numel,
+        mask=init_routes < MAX_PACKED_ROUTES,
+    )
+    init_blocks = tl.arange(0, BLOCK_M)
+    tl.store(block_expert_ids + init_blocks, -1, mask=init_blocks < MAX_ROUTE_BLOCKS)
+    tl.debug_barrier()
+    tl.store(packed_route_indices + slots, sorted_routes, mask=live)
+    tl.store(
+        block_expert_ids + slots // BLOCK_SIZE,
+        sorted_ids,
+        mask=live & ((routes - starts) % BLOCK_SIZE == 0),
+    )
+    tl.store(packed_route_count, total)
 
 
 @triton.jit
@@ -40,15 +123,14 @@ def _w4a16_route_count_kernel(
     Writes ``counts[NUM_EXPERTS]``."""
     pid = tl.program_id(0)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
-        tl.int32
-    )
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
     valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
     ids = raw_ids
     if HAS_EXPERT_MAP:
         safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
-        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1)
         valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+    ids = ids.to(tl.int32)
     tl.atomic_add(counts + ids, 1, sem="relaxed", mask=valid)
 
 
@@ -211,15 +293,14 @@ def _pack_topk_routes_small_prefix_kernel(
     route_offsets = tl.arange(0, BLOCK_T)
     for start in tl.range(0, NUMEL_CAPACITY, BLOCK_T):
         offsets = start + route_offsets
-        raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
-            tl.int32
-        )
+        raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
         valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
         ids = raw_ids
         if HAS_EXPERT_MAP:
             safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
-            ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+            ids = tl.load(expert_map + safe_ids, mask=valid, other=-1)
             valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+        ids = ids.to(tl.int32)
         tl.atomic_add(expert_counts + ids, 1, sem="relaxed", mask=valid)
     tl.debug_barrier()
 
@@ -282,15 +363,14 @@ def _pack_topk_routes_sort_kernel(
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
-    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
-        tl.int32
-    )
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1)
     valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
     ids = raw_ids
     if HAS_EXPERT_MAP:
         safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
-        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1)
         valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+    ids = ids.to(tl.int32)
 
     ranks = tl.atomic_add(expert_offsets + ids, 1, sem="relaxed", mask=valid)
     tl.store(packed_route_indices + ranks, offsets, mask=valid)
@@ -347,6 +427,11 @@ def compile_w4a16_route_pack_launches(
         block_route_init <= _SMALL_PREFIX_MAX_PACKED_ROUTES
         and block_m <= _SMALL_PREFIX_MAX_ROUTE_BLOCKS
     )
+    prefix_kernel = (
+        _pack_topk_routes_sorted_kernel
+        if numel_capacity <= _SORTED_PACK_MAX_ROUTES
+        else _pack_topk_routes_small_prefix_kernel
+    )
     programs = {}
     # Avoid Triton's divisibility and value-one specialization of the live bound.
     live_numel = 3
@@ -356,31 +441,29 @@ def compile_w4a16_route_pack_launches(
                 key = (ids_dtype, has_expert_map)
                 expert_map_dtype = torch.int32 if has_expert_map else ids_dtype
                 if use_small_prefix:
-                    programs[("small_prefix", *key)] = (
-                        _pack_topk_routes_small_prefix_kernel.warmup(
-                            ids_dtype,
-                            expert_map_dtype,
-                            torch.int32,
-                            torch.int32,
-                            torch.int32,
-                            torch.int32,
-                            torch.int32,
-                            live_numel,
-                            NUMEL_CAPACITY=int(numel_capacity),
-                            BLOCK_SIZE=int(block_size),
-                            NUM_EXPERTS=int(num_experts),
-                            MAX_PACKED_ROUTES=max_packed_routes,
-                            MAX_ROUTE_BLOCKS=max_route_blocks,
-                            HAS_EXPERT_MAP=has_expert_map,
-                            BLOCK_E=block_e,
-                            BLOCK_T=_COUNT_BLOCK_T,
-                            BLOCK_ROUTE_INIT=block_route_init,
-                            BLOCK_M=block_m,
-                            SEARCH_STEPS=block_e.bit_length(),
-                            COUNTS_ALIAS_PACKED=False,
-                            num_warps=8,
-                            grid=(1, 1, 1),
-                        )
+                    programs[("small_prefix", *key)] = prefix_kernel.warmup(
+                        ids_dtype,
+                        expert_map_dtype,
+                        torch.int32,
+                        torch.int32,
+                        torch.int32,
+                        torch.int32,
+                        torch.int32,
+                        live_numel,
+                        NUMEL_CAPACITY=int(numel_capacity),
+                        BLOCK_SIZE=int(block_size),
+                        NUM_EXPERTS=int(num_experts),
+                        MAX_PACKED_ROUTES=max_packed_routes,
+                        MAX_ROUTE_BLOCKS=max_route_blocks,
+                        HAS_EXPERT_MAP=has_expert_map,
+                        BLOCK_E=block_e,
+                        BLOCK_T=_COUNT_BLOCK_T,
+                        BLOCK_ROUTE_INIT=block_route_init,
+                        BLOCK_M=block_m,
+                        SEARCH_STEPS=block_e.bit_length(),
+                        COUNTS_ALIAS_PACKED=False,
+                        num_warps=1 if numel_capacity <= _SORTED_PACK_MAX_ROUTES else 8,
+                        grid=(1, 1, 1),
                     )
                 if not use_small_prefix:
                     programs[("count", *key)] = _w4a16_route_count_kernel.warmup(
@@ -638,7 +721,11 @@ def pack_topk_routes_by_expert(
             )
         if launches is None:
             launch_triton(
-                _pack_topk_routes_small_prefix_kernel,
+                (
+                    _pack_topk_routes_sorted_kernel
+                    if numel_capacity <= _SORTED_PACK_MAX_ROUTES
+                    else _pack_topk_routes_small_prefix_kernel
+                ),
                 (1,),
                 topk_ids,
                 expert_map_tensor,
@@ -660,7 +747,7 @@ def pack_topk_routes_by_expert(
                 BLOCK_M=block_m,
                 SEARCH_STEPS=block_e.bit_length(),
                 COUNTS_ALIAS_PACKED=counts_alias_packed,
-                num_warps=8,
+                num_warps=1 if numel_capacity <= _SORTED_PACK_MAX_ROUTES else 8,
             )
         else:
             _launch_prepared(
@@ -687,6 +774,8 @@ def pack_topk_routes_by_expert(
                 block_e.bit_length(),
                 counts_alias_packed,
             )
+        if numel_capacity <= _SORTED_PACK_MAX_ROUTES:
+            return packed_route_indices, block_expert_ids, packed_route_count
     else:
         # Parallel path for shapes above the single-launch caps: atomic
         # histogram over routed rows, one tiny 1-D prefix, and binary-search

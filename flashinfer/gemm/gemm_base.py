@@ -424,6 +424,7 @@ def _cutlass_mm_bf16_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if bias is not None:
         raise ValueError(
@@ -454,6 +455,7 @@ def _cublaslt_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if bias is not None:
         if out_dtype != torch.bfloat16:
@@ -488,6 +490,7 @@ def _cudnn_mm_bf16_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     _validate_bf16_output_dtype(out_dtype)
     return _cudnn_available_or_raise_for_backend(backend)
@@ -505,6 +508,7 @@ def _tgv_gemm_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError(
@@ -539,6 +543,7 @@ def _cute_dsl_mm_bf16_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cute-dsl", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The CuTeDSL low-M backend requires bfloat16 output.")
@@ -603,6 +608,7 @@ def _cutile_mm_bf16_requirement(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if out_dtype not in (torch.bfloat16, torch.float16, torch.float32):
         raise ValueError(
@@ -630,6 +636,7 @@ def _tinygemm_mm_bf16_requirement(
     pdl: bool = False,
     backend: Literal["cudnn", "cutlass", "tgv", "tinygemm", "auto"] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if out_dtype != torch.bfloat16:
         raise ValueError("The TinyGEMM backend only supports bfloat16 output.")
@@ -666,6 +673,7 @@ def _check_mm_bf16_problem_size(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if a.dtype != torch.bfloat16:
         raise ValueError(
@@ -710,6 +718,7 @@ def _heuristic_func_mm_bf16(
         "cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "auto"
     ] = "cudnn",
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     heuristic_backends = []
     if bias is not None or pdl:
@@ -772,6 +781,7 @@ def mm_bf16(
     ] = "cudnn",
     *,
     batch_invariant: bool = False,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""MM BF16
 
@@ -808,6 +818,10 @@ def mm_bf16(
         Output dtype, bf16, fp16, or fp32. Enabled for CUTLASS, cuDNN, and cuBLASLt backends.
         TinyGEMM and CuTeDSL require ``torch.bfloat16``. Defaults to
         ``torch.bfloat16``.
+
+    workspace_buffer: Optional[torch.Tensor]
+        Caller-owned contiguous uint8 workspace on the input device, with at least
+        ``DEFAULT_WORKSPACE_SIZE`` bytes. When omitted, use the library workspace cache.
 
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "tinygemm", "cutile", "cute-dsl", "auto"]
         The backend to use for the operation. Defaults to ``"cudnn"``.
@@ -912,9 +926,19 @@ def mm_bf16(
         # via the ``@backend_requirement`` decorator (accepts bf16 / fp16 / fp32).
         return mm_bf16_cutile(a, b, out)
 
-    workspace_buffer = _get_stream_cache_buf(
-        "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
-    )
+    if workspace_buffer is None:
+        workspace_buffer = _get_stream_cache_buf(
+            "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        )
+    elif (
+        workspace_buffer.dtype != torch.uint8
+        or workspace_buffer.device != a.device
+        or not workspace_buffer.is_contiguous()
+        or workspace_buffer.numel() < DEFAULT_WORKSPACE_SIZE
+    ):
+        raise ValueError(
+            "BF16 GEMM workspace must be contiguous device bytes covering DEFAULT_WORKSPACE_SIZE"
+        )
     if backend == "auto":
         backends = mm_bf16.suitable_auto_backends
     elif backend == "cudnn":
@@ -10656,6 +10680,7 @@ def _cutlass_gemm_fp8_nt_groupwise_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm"] = "cutlass",
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if scale_major_mode is None:
         raise ValueError("scale_major_mode is required in CUTLASS")
@@ -10675,6 +10700,7 @@ def _trtllm_gemm_fp8_nt_groupwise_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm"] = "cutlass",
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if scale_granularity_mnk != (1, 128, 128):
         raise ValueError("scale_granularity_mnk must be (1, 128, 128) in TRTLLM")
@@ -10695,6 +10721,7 @@ def _check_gemm_fp8_nt_groupwise_problem_size(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm"] = "cutlass",
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     if a.ndim != 2 or b.ndim != 2:
         raise ValueError(f"Shape mismatch. a.shape = {a.shape}, b.shape = {b.shape}")
@@ -10724,6 +10751,7 @@ def _cutile_gemm_fp8_nt_groupwise_requirement(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm", "cutile"] = "cutlass",
+    workspace_buffer: Optional[torch.Tensor] = None,
 ):
     # v1 supports only K-major scales + (1, 128, 128) granularity.
     # MN-major and other granularities are documented follow-ups.
@@ -10842,6 +10870,8 @@ def gemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     backend: Literal["cutlass", "trtllm", "cutile", "cute-dsl", "auto"] = "cutlass",
+    *,
+    workspace_buffer: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Performs matrix multiplication with FP8 data types using groupwise scaling.
 
@@ -10885,6 +10915,10 @@ def gemm_fp8_nt_groupwise(
         How many SMs to use for the MMA operation, must be 1 or 2.
         2 is faster when number of rows (M) per group is large (>= 256).
 
+    workspace_buffer: Optional[torch.Tensor]
+        Caller-owned contiguous uint8 workspace on the input device, with at least
+        ``DEFAULT_WORKSPACE_SIZE`` bytes. When omitted, use the library workspace cache.
+
     out: Optional[torch.Tensor]
         Output tensor, shape (m, n). If not specified, we will create an output tensor explicitly.
 
@@ -10922,9 +10956,19 @@ def gemm_fp8_nt_groupwise(
     The ``m`` should be padded to a multiple of 4 before calling this function, to accommodate the kernel's requirement.
     """
 
-    workspace_buffer = _get_stream_cache_buf(
-        "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
-    )
+    if workspace_buffer is None:
+        workspace_buffer = _get_stream_cache_buf(
+            "gemm_fp8_nt_groupwise_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+        )
+    elif (
+        workspace_buffer.dtype != torch.uint8
+        or workspace_buffer.device != a.device
+        or not workspace_buffer.is_contiguous()
+        or workspace_buffer.numel() < DEFAULT_WORKSPACE_SIZE
+    ):
+        raise ValueError(
+            "groupwise FP8 workspace must be contiguous device bytes covering DEFAULT_WORKSPACE_SIZE"
+        )
 
     if out is None:
         out_dtype = out_dtype or torch.bfloat16

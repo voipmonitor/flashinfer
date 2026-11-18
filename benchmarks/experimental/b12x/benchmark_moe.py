@@ -16,6 +16,13 @@ whole-expert expansion using the same resident payload and complete-call timing.
 ``--time-graph-replay`` times the captured graph itself. Combine it with
 ``--no-flush-l2`` to retain cache state across repeated calls to one layer.
 
+Kimi K3.1 Pro uses ``--model-profile kimi-k31-pro`` and
+``--batch-size-profile kimi-k31-verify`` for TP16 verification rows 2, 4, 6, 8.
+Its real MXFP4 experts use BF16 activations, SiTU, and lossless CSF scales;
+latent down/up projections and model routing remain outside the timed operator.
+``--routing-workload preparation-mixture`` includes diffuse, skewed, correlated,
+and whole-batch shared routes with independent tuning and evaluation seeds.
+
 Step-5 TP4/C1 with MTP3 verifies four rows. Its checkpoint profile defaults to
 layer 3, NVFP4 W4A4, lossless CSF scales, and the checkpoint's clamp-after-SiLU
 limit. For the expert-sharing sweep, run with ``--model-profile
@@ -123,6 +130,7 @@ CHUNKED_PREFILL_BATCH_SIZES = [8192, 16384, 24576, 32768]
 BATCH_SIZE_PROFILES = {
     "eager-prefill": EAGER_PREFILL_BATCH_SIZES,
     "micro": LEGACY_BATCH_SIZES,
+    "kimi-k31-verify": [2, 4, 6, 8],
     "nano35-mtp": NANO35_MTP_BATCH_SIZES,
     "qwen38-flash-next": QWEN38_FLASH_NEXT_BATCH_SIZES,
     "step5-mtp3": [1, 4],
@@ -360,6 +368,16 @@ class ModelProfile:
 
 
 MODEL_PROFILES = {
+    "kimi-k31-pro": ModelProfile(
+        label="Kimi K3.1 Pro",
+        checkpoint_family="kimi_k31",
+        default_layer_idx=1,
+        tp_size=16,
+        hf_repo_id="moonshotai/Kimi-K3.1-Pro",
+        default_activation="situ",
+        default_quant_mode="w4a16",
+        default_scale_compression="csf",
+    ),
     "step5-preview-nvfp4": ModelProfile(
         label="Step-5 Preview NVFP4",
         checkpoint_family="step5",
@@ -890,6 +908,35 @@ def build_model_spec(
         )
 
     cfg = _load_config(model_path)
+    if profile.checkpoint_family == "kimi_k31":
+        selected = profile.default_layer_idx if layer_idx is None else layer_idx
+        if (
+            cfg.get("model_type") != "kimi_linear"
+            or cfg.get("hidden_act") != "situ"
+            or cfg.get("activation_situ_beta") != 4.0
+            or cfg.get("activation_situ_linear_beta") != 25.0
+            or not cfg["first_k_dense_replace"] <= selected < cfg["num_hidden_layers"]
+        ):
+            raise ValueError(
+                "Kimi K3.1 requires a target-model SiTU routed-expert layer"
+            )
+        if (
+            tp <= 0
+            or not 0 <= tp_rank < tp
+            or cfg["moe_intermediate_size"] % tp
+            or (cfg["moe_intermediate_size"] // tp) % 32
+        ):
+            raise ValueError(
+                "Kimi K3.1 requires a valid TP rank and a 32-aligned expert shard"
+            )
+        return ModelSpec(
+            hidden_size=cfg["routed_expert_hidden_size"],
+            intermediate_size=cfg["moe_intermediate_size"],
+            num_experts=cfg["num_experts"],
+            top_k=cfg["num_experts_per_token"],
+            tp_size=tp,
+            tp_rank=tp_rank,
+        )
     if profile.checkpoint_family == "step5":
         selected = profile.default_layer_idx if layer_idx is None else layer_idx
         if cfg.get("model_type") != "step5" or selected not in cfg["moe_layer_list"]:
@@ -1731,6 +1778,50 @@ def load_expert_weights(
         g1_alphas = ones
         g2_alphas = ones
         g1_alphas_per_expert = ones
+    elif checkpoint_family == "kimi_k31":
+        if activation != "situ":
+            raise ValueError("Kimi K3.1 checkpoint experts require SiTU")
+        source_format = "fp4_e8m0_k32"
+        prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe.experts"
+        w13_weight = torch.empty(E, 2 * I_tp, K // 2, dtype=torch.uint8, device=device)
+        w2_weight = torch.empty(E, K, I_tp // 2, dtype=torch.uint8, device=device)
+        w13_sf = torch.empty(E, 2 * I_tp, K // 32, dtype=torch.uint8, device=device)
+        down_sf = torch.empty(E, K, I_tp // 32, dtype=torch.uint8, device=device)
+        first = spec.tp_rank * I_tp
+        print(f"  Loading {E} Kimi K3.1 MXFP4 experts...", end="", flush=True)
+        for eid in range(E):
+            for half, projection in enumerate(("w1", "w3")):
+                key = f"{prefix}.{eid}.{projection}"
+                w13_weight[eid, half * I_tp : (half + 1) * I_tp].copy_(
+                    loader.get_tensor(f"{key}.weight_packed").narrow(0, first, I_tp)
+                )
+                w13_sf[eid, half * I_tp : (half + 1) * I_tp].copy_(
+                    loader.get_tensor(f"{key}.weight_scale").narrow(0, first, I_tp)
+                )
+            key = f"{prefix}.{eid}.w2"
+            w2_weight[eid].copy_(
+                loader.get_tensor(f"{key}.weight_packed").narrow(
+                    1, first // 2, I_tp // 2
+                )
+            )
+            down_sf[eid].copy_(
+                loader.get_tensor(f"{key}.weight_scale").narrow(
+                    1, first // 32, I_tp // 32
+                )
+            )
+        print(" done.")
+        w13_sf = w13_sf.view(torch.float8_e8m0fnu)
+        down_sf = down_sf.view(torch.float8_e8m0fnu)
+        w13_blockscale_swizzled = w13_sf
+        w2_blockscale_swizzled = down_sf
+        w13_permuted = w13_weight.permute(1, 2, 0)
+        down_permuted = w2_weight.permute(1, 2, 0)
+        w13_scale, down_scale = w13_sf, down_sf
+        ones = torch.ones(E, dtype=torch.float32, device=device)
+        w13_input_scale = torch.ones((), dtype=torch.float32, device=device)
+        w2_input_scale = torch.ones((), dtype=torch.float32, device=device)
+        w13_input_scale_per_expert = down_is = down_gs = ones
+        g1_alphas = g2_alphas = g1_alphas_per_expert = ones
     elif checkpoint_family in {"deepseek_v4_flash", "deepseek_v41_flash"}:
         uses_v41_checkpoint_layout = checkpoint_family == "deepseek_v41_flash"
         family_label = (
@@ -2946,6 +3037,13 @@ ORACLE_TOLERANCES = {
 }
 
 W4A16_ORACLE_TOLERANCES = {
+    "situ": {
+        "max_abs": None,
+        "rmse": None,
+        "mean_abs": None,
+        "cos_min": 0.9975,
+        "normalized_rmse": 0.015,
+    },
     "silu": {
         "max_abs": None,
         "rmse": None,
@@ -3113,7 +3211,17 @@ def live_moe_inputs(x, ids, probabilities, num_experts):
 
 
 def validate_live_moe_graph(
-    graph, eager, x, ids, probabilities, output, experts, oracle
+    graph,
+    eager,
+    x,
+    ids,
+    probabilities,
+    output,
+    experts,
+    oracle,
+    *,
+    activation="silu",
+    oracle_mode="w4a8_mx",
 ):
     """Replay bound storage after changing live operands and resident weights."""
     operands = (x, ids, probabilities)
@@ -3143,7 +3251,7 @@ def validate_live_moe_graph(
     def consistency(label, reference):
         metrics = compare_graph_replay_outputs(output, reference)
         failures = check_oracle_metrics(
-            label, metrics, x.shape[0], oracle_mode="w4a8_mx"
+            label, metrics, x.shape[0], activation=activation, oracle_mode=oracle_mode
         )
         if metrics.cos <= 0.9999:
             failures.append(f"{label}: cosine={metrics.cos:.9f} <= 0.9999")
@@ -3169,7 +3277,11 @@ def validate_live_moe_graph(
         if oracle is not None:
             oracle_metrics = compare_to_reference(output, oracle)
             failures = check_oracle_metrics(
-                "MoE mutated oracle", oracle_metrics, x.shape[0], oracle_mode="w4a8_mx"
+                "MoE mutated oracle",
+                oracle_metrics,
+                x.shape[0],
+                activation=activation,
+                oracle_mode=oracle_mode,
             )
             if failures:
                 raise RuntimeError("; ".join(failures))
@@ -3199,6 +3311,44 @@ def validate_live_moe_graph(
     )
     metrics["guards"] = "passed"
     return metrics
+
+
+def selected_csf_expansion(binding) -> dict | None:
+    """Describe the scale decoder bound to the measured MoE invocation."""
+    decoder = binding.experts.nvfp4_csf
+    if decoder is None:
+        return None
+    routes_packed = bool(getattr(binding, "csf_route_pack", False))
+    packed_geometry = (
+        dict(
+            zip(
+                (
+                    "route_capacity",
+                    "block_size",
+                    "max_packed_routes",
+                    "max_route_blocks",
+                ),
+                decoder.packed_route_geometry,
+                strict=True,
+            )
+        )
+        if routes_packed
+        else None
+    )
+    return {
+        "routes_packed": routes_packed,
+        "packed_route_geometry": packed_geometry,
+        "planes": {
+            name: {
+                "geometry": list(plane.geometry),
+                "groups_per_task": getattr(plane, "groups_per_task", None),
+                "shared_exceptions": getattr(plane, "shared_exceptions", None),
+            }
+            for name, plane in (("fc1", decoder.first), ("fc2", decoder.second))
+        },
+        "direct_routes": decoder.direct_routes,
+        "bitmap_routes": decoder.bitmap_routes,
+    }
 
 
 def prepare_moe_execution(
@@ -3732,9 +3882,20 @@ def bench_multilayer_graph_mode(
         sys.exit(1)
 
 
+def parse_moe_config(value: str) -> dict:
+    config = json.loads(value)
+    if isinstance(config.get("w4a16_tile_config"), list):
+        config["w4a16_tile_config"] = tuple(config["w4a16_tile_config"])
+    return config
+
+
 def bench_e2e() -> None:
     from b12x.moe.fused_moe._impl import default_moe_quant_mode
-    from b12x.moe.fused_moe.workloads import ROUTING_MIX, ROUTING_WORKLOADS
+    from b12x.moe.fused_moe.workloads import (
+        ROUTING_MIX,
+        ROUTING_WORKLOADS,
+        TUNING_ROUTING_WORKLOADS,
+    )
 
     quant_mode_default = default_moe_quant_mode()
     parser = argparse.ArgumentParser()
@@ -3761,7 +3922,7 @@ def bench_e2e() -> None:
     )
     parser.add_argument(
         "--moe-config",
-        type=json.loads,
+        type=parse_moe_config,
         default=None,
         help=(
             "JSON MoeDecodeConfig override for controlled single-op experiments. "
@@ -3786,9 +3947,12 @@ def bench_e2e() -> None:
     )
     parser.add_argument(
         "--routing-workload",
-        choices=("default", "mixture", *ROUTING_WORKLOADS),
+        choices=("default", "mixture", "preparation-mixture", *ROUTING_WORKLOADS),
         default=None,
-        help="Synthetic route distribution; pre-routed single-op runs default to mixture.",
+        help=(
+            "Synthetic route distribution; pre-routed single-op runs default to mixture. "
+            "preparation-mixture also includes whole-batch shared routes used by preparation."
+        ),
     )
     parser.add_argument(
         "--tuning-samples",
@@ -4314,9 +4478,14 @@ def bench_e2e() -> None:
         activation=args.activation,
         checkpoint_family=model_profile.checkpoint_family,
     )
-    routing_workloads = (
-        ROUTING_MIX if args.routing_workload == "mixture" else (args.routing_workload,)
-    )
+    if args.routing_workload == "preparation-mixture":
+        routing_workloads = tuple(
+            workload for group in TUNING_ROUTING_WORKLOADS for workload in group
+        )
+    elif args.routing_workload == "mixture":
+        routing_workloads = ROUTING_MIX
+    else:
+        routing_workloads = (args.routing_workload,)
     evaluation_scenarios = tuple(
         (workload, index)
         for workload in routing_workloads
@@ -4465,7 +4634,7 @@ def bench_e2e() -> None:
             if (
                 model_profile.checkpoint_family == "deepseek_v41_flash"
                 and args.quant_mode == "w4a8_mx"
-            ):
+            ) or model_profile.checkpoint_family == "kimi_k31":
                 live_x, live_ids, live_probabilities = live_moe_inputs(
                     oracle_x, oracle_ids, oracle_topk, spec.num_experts
                 )
@@ -4834,6 +5003,7 @@ def bench_e2e() -> None:
                 "query": exact.selection.query.to_dict(),
                 "invocation": exact.invocation.to_dict(),
             },
+            "csf_expansion": selected_csf_expansion(backend_binding),
             "oracle_quant_scale_math": oracle_scale_mode,
             "oracle": asdict(backend_metrics) if backend_metrics is not None else None,
             "graph_samples_ms": {},
@@ -4920,7 +5090,7 @@ def bench_e2e() -> None:
                     if (
                         model_profile.checkpoint_family == "deepseek_v41_flash"
                         and args.quant_mode == "w4a8_mx"
-                    ):
+                    ) or model_profile.checkpoint_family == "kimi_k31":
                         mutated_oracle = mutated_oracles.get((batch_size, sample_index))
                         record["live_graph_guards"] = validate_live_moe_graph(
                             graph,
@@ -4933,6 +5103,8 @@ def bench_e2e() -> None:
                             None
                             if mutated_oracle is None
                             else mutated_oracle.to(device),
+                            activation=args.activation,
+                            oracle_mode=args.oracle_mode,
                         )
 
                     timed_fn = replay if args.time_graph_replay else fn
@@ -4995,8 +5167,9 @@ def bench_e2e() -> None:
                         ) as profiler:
                             graph.replay()
                             torch.cuda.synchronize()
-                        trace_path = (
-                            args.torch_trace_dir / f"m{batch_size}-{name}.trace.json"
+                        trace_path = args.torch_trace_dir / (
+                            f"m{batch_size}-{record['routing_workload']}-"
+                            f"seed{record['input_seed']}-{name}.trace.json"
                         )
                         profiler.export_chrome_trace(str(trace_path))
                     if args.profile_graphs:

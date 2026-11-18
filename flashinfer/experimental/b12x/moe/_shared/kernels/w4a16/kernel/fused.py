@@ -107,6 +107,7 @@ class W4A16FusedMoeKernel:
         rotation_input_dtype: str = "fp16",
         broadcast_suh: bool = False,
         pipeline_stages: int | None = None,
+        fc1_pipeline_stages: int | None = None,
         skip_empty_m_blocks: bool | None = None,
         trellis_decode_table: str = "auto",
         small_m_occupancy: int | None = None,
@@ -366,7 +367,9 @@ class W4A16FusedMoeKernel:
             route_major_a=self.full_rotation,
             schedule_whole_tiles=self.schedule_whole_tiles,
             dynamic_num_experts=self.dynamic_num_experts,
-            pipeline_stages=pipeline_stages,
+            pipeline_stages=fc1_pipeline_stages
+            if fc1_pipeline_stages is not None
+            else pipeline_stages,
             skip_empty_m_blocks=skip_empty_m_blocks,
             small_m_occupancy=small_m_occupancy,
             csf_inline_scales=csf_inline_scales,
@@ -419,6 +422,13 @@ class W4A16FusedMoeKernel:
             dynamic_num_experts=self.dynamic_num_experts,
             schedule_route_block_factor=self.fc2_schedule_route_block_factor,
             pipeline_stages=pipeline_stages,
+            preload_all_tiles=(
+                weight_layout == "modelopt"
+                and scale_format == "e8m0_k32"
+                and element_dtype == "bf16"
+                and intermediate_size <= min(256, 4 * fc2_tile_k)
+                and not csf_inline_scales
+            ),
             skip_empty_m_blocks=skip_empty_m_blocks,
             small_m_occupancy=small_m_occupancy,
             csf_inline_scales=csf_inline_scales,
@@ -429,6 +439,16 @@ class W4A16FusedMoeKernel:
                 "fused W4A16 kernel expects matching FC1/FC2 thread counts"
             )
         self.sms = self.fc1.sms
+        self.activation_vector_elements = (
+            2
+            if self.activation_is_gated
+            and not self.is_fp16
+            and self.intermediate_size % 8 == 0
+            and self.fc1_cols % 8 == 0
+            and self.size_m * self.top_k * self.intermediate_size
+            < self.sms * self.cta_threads * 8
+            else 8
+        )
         self.blocks_per_sm = min(self.fc1.blocks_per_sm, self.fc2.blocks_per_sm)
         self.shared_words = max(self.fc1.shared_words, self.fc2.shared_words)
         self.iq2_lut_bytes = (
@@ -524,6 +544,7 @@ class W4A16FusedMoeKernel:
             self.activation_is_gated,
             self.activation_is_situ,
             self.activation_is_swigluoai,
+            self.activation_vector_elements,
             self.has_swiglu_limit,
             self.swiglu_limit,
             self.swiglu_clamp_after_silu,
@@ -2272,7 +2293,7 @@ class W4A16FusedMoeKernel:
         return _pack_f32x2_to_bf16x2_rn(lo.to(cutlass.Float32), hi.to(cutlass.Float32))
 
     @cute.jit
-    def _run_activation_gated_x8(
+    def _run_activation_gated(
         self,
         fc1_bf16_flat: cute.Tensor,
         activated_bf16_flat: cute.Tensor,
@@ -2281,8 +2302,22 @@ class W4A16FusedMoeKernel:
         grid_x: Int32,
         active_m: cutlass.Int32,
     ):
-        # The scalar gated loop with 16-byte gate/up loads and output stores:
-        # each thread handles 8 consecutive intermediate columns of one row.
+        if cutlass.const_expr(self.activation_vector_elements == 2):
+            fc1_pairs = cute.recast_tensor(fc1_bf16_flat, Uint32)
+            activated_pairs = cute.recast_tensor(activated_bf16_flat, Uint32)
+            pairs_per_row = Int32(self.intermediate_size // 2)
+            pidx = cta * Int32(self.cta_threads) + tid
+            stride = grid_x * Int32(self.cta_threads)
+            total = active_m * Int32(self.top_k) * pairs_per_row
+            while pidx < total:
+                row = pidx // pairs_per_row
+                col = pidx - row * pairs_per_row
+                gate_off = row * Int32(self.fc1_cols // 2) + col
+                gate = fc1_pairs[gate_off]
+                up = fc1_pairs[gate_off + pairs_per_row]
+                activated_pairs[pidx] = self._gated_activation_bf16x2(gate, up)
+                pidx += stride
+            return
         vec_per_row = Int32(self.intermediate_size // 8)
         vidx = cta * Int32(self.cta_threads) + tid
         stride = grid_x * Int32(self.cta_threads)
@@ -2405,7 +2440,7 @@ class W4A16FusedMoeKernel:
             and self.intermediate_size % 8 == 0
             and self.fc1_cols % 8 == 0
         ):
-            self._run_activation_gated_x8(
+            self._run_activation_gated(
                 fc1_bf16_flat, activated_bf16_flat, tid, cta, grid_x, active_m
             )
             return

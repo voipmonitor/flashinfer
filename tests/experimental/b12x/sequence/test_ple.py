@@ -774,8 +774,11 @@ def test_ple_hash_cuda_graph_replay_is_allocation_free() -> None:
     torch.testing.assert_close(captured_out, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("scalar_offset", [0, 1])
 @torch.inference_mode()
-def test_ple_hash_target_cuda_graph_replays_dynamic_packed_metadata() -> None:
+def test_ple_hash_target_cuda_graph_replays_dynamic_packed_metadata(
+    scalar_offset: int,
+) -> None:
     device = require_b12x()
     caps = ple_hash.Caps(
         device=device,
@@ -796,8 +799,24 @@ def test_ple_hash_target_cuda_graph_replays_dynamic_packed_metadata() -> None:
         dtype=torch.int64,
         device=device,
     )
-    num_seqs = torch.tensor([1], dtype=torch.int32, device=device)
-    num_tokens = torch.tensor([2], dtype=torch.int32, device=device)
+    scalar_storage = torch.zeros((2, 8), dtype=torch.int32, device=device)
+    num_seqs = scalar_storage[0, scalar_offset : scalar_offset + 1]
+    num_tokens = scalar_storage[1, scalar_offset : scalar_offset + 1]
+    num_seqs.fill_(1)
+    num_tokens.fill_(2)
+    assert num_seqs.data_ptr() % 16 == scalar_offset * 4
+    assert num_tokens.data_ptr() % 16 == scalar_offset * 4
+    invocation = ple_hash.invocation_from_tensors(
+        token_ids=token_ids,
+        query_start_loc=query_start_loc,
+        committed_history=committed_history,
+        num_seqs=num_seqs,
+        num_tokens=num_tokens,
+        out=torch.empty(
+            (caps.max_tokens, caps.head_count), dtype=torch.int64, device=device
+        ),
+    )
+    assert invocation["input_alignments"][3:5] == (4, 4)
     geometry, binding = _bind_cuda_hash(
         caps,
         token_ids=token_ids,
