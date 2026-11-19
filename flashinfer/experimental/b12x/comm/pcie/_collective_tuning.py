@@ -58,6 +58,12 @@ def _configs(query, device=None):
         call = payload["call"]
         blocks = int(call.get("blocks", call.get("block_limit", 16)))
         threads = int(call["threads"])
+        if name in ("dcp_route_separate", "dcp_route_row"):
+            if name == "dcp_route_separate" or pairwise_device(device):
+                yield CollectiveConfig(
+                    implementation=name, threads=threads, blocks=blocks
+                )
+            continue
         if name in ISLAND_VARIANTS:
             # Physical CTAs keep buffer parity synchronized. Only participating
             # CTAs advance communication epochs, so active counts can vary safely.
@@ -100,6 +106,7 @@ def _configs(query, device=None):
             "dcp_ring",
             "dcp_recursive",
             "dcp_recursive_ready",
+            "dcp_recursive_outer_first",
         ):
             # Selected profiles require SM120 hardware with at least 64 SMs.
             # Phased kernels also have to pass the native cluster occupancy check.
@@ -113,6 +120,7 @@ def _configs(query, device=None):
                 "dcp_phased_push",
                 "dcp_recursive",
                 "dcp_recursive_ready",
+                "dcp_recursive_outer_first",
             ):
                 counts = (128,)
             else:
@@ -350,6 +358,13 @@ def _validate_query(query, device):
         NATIVE.validate_query(native, device)
         if (native.world_size, native.rank) != (query.world_size, query.rank):
             raise ValueError("native alternatives must use the same rank group")
+        if name in ("dcp_route_separate", "dcp_route_row") and (
+            query.operation != "all_gather_pair_kimi_topk"
+            or query.world_size != 16
+            or native.call.get("route_transport")
+            != {"dcp_route_separate": "separate", "dcp_route_row": "row"}[name]
+        ):
+            raise ValueError("Kimi row gathering requires a complete four-row route")
         if name == "twoshot_pairwise" and (
             query.operation != "all_reduce"
             or native.surface != "PCIeTwoShotBF16.all_reduce"
@@ -393,18 +408,21 @@ def _validate_query(query, device):
             "dcp_ring",
             "dcp_recursive",
             "dcp_recursive_ready",
+            "dcp_recursive_outer_first",
         ) and (
             query.operation != "all_gather_heads"
             or (
                 query.world_size not in (8, 16)
                 and not (query.world_size == 4 and name == "dcp_ring")
             )
+            or (name == "dcp_recursive_outer_first" and query.world_size != 16)
             or not native.surface.endswith(".all_gather_heads")
             or native.call.get("gather_transport")
             != {
                 "dcp_ring": "selected_ring",
                 "dcp_recursive": "selected_recursive",
                 "dcp_recursive_ready": "selected_recursive_ready",
+                "dcp_recursive_outer_first": "selected_recursive_outer_first",
                 "dcp_phased": "selected_phased_barrier",
                 "dcp_phased_push": "selected_phased_push",
             }[name]
@@ -526,7 +544,7 @@ def _family_bucket(query):
 TUNING = TuningContract(
     component_id="comm.pcie",
     query_schema_version=8,
-    candidate_contract_version=9,
+    candidate_contract_version=10,
     config_schema_version=2,
     query_fields=frozenset(
         ("operation", "world_size", "rank", "alternatives", "default", "inplace")
@@ -603,6 +621,7 @@ def plan(
             "dcp_ring",
             "dcp_recursive",
             "dcp_recursive_ready",
+            "dcp_recursive_outer_first",
         ):
             call.update(submode=config.submode, active_blocks=config.active_blocks)
         q = replace(q, call=FrozenMapping(call))
